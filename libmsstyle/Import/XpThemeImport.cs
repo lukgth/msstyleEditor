@@ -139,7 +139,7 @@ namespace libmsstyle.Import
 
                 if (res.Ok && o.Write)
                 {
-                    VariantWriter.Apply(opt.OutputPath, themeName, scheme.InternalName, scheme.DisplayName.Trim(), sizes);
+                    VariantWriter.Apply(opt.OutputPath, themeName, scheme.InternalName, scheme.DisplayName.Trim(), sizes, scheme.NormalSizeDisplayName);
                     report.Notes.Add($"variants: theme \"{themeName}\", color {scheme.InternalName} \"{scheme.DisplayName.Trim()}\", sizes NormalSize{string.Concat(sizes.Select(z => ", " + z.Name))}.");
                     CheckVariantsLoad(opt.OutputPath, scheme.InternalName, sizes, report);
                 }

@@ -31,7 +31,9 @@ namespace libmsstyle.Import
         /// <param name="sizes">ports of the other sizes, from the same template. Their IMAGE/STREAM resources and font
         /// strings are matched to the main output by content; what's new is added under fresh ids and the size's
         /// VARIANT records are pointed at those.</param>
-        public static void Apply(string stylePath, string themeName, string colorName, string colorDisplayName, IList<Size> sizes)
+        /// <param name="normalSizeDisplayName">Font size label of the default size; null keeps the template's "Normal".</param>
+        public static void Apply(string stylePath, string themeName, string colorName, string colorDisplayName, IList<Size> sizes,
+            string normalSizeDisplayName = null)
         {
             byte[] cmap, bcmap, vmap, rmap;
             Dictionary<int, string> mainStrings;
@@ -63,6 +65,12 @@ namespace libmsstyle.Import
             m.SetText(ci, VariantMaps.TooltipId, colorDisplayName);
             var v0 = m.Variants[0];
             m.Variants[0] = (v0.Variant, v0.Size, colorName);
+            int si = m.ClassIndex("sizevariant." + v0.Size);
+            if (si >= 0 && !string.IsNullOrWhiteSpace(normalSizeDisplayName))
+            {
+                m.SetText(si, VariantMaps.DisplayNameId, normalSizeDisplayName);
+                m.SetText(si, VariantMaps.TooltipId, normalSizeDisplayName);
+            }
 
             // new size classes go to the end of CMAP so no class index in any VARIANT moves. They carry no records,
             // which uxtheme accepts for variant classes (Luna10's sizevariant.Default has none either). BCMAP has one

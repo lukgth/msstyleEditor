@@ -777,15 +777,47 @@ namespace libmsstyle
         {
             m_platform = Platform.WinXP;
             m_xpColorSchemes = XpStyleIniParser.ParseThemesIni(themesIniData);
-            XpThemeDisplayName = XpStyleIniParser.ThemeDisplayName(themesIniData);
 
             if (m_xpColorSchemes.Count == 0)
             {
                 throw new Exception("No color schemes found in THEMES_INI!");
             }
 
+            // What XP shows comes from the string table packthem wrote, not from THEMES_INI's DisplayName lines
+            // (themeldr tmutils.cpp _EnumThemeColors/_EnumThemeSizes, uxtheme GetThemeDocumentationProperty):
+            // color i = 1000+i, size i = 3000+i (index in COLORNAMES/SIZENAMES), theme name = 5000. Authors set them
+            // freely: Flarn's sizes read "HaxrCorp S8 / Tahoma / Trebuchet MS", appows' "segoe ui / corbel / arial".
+            var packed = new Dictionary<int, string>();
+            foreach (var lang in ResourceAccess.GetAllLanguageIds(m_moduleHandle, "#" + Win32Api.RT_STRING, 63,
+                Win32Api.EnumResourceFlags.RESOURCE_ENUM_LN).Take(1))
+                ResourceAccess.StringTable.Load(m_moduleHandle, lang, packed);
+            string Packed(int id) => packed.TryGetValue(id, out var s) && !string.IsNullOrWhiteSpace(s) ? s.Trim() : null;
+            var colorNames = XpNameList("COLORNAMES");
+            var sizeNames = XpNameList("SIZENAMES");
+            foreach (var scheme in m_xpColorSchemes)
+            {
+                int ci = colorNames.FindIndex(n => n.Equals(scheme.InternalName, StringComparison.OrdinalIgnoreCase));
+                if (ci >= 0 && Packed(1000 + ci) is string cd) scheme.DisplayName = cd;
+                foreach (var size in scheme.Sizes)
+                {
+                    int si = sizeNames.FindIndex(n => n.Equals(size.InternalName, StringComparison.OrdinalIgnoreCase));
+                    if (si >= 0 && Packed(3000 + si) is string sd) size.DisplayName = sd;
+                }
+                int ni = sizeNames.FindIndex(n => n.Equals("NormalSize", StringComparison.OrdinalIgnoreCase));
+                scheme.NormalSizeDisplayName = ni >= 0 ? Packed(3000 + ni) : null;
+            }
+            XpThemeDisplayName = Packed(5000) ?? XpStyleIniParser.ThemeDisplayName(themesIniData);
+
             // Default to first scheme; caller can call LoadXpWithScheme() to switch
             LoadXpWithScheme(m_xpColorSchemes[0]);
+        }
+
+        /// <summary>packthem's COLORNAMES/SIZENAMES resource: null-separated internal names in index order.</summary>
+        private List<string> XpNameList(string type)
+        {
+            var data = ResourceAccess.GetResource(m_moduleHandle, type, 1);
+            if (data == null) return new List<string>();
+            return Encoding.Unicode.GetString(data).Split('\0').Where(s => s.Length > 0).ToList();
         }
 
         /// <summary>

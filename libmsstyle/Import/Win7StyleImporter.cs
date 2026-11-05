@@ -483,6 +483,87 @@ namespace libmsstyle.Import
             MirrorIntoWin10Classes();
             if (m_source.Platform == Platform.WinXP) FillFlatFromXp();
             if (m_source.Platform == Platform.WinXP) SingleImageIntoDpiSlots();
+            if (m_source.Platform == Platform.WinXP) ThemeWholeClientEdge();
+            if (m_source.Platform == Platform.WinXP) OpaqueSpinBackgrounds();
+        }
+
+        /// <summary>
+        /// xp only. comctl32's up-down erases with its class brush (BTNFACE, updown.c) before drawing the Spin parts,
+        /// so a see-through button picture showed BTNFACE on xp. WinForms' NumericUpDown paints the parts on an
+        /// unerased opaque control: GSM's fully transparent button backgrounds came out white. A source picture with
+        /// transparent pixels is flattened onto the source's BTNFACE, which looks the same in comctl32.
+        /// </summary>
+        private void OpaqueSpinBackgrounds()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Spin", out var tc) || m_target.DuplicateClassNames.Contains("Spin")
+                || KeyPattern.Matches(m_opt.Exclude, "Spin", "*", "IMAGEFILE")) return;
+            if (!m_source.ClassesByName.TryGetValue("sysmetrics", out var sm)
+                || !(SemanticModel.FindEffective(m_source.Style, sm, 0, 0, IDENTIFIER.BTNFACE)?.GetValue() is Color face)) return;
+            var flattened = new Dictionary<int, int>();
+            for (int part = 1; part <= 4; ++part)
+            {
+                if (!tc.Parts.TryGetValue(part, out var p)) continue;
+                foreach (var st in p.States.Values)
+                {
+                    var img = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
+                    if (img == null || !(img.GetValue() is int id)) continue;
+                    if (!flattened.TryGetValue(id, out int newId))
+                    {
+                        // only pictures this run brought in: the template's own are win10 art drawn for win10.
+                        if (!m_alloc.Added.TryGetValue("IMAGE/" + id, out var bytes)) continue;
+                        ArgbImage pic;
+                        try { pic = ImageIdentity.Decode(bytes); } catch (ArgumentException) { continue; }
+                        if (pic.Pixels.All(px => (px >> 24) == 0xFF)) continue;
+                        var flat = new ArgbImage(pic.Width, pic.Height);
+                        for (int i = 0; i < pic.Pixels.Length; ++i)
+                        {
+                            uint px = pic.Pixels[i], a = px >> 24;
+                            uint Mix(int shift, int under) => (uint)((((px >> shift) & 0xFF) * a + (uint)under * (255 - a) + 127) / 255);
+                            flat.Pixels[i] = 0xFF000000 | (Mix(16, face.R) << 16) | (Mix(8, face.G) << 8) | Mix(0, face.B);
+                        }
+                        var png = ImageIdentity.EncodePngVerified(flat);
+                        newId = PlaceResource("IMAGE", id, png, ImageIdentity.Analyze(png));
+                        flattened[id] = newId;
+                        m_report.Notes.Add($"Spin IMAGE {id}: see-through button picture flattened onto the source's BTNFACE {face.R},{face.G},{face.B} as IMAGE {newId} (WinForms' NumericUpDown doesn't erase under it).");
+                        m_report.Count("applied-opaque-spin");
+                    }
+                    img.SetValue(newId);
+                    MarkTouched(img, $"Spin|{p.PartName}|S{st.StateId}|IMAGEFILE");
+                }
+            }
+        }
+
+        // controls whose WS_EX_CLIENTEDGE comctl32 paints from the theme (CCDrawNonClientTheme callers).
+        private static readonly string[] ClientEdgeClasses = { "ListView", "TreeView", "ListBox" };
+
+        /// <summary>
+        /// xp only. comctl32 (cutils.c CCDrawNonClientTheme) draws a client edge with the part's background, then
+        /// fills what a BORDERSIZE thinner than the 2px edge leaves with a brush that is white on win10 for Task
+        /// Manager's and the Open dialog's lists: a white ring inside GSM's dark border. SIZINGBORDERWIDTH at the
+        /// edge width skips that fill, so the BORDERFILL (border, then its FILLCOLOR) covers the whole edge.
+        /// Only when the fill isn't white already (Luna's lists look the same either way).
+        /// </summary>
+        private void ThemeWholeClientEdge()
+        {
+            foreach (var name in ClientEdgeClasses)
+            {
+                if (!m_target.ClassesByName.TryGetValue(name, out var tc) || m_target.DuplicateClassNames.Contains(name)
+                    || KeyPattern.Matches(m_opt.Exclude, name, "*", "SIZINGBORDERWIDTH")) continue;
+                if (!tc.Parts.TryGetValue(0, out var part) || !part.States.TryGetValue(0, out var state)) continue;
+                if (!(SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.BGTYPE)?.GetValue() is int bg) || bg != 1) continue;
+                if (!(SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.FILLCOLOR)?.GetValue() is Color fill)
+                    || (fill.R == 255 && fill.G == 255 && fill.B == 255)) continue;
+                if (SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.SIZINGBORDERWIDTH) != null) continue;
+                if (SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.BORDERSIZE)?.GetValue() is int bs && bs >= 2) continue;
+
+                var p = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGBORDERWIDTH, (int)IDENTIFIER.INT) { classID = tc.ClassId, partID = 0, stateID = 0 });
+                p.SetValue(2);
+                state.Properties.Add(p);
+                AddedRecords.Add($"{tc.ClassId}/0/0/{(int)IDENTIFIER.SIZINGBORDERWIDTH}/{(int)IDENTIFIER.INT}");
+                MarkTouched(p, $"{name}|{part.PartName}|S0|SIZINGBORDERWIDTH");
+                m_report.Notes.Add($"{name}: SIZINGBORDERWIDTH 2 added so the theme paints the whole client edge in {fill.R},{fill.G},{fill.B} (comctl32 filled the rest white).");
+                m_report.Count("applied-client-edge");
+            }
         }
 
         // win10 class/part that draws what an xp class/part drew, and the xp class/part whose picture it takes.
@@ -612,6 +693,14 @@ namespace libmsstyle.Import
             // the reading pane was a gradient of GRADIENTCOLOR1-3 on win7 and is a flat 3802 fill on win10.
             // one color can't hold a gradient, the first stop is the closest.
             ("ReadingPane", 1, 0, IDENTIFIER.FILLCOLOR, "ReadingPane", 1, 0, IDENTIFIER.GRADIENTCOLOR1, true),
+            // win10 TaskDialog panes (also the Run box here, which a Windhawk mod draws as one): Luna10 fills them with
+            // stock xp's BTNFACE beige. xp's dialogs were the plain BTNFACE, so GSM's dark Run box came out beige.
+            ("TaskDialog", 1, 0, IDENTIFIER.FILLCOLOR, "sysmetrics", 0, 0, IDENTIFIER.BTNFACE, false),
+            ("TaskDialog", 4, 0, IDENTIFIER.FILLCOLOR, "sysmetrics", 0, 0, IDENTIFIER.BTNFACE, false),
+            ("TaskDialog", 8, 0, IDENTIFIER.FILLCOLOR, "sysmetrics", 0, 0, IDENTIFIER.BTNFACE, false),
+            ("TaskDialog", 8, 0, IDENTIFIER.BORDERCOLOR, "sysmetrics", 0, 0, IDENTIFIER.BTNFACE, false),
+            ("TaskDialog", 9, 0, IDENTIFIER.FILLCOLOR, "sysmetrics", 0, 0, IDENTIFIER.BTNFACE, false),
+            ("TaskDialog", 15, 0, IDENTIFIER.FILLCOLOR, "sysmetrics", 0, 0, IDENTIFIER.BTNFACE, false),
         };
 
         /// <summary>

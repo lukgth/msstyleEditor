@@ -18,6 +18,8 @@ namespace libmsstyle
         public string IniResourceName { get; set; } // e.g. "NORMALBLUE_INI", the NormalSize file
         /// <summary>the other sizes xp offers for this scheme (Font size in Display Properties), NormalSize excluded.</summary>
         public List<XpSize> Sizes { get; } = new List<XpSize>();
+        /// <summary>what XP showed for NormalSize under Font size (packed string 3000+index); null = "Normal".</summary>
+        public string NormalSizeDisplayName { get; set; }
         public override string ToString() => DisplayName == InternalName ? InternalName : $"{DisplayName} ({InternalName})";
     }
 
