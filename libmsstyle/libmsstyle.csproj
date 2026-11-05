@@ -79,11 +79,37 @@
     <Compile Include="Import\StyleCompanions.cs" />
     <Compile Include="Import\StyleValidator.cs" />
     <Compile Include="Import\Win7StyleImporter.cs" />
-    <Compile Include="Import\Win7StockAero.cs" />
+    <Compile Include="Import\UxthemeLoader.cs" />
+    <Compile Include="Import\VariantMaps.cs" />
+    <Compile Include="Import\VariantWriter.cs" />
+    <Compile Include="Import\StockStyles.cs" />
+    <Compile Include="Import\XpShellImport.cs" />
+    <Compile Include="Import\XpShellStyle.cs" />
+    <Compile Include="Import\XpStripRemap.cs" />
+    <Compile Include="Import\XpThemeFiles.cs" />
+    <Compile Include="Import\XpThemeImport.cs" />
     <Compile Include="Margins.cs" />
     <!-- stock win7 aero, the common ancestor the importer diffs custom win7 styles against. -->
     <EmbeddedResource Include="..\libmsstyleTests\styles\w7_aero.msstyles">
       <LogicalName>libmsstyle.Import.w7_aero.msstyles</LogicalName>
+    </EmbeddedResource>
+    <!-- stock windows xp luna.msstyles (all three schemes), the common ancestor for custom xp styles. -->
+    <EmbeddedResource Include="..\libmsstyleTests\styles\xp_luna\luna.msstyles">
+      <LogicalName>libmsstyle.Import.xp_luna.msstyles</LogicalName>
+    </EmbeddedResource>
+    <!-- its Shell\<scheme>\shellstyle.dll: the base for porting a custom xp shellstyle. -->
+    <EmbeddedResource Include="..\libmsstyleTests\styles\xp_luna\Shell\NormalColor\shellstyle.dll">
+      <LogicalName>libmsstyle.Import.xp_luna_shell_normalcolor.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\libmsstyleTests\styles\xp_luna\Shell\Metallic\shellstyle.dll">
+      <LogicalName>libmsstyle.Import.xp_luna_shell_metallic.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\libmsstyleTests\styles\xp_luna\Shell\Homestead\shellstyle.dll">
+      <LogicalName>libmsstyle.Import.xp_luna_shell_homestead.dll</LogicalName>
+    </EmbeddedResource>
+    <!-- %SystemRoot%\System32\shellstyle.dll (xp sp3): what xp's shell32 loads for a theme that ships no Shell folder. -->
+    <EmbeddedResource Include="..\libmsstyleTests\styles\xp_luna\Shell\Classic\shellstyle.dll">
+      <LogicalName>libmsstyle.Import.xp_classic_shell.dll</LogicalName>
     </EmbeddedResource>
     <Compile Include="Platform.cs" />
     <Compile Include="PropertyStream.cs" />
@@ -101,6 +127,7 @@
     <Compile Include="Transform3D.cs" />
     <Compile Include="TransformOpacity.cs" />
     <Compile Include="VisualStyle.cs" />
+    <Compile Include="XpSchema.cs" />
     <Compile Include="XpStyleIniParser.cs" />
     <Compile Include="VisualStyleAnimationMap.cs" />
     <Compile Include="VisualStyleDefinitions.cs" />

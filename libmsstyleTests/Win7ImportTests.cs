@@ -61,7 +61,7 @@ namespace libmsstyleTests
         public void ImportingStockWin7OntoTemplateChangesNothing()
         {
             // no BasePath: the built-in stock aero has to be the same file as the repo copy.
-            CollectionAssert.AreEqual(File.ReadAllBytes(W7Aero), File.ReadAllBytes(Win7StockAero.GetPath()));
+            CollectionAssert.AreEqual(File.ReadAllBytes(W7Aero), File.ReadAllBytes(StockStyles.Win7AeroPath()));
 
             string output = Path.Combine(m_dir, "self.msstyles");
             var r = Win7StyleImporter.Run(new Win7ImportOptions

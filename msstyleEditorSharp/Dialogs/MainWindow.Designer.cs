@@ -40,6 +40,7 @@ namespace msstyleEditor
             this.btFileInfoExport = new System.Windows.Forms.RibbonButton();
             this.btThemeFolder = new System.Windows.Forms.RibbonButton();
             this.btImportWin7 = new System.Windows.Forms.RibbonButton();
+            this.btImportXp = new System.Windows.Forms.RibbonButton();
             this.ribbonPanelTheme = new System.Windows.Forms.RibbonPanel();
             this.btTestTheme = new System.Windows.Forms.RibbonButton();
             this.btReloadTest = new System.Windows.Forms.RibbonButton();
@@ -185,6 +186,7 @@ namespace msstyleEditor
             this.ribbonPanelExtras.Items.Add(this.btFileInfoExport);
             this.ribbonPanelExtras.Items.Add(this.btThemeFolder);
             this.ribbonPanelExtras.Items.Add(this.btImportWin7);
+            this.ribbonPanelExtras.Items.Add(this.btImportXp);
             this.ribbonPanelExtras.Name = "ribbonPanelExtras";
             this.ribbonPanelExtras.Text = "Extras";
             // 
@@ -217,6 +219,16 @@ namespace msstyleEditor
             this.btImportWin7.SmallImage = ((System.Drawing.Image)(resources.GetObject("btFileInfoExport.SmallImage")));
             this.btImportWin7.Text = "Import Win7 Style";
             this.btImportWin7.Click += new System.EventHandler(this.OnImportWin7Style);
+            // 
+            // btImportXp
+            // 
+            this.btImportXp.Image = ((System.Drawing.Image)(resources.GetObject("btFileInfoExport.Image")));
+            this.btImportXp.LargeImage = ((System.Drawing.Image)(resources.GetObject("btFileInfoExport.LargeImage")));
+            this.btImportXp.MaxSizeMode = System.Windows.Forms.RibbonElementSizeMode.Medium;
+            this.btImportXp.Name = "btImportXp";
+            this.btImportXp.SmallImage = ((System.Drawing.Image)(resources.GetObject("btFileInfoExport.SmallImage")));
+            this.btImportXp.Text = "Import WinXP Style";
+            this.btImportXp.Click += new System.EventHandler(this.OnImportXpTheme);
             // 
             // ribbonPanelTheme
             // 
@@ -745,6 +757,7 @@ namespace msstyleEditor
         private System.Windows.Forms.RibbonTab tabInfo;
         private System.Windows.Forms.RibbonButton btThemeFolder;
         private System.Windows.Forms.RibbonButton btImportWin7;
+        private System.Windows.Forms.RibbonButton btImportXp;
         private System.Windows.Forms.ToolStripStatusLabel lbStylePlatform;
         private System.Windows.Forms.RibbonPanel ribbonPanel15;
         private System.Windows.Forms.RibbonButton btAbout;

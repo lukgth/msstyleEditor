@@ -81,5 +81,25 @@ Limitations:
 * Fonts are compared by what they parse to, not their spelling. A font the template doesn't have is added to its string tables, which means the result is saved with the strings inside the `.msstyles`. A font string Windows would reject (an unknown style word fails the whole theme) is never written, and a caption/menu font taller than its bar blocks the result.
 * Pictures the template reuses from stock Windows 7 elsewhere (dark mode classes, extra DPI sizes, shared image ids) get the custom style's version too, unless the custom style gave the parts that shared that picture different looks.
 
+## Porting a Windows XP style (experimental)
+
+In the editor: open a working Windows 10 XP port (for example the `Luna.msstyles` port), click Extras > Import XP Theme, pick a custom Windows XP `.msstyles` and an output folder. Every color scheme is ported; the result window lists each scheme with its report and can open the output folder, install a scheme (copies it to `%WINDIR%\Resources\Themes`, asks for admin, then opens its `.theme`) or open the ported style in the editor. Windows locks the files of the theme in use: to reinstall it, switch to another theme first.
+
+The same from the command line, `msstyleImport import-xp`:
+
+```
+msstyleImport schemes custom_xp.msstyles
+msstyleImport import-xp --source custom_xp.msstyles --template Luna\Luna.msstyles --out-dir out [--scheme NormalColor]... [--name MyStyle] [--write]
+```
+
+With `--write` it produces `out\<Name> <scheme>\<Name> <scheme>.msstyles` (plus the template's `Shell` folder with the source shellstyle's bitmaps) and `out\<Name> <scheme>.theme`; a style with one scheme drops the ` <scheme>` suffix. Copy `out\<Name> <scheme>` to `%WINDIR%\Resources\Themes` and open the `.theme`. Reports go to `out\reports\`.
+
+It's the Windows 7 importer with stock XP Luna (`libmsstyleTests\styles\xp_luna\luna.msstyles`, built in) as the base, `--base-scheme` (default NormalColor) picking the Luna scheme the template was ported from. What differs for XP:
+
+* The XP INI is parsed with the XP schema (`libmsstyle\XpSchema.cs`, generated from `tmschema.h` by `tools\XpSchemaGen.cs`), so part and state ids match the Windows 10 records. Lines XP's own parser rejects are skipped and listed as warnings.
+* Bitmaps become premultiplied PNGs on load: 32bpp ones keep their alpha (when it isn't all 0/255, as XP decides), others get the `Transparent`/`TransparentColor` color key (magenta by default). A missing `ImageLayout` is written as horizontal, XP's default.
+* Where the template re-cut an XP strip into more frames using stock XP frames (Toolbar buttons 6 -> 8, scroll arrows 16 -> 20), the source strip is re-cut the same way. A source picture that doesn't divide into the template's frame count keeps the template's picture.
+* DWMWindow keeps the template's frames: XP has no DWM atlas. The window frames you see come from `Window` when DWM frames are off (Basic mode).
+
 ## Contributors
 * [Shomnipotence](https://github.com/Shomnipotence) - New application icon design

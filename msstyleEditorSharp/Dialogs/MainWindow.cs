@@ -675,12 +675,6 @@ namespace msstyleEditor
                 }
             }
 
-            // Apply color-key transparency for XP images in the view
-            if (m_style.Platform == Platform.WinXP && img is Bitmap xpBmp)
-            {
-                img = ApplyXpTransparency(xpBmp);
-            }
-
             bool xpReadOnly = m_style.Platform == Platform.WinXP;
             btImageExport.Enabled = resource.Data != null;
             btImageImport.Enabled = !xpReadOnly;
@@ -729,7 +723,7 @@ namespace msstyleEditor
             string queuedFile = m_style.GetQueuedResourceUpdate(resource.ResourceId, resource.Type);
             if (!String.IsNullOrEmpty(queuedFile) && File.Exists(queuedFile))
             {
-                if (resource.Type == StyleResourceType.Image && m_style.Platform != Platform.WinXP)
+                if (resource.Type == StyleResourceType.Image)
                 {
                     // Queued IMAGE files are stored with premultiplied alpha, convert back
                     using (var fs = File.OpenRead(queuedFile))
@@ -745,7 +739,8 @@ namespace msstyleEditor
                 }
             }
 
-            if (resource.Type == StyleResourceType.Image && m_style.Platform != Platform.WinXP)
+            // IMAGE resources are premultiplied; xp bitmaps are converted the same way at load.
+            if (resource.Type == StyleResourceType.Image)
             {
                 using (var ms = new MemoryStream(resource.Data))
                 {
@@ -764,92 +759,6 @@ namespace msstyleEditor
                     return new Bitmap(temp);
                 }
             }
-        }
-
-        /// <summary>
-        /// Applies color-key transparency to an XP image.
-        /// Checks for TRANSPARENT and TRANSPARENTCOLOR properties; defaults to magenta (255,0,255).
-        /// </summary>
-        private Bitmap ApplyXpTransparency(Bitmap bmp)
-        {
-            // Look for TransparentColor and Transparent properties in the part/state context
-            Color transparentColor = Color.Empty;
-            bool isTransparent = false;
-
-            // Check state, then part common properties
-            StyleState[] searchStates = GetTransparencySearchStates();
-            foreach (var state in searchStates)
-            {
-                if (state == null) continue;
-                foreach (var prop in state.Properties)
-                {
-                    if (prop.Header.nameID == (int)IDENTIFIER.TRANSPARENT_ && prop.GetValue() is bool b)
-                    {
-                        isTransparent = b;
-                    }
-                    else if (prop.Header.nameID == (int)IDENTIFIER.TRANSPARENTCOLOR && prop.GetValue() is Color c)
-                    {
-                        transparentColor = c;
-                    }
-                }
-            }
-
-            if (!isTransparent)
-                return bmp;
-
-            // XP falls back to magenta (255, 0, 255) when no TransparentColor is specified
-            if (transparentColor.IsEmpty)
-                transparentColor = Color.FromArgb(255, 0, 255);
-
-            // Apply color-key transparency: create a 32bpp copy with matching pixels set to transparent
-            var result = new Bitmap(bmp.Width, bmp.Height, PixelFormat.Format32bppArgb);
-            for (int y = 0; y < bmp.Height; y++)
-            {
-                for (int x = 0; x < bmp.Width; x++)
-                {
-                    Color px = bmp.GetPixel(x, y);
-                    if (px.R == transparentColor.R && px.G == transparentColor.G && px.B == transparentColor.B)
-                    {
-                        result.SetPixel(x, y, Color.Transparent);
-                    }
-                    else
-                    {
-                        result.SetPixel(x, y, px);
-                    }
-                }
-            }
-            return result;
-        }
-
-        private StyleState[] GetTransparencySearchStates()
-        {
-            var states = new List<StyleState>();
-
-            // Current state
-            if (m_selection.State != null)
-                states.Add(m_selection.State);
-
-            // Part common properties (state 0)
-            if (m_selection.Part != null)
-            {
-                StyleState commonState;
-                if (m_selection.Part.States.TryGetValue(0, out commonState))
-                    states.Add(commonState);
-            }
-
-            // Class common properties (part 0, state 0)
-            if (m_selection.Class != null)
-            {
-                StylePart commonPart;
-                if (m_selection.Class.Parts.TryGetValue(0, out commonPart))
-                {
-                    StyleState commonState;
-                    if (commonPart.States.TryGetValue(0, out commonState))
-                        states.Add(commonState);
-                }
-            }
-
-            return states.ToArray();
         }
 
         private void SaveResourceBitmap(Bitmap bmp, StyleResourceType type, string outputPath)
@@ -1215,6 +1124,81 @@ namespace msstyleEditor
             }
         }
 
+        private async void OnImportXpTheme(object sender, EventArgs e)
+        {
+            if (m_style == null || (m_style.Platform != Platform.Win10 && m_style.Platform != Platform.Win11))
+            {
+                MessageBox.Show(this, "Open the Windows 10 XP port to build on first (e.g. a Luna port that already works on your system).",
+                    "Import Windows XP Style", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            string source;
+            using (var ofd = new OpenFileDialog { Title = "Windows XP style to import", Filter = "Visual Style (*.msstyles)|*.msstyles" })
+            {
+                if (ofd.ShowDialog(this) != DialogResult.OK) return;
+                source = ofd.FileName;
+            }
+
+            string outDir;
+            using (var fbd = new FolderBrowserDialog { Description = "Folder for the ported theme (one style folder and .theme per color scheme)" })
+            {
+                if (fbd.ShowDialog(this) != DialogResult.OK) return;
+                outDir = fbd.SelectedPath;
+            }
+
+            // the open style may have unsaved edits, so the template is a snapshot of it, not its file.
+            string work = Path.Combine(Path.GetTempPath(), "msstyleEditor-import", DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+            string snapshot = Path.Combine(work, "template", Path.GetFileName(m_style.Path));
+            var opt = new libmsstyle.Import.XpThemeImportOptions
+            {
+                SourcePath = source,
+                TemplatePath = snapshot,
+                // the snapshot sits alone in temp; Shell and the .mui come from the file that's open.
+                CompanionSourcePath = m_style.Path,
+                OutDir = outDir,
+                Write = true,
+            };
+
+            List<libmsstyle.Import.XpSchemeResult> results;
+            Cursor = Cursors.WaitCursor;
+            btImportXp.Enabled = false;
+            UpdateStatusText("Importing " + Path.GetFileName(source) + "...");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(snapshot));
+                m_style.Save(snapshot, true);
+                results = await System.Threading.Tasks.Task.Run(() => libmsstyle.Import.XpThemeImport.Run(opt,
+                    (scheme, file) => BeginInvoke((Action)(() => UpdateStatusText($"Importing {Path.GetFileName(source)}: {scheme.DisplayName.Trim()}...")))));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "Import failed!", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                UpdateStatusText("Import failed.");
+                return;
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+                btImportXp.Enabled = true;
+            }
+
+            string open = null;
+            using (var dlg = new XpImportDialog(results, outDir))
+            {
+                dlg.ShowDialog(this);
+                open = dlg.StyleToOpen;
+            }
+
+            int ok = results.Count(r => r.Ok);
+            if (open != null)
+            {
+                CloseStyle();
+                OpenStyle(open);
+            }
+            UpdateStatusText($"XP import: {ok} of {results.Count} color schemes ported to {outDir}.");
+        }
+
         private void OnControlPreview(object sender, EventArgs e)
         {
             var dlg = new ControlDemoDialog();
@@ -1485,34 +1469,16 @@ namespace msstyleEditor
                 {
                     using (var bmp = LoadResourceAsBitmap(m_selectedImage))
                     {
-                        Bitmap exportBmp = bmp;
-                        bool disposeExport = false;
-
-                        // For XP styles, apply transparency (color-key or 32bpp alpha)
-                        if (m_style.Platform == Platform.WinXP)
+                        if (m_selectedCropRect.HasValue)
                         {
-                            exportBmp = ApplyXpTransparency(bmp);
-                            disposeExport = exportBmp != bmp;
-                        }
-
-                        try
-                        {
-                            if (m_selectedCropRect.HasValue)
+                            using (var cropped = CropImage(bmp, m_selectedCropRect.Value))
                             {
-                                using (var cropped = CropImage(exportBmp, m_selectedCropRect.Value))
-                                {
-                                    cropped.Save(sfd.FileName, ImageFormat.Png);
-                                }
-                            }
-                            else
-                            {
-                                exportBmp.Save(sfd.FileName, ImageFormat.Png);
+                                cropped.Save(sfd.FileName, ImageFormat.Png);
                             }
                         }
-                        finally
+                        else
                         {
-                            if (disposeExport)
-                                exportBmp.Dispose();
+                            bmp.Save(sfd.FileName, ImageFormat.Png);
                         }
                     }
                 }

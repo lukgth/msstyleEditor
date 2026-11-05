@@ -7,10 +7,20 @@ namespace libmsstyle.Import
 {
     public class Win7ImportOptions
     {
-        /// <summary>the customized windows 7 style.</summary>
+        /// <summary>the customized windows 7 (or, with <see cref="SourcePlatform"/> WinXP, windows xp) style.</summary>
         public string SourcePath { get; set; }
-        /// <summary>unmodified windows 7 aero, the common ancestor of the source. Empty = the copy built into libmsstyle.</summary>
+        /// <summary>unmodified stock style the source was made from: win7 aero or xp luna. Empty = the copy built into libmsstyle.</summary>
         public string BasePath { get; set; }
+        /// <summary>Win7 (default; Vista styles too) or WinXP. Source and base must both be this generation.</summary>
+        public Platform SourcePlatform { get; set; } = Platform.Win7;
+        /// <summary>xp only: color scheme of the source to import (internal or display name). Empty = the first one.</summary>
+        public string SourceScheme { get; set; }
+        /// <summary>xp only: size of the source scheme to import ("LargeFonts"). Empty = NormalSize.</summary>
+        public string SourceSize { get; set; }
+        /// <summary>xp only: scheme of the base the template was ported from (NormalColor, Metallic, HomeStead). Empty = the first one.</summary>
+        public string BaseScheme { get; set; }
+        /// <summary>xp only: the source's shellstyle.dll. Empty = Shell\&lt;SourceScheme&gt;\shellstyle.dll next to the source, if there is one.</summary>
+        public string SourceShellStylePath { get; set; }
         /// <summary>known-working windows 10 style; the output is a modified copy of this file.</summary>
         public string TemplatePath { get; set; }
         /// <summary>where the candidate goes. Ignored for dry runs.</summary>

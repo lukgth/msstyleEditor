@@ -36,18 +36,75 @@ namespace libmsstyle
         }
 
         /// <summary>
-        /// Converts raw DIB data (from RT_BITMAP PE resources) to PNG byte array.
-        /// Handles 32bpp with proper alpha preservation (GDI+ normally drops alpha on BMP load).
+        /// Converts an XP RT_BITMAP (raw DIB) into a png the way uxtheme stores IMAGE resources:
+        /// premultiplied ARGB.
+        /// 32bpp: XP's themeldr only uses the alpha channel when some pixel is partially
+        /// transparent (utils.cpp PreMultiplyAlpha "true alpha"); otherwise the image is opaque.
+        /// <paramref name="transparentKey"/>: pixels of exactly that rgb become alpha 0 (XP's
+        /// TRANSPARENT / TRANSPARENTCOLOR color key, applied to non-alpha images only).
+        /// <paramref name="anyAlpha"/>: DirectUI's rule instead (shellstyle rcbmp mode 2, directui
+        /// convert.cpp HasAlphaChannel): any non-zero alpha means the alpha channel is used, so
+        /// 0/255-only bitmaps keep their transparent pixels.
         /// </summary>
-        public static byte[] ConvertDibToPng(byte[] dib)
+        public static byte[] ConvertXpDibToPremultipliedPng(byte[] dib, Color? transparentKey, bool anyAlpha = false)
         {
             short biBitCount = BitConverter.ToInt16(dib, 14);
-
             using (Bitmap bmp = biBitCount == 32 ? CreateArgbBitmapFromDib(dib) : CreateBitmapFromDib(dib))
-            using (var ms = new MemoryStream())
             {
-                bmp.Save(ms, ImageFormat.Png);
-                return ms.ToArray();
+                int w = bmp.Width, h = bmp.Height;
+                var px = new int[w * h];
+                var bd = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                try
+                {
+                    for (int y = 0; y < h; ++y) Marshal.Copy(IntPtr.Add(bd.Scan0, y * bd.Stride), px, y * w, w);
+                }
+                finally { bmp.UnlockBits(bd); }
+
+                bool trueAlpha = false;
+                if (biBitCount == 32)
+                {
+                    foreach (int p in px)
+                    {
+                        uint a = (uint)p >> 24;
+                        if (anyAlpha ? a != 0 : a != 0 && a != 255) { trueAlpha = true; break; }
+                    }
+                }
+
+                int key = transparentKey.HasValue ? transparentKey.Value.ToArgb() & 0xFFFFFF : -1;
+                for (int i = 0; i < px.Length; ++i)
+                {
+                    uint p = (uint)px[i];
+                    if (trueAlpha)
+                    {
+                        uint a = p >> 24;
+                        uint r = ((p >> 16) & 0xFF) * a / 255, g = ((p >> 8) & 0xFF) * a / 255, b = (p & 0xFF) * a / 255;
+                        px[i] = (int)((a << 24) | (r << 16) | (g << 8) | b);
+                    }
+                    else if (key >= 0 && (int)(p & 0xFFFFFF) == key)
+                    {
+                        px[i] = 0;
+                    }
+                    else
+                    {
+                        px[i] = (int)(p | 0xFF000000);
+                    }
+                }
+
+                // stored premultiplied: write the pixels as plain ARGB so GDI+ doesn't un-premultiply.
+                using (var outBmp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+                {
+                    var od = outBmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                    try
+                    {
+                        for (int y = 0; y < h; ++y) Marshal.Copy(px, y * w, IntPtr.Add(od.Scan0, y * od.Stride), w);
+                    }
+                    finally { outBmp.UnlockBits(od); }
+                    using (var ms = new MemoryStream())
+                    {
+                        outBmp.Save(ms, ImageFormat.Png);
+                        return ms.ToArray();
+                    }
+                }
             }
         }
 
@@ -117,9 +174,12 @@ namespace libmsstyle
                 int colors = biClrUsed > 0 ? biClrUsed : (1 << biBitCount);
                 colorTableSize = colors * 4;
             }
-            else if (biCompression == 3 && biSize == 40)
+            else
             {
-                colorTableSize = 12;
+                // BI_BITFIELDS masks, then an optional palette of biClrUsed entries: 16/24/32 bpp DIBs may still
+                // carry one (appows' 24bpp separators have 16), and the pixels start after it.
+                if (biCompression == 3 && biSize == 40) colorTableSize = 12;
+                colorTableSize += Math.Max(0, biClrUsed) * 4;
             }
 
             int fileHeaderSize = 14;

@@ -142,7 +142,12 @@ namespace libmsstyle.Import
             if (c.Platform != t.Platform) Error($"candidate is detected as {c.Platform}, template as {t.Platform}");
             var stored = cInv.GetData(cInv.Entries.First(e => e.Type == "VARIANT"));
             var reser = c.SerializeProperties();
-            if (!stored.SequenceEqual(reser)) Error("candidate VARIANT doesn't survive parse -> serialize unchanged");
+            if (!stored.SequenceEqual(reser))
+            {
+                int at = 0;
+                while (at < stored.Length && at < reser.Length && stored[at] == reser[at]) at++;
+                Error($"candidate VARIANT doesn't survive parse -> serialize unchanged (stored {stored.Length} bytes, re-serialized {reser.Length}, first difference at 0x{at:X})");
+            }
             else Check($"candidate VARIANT ({stored.Length} bytes) parses without diagnostics and re-serializes byte-identically.");
         }
 
@@ -202,6 +207,8 @@ namespace libmsstyle.Import
             var closed = new HashSet<string>();
             string current = null;
             int cursor = 0, n = 0;
+            var sizeByType = ExternalRecordSizes(tInv.GetData(tInv.Entries.First(e => e.Type == "VARIANT")));
+            var badSize = new List<string>();
             while (cursor < data.Length - 4)
             {
                 int start = cursor;
@@ -226,8 +233,15 @@ namespace libmsstyle.Import
                     current = tuple;
                 }
                 n++;
+                // records with an external id carry no payload, but the declared size is still read:
+                // a FONT declaring anything but a LOGFONTW (0x5C) makes win10 reject the whole theme
+                // (seen live with an xp import that left the INI string length there).
+                if (p.Header.shortFlag != 0 && sizeByType.TryGetValue(p.Header.typeID, out int want) && p.Header.sizeInBytes != want)
+                    badSize.Add($"{tuple} name {p.Header.nameID}: declares {p.Header.sizeInBytes} bytes, the template's type {p.Header.typeID} records declare {want}");
             }
             Check($"{n} records read sequentially; every class/part/state group is contiguous.");
+            foreach (var b in badSize.Take(20)) Error("record size: " + b);
+            if (badSize.Count == 0) Check("every external-id record declares the same size as the template's records of its type.");
 
             // same reason as the class set above: the order classes first show up in VARIANT is
             // the registration order BCMAP parents are relative to.
@@ -240,6 +254,25 @@ namespace libmsstyle.Import
                 Error($"classes show up in VARIANT in a different order than in the template (first difference at position {at}), which shifts BCMAP parents");
             }
             else Check($"{cOrder.Count} classes show up in VARIANT in the template's order.");
+        }
+
+        /// <summary>type id -> declared size of external-id records, where the template is consistent.</summary>
+        private static Dictionary<int, int> ExternalRecordSizes(byte[] data)
+        {
+            var seen = new Dictionary<int, HashSet<int>>();
+            int cursor = 0;
+            while (cursor < data.Length - 4)
+            {
+                int start = cursor;
+                StyleProperty p;
+                try { p = PropertyStream.ReadNextProperty(data, ref cursor); }
+                catch (Exception) { break; }
+                if (cursor <= start) break;
+                if (p.Header.shortFlag == 0) continue;
+                if (!seen.TryGetValue(p.Header.typeID, out var s)) seen[p.Header.typeID] = s = new HashSet<int>();
+                s.Add(p.Header.sizeInBytes);
+            }
+            return seen.Where(kv => kv.Value.Count == 1).ToDictionary(kv => kv.Key, kv => kv.Value.First());
         }
 
         private static List<int> ClassOrder(byte[] data)

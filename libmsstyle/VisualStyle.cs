@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -83,9 +84,6 @@ namespace libmsstyle
         // Structured representations (new - replaces hex editing approach)
         private CMap m_cmapStruct;
         private BcMap m_bcmapStruct;
-
-        // XP-specific: maps image file paths (from INI) to BITMAP resource names
-        private Dictionary<string, string> m_xpImageMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         // XP-specific: the selected color scheme
         private XpColorScheme m_xpColorScheme;
@@ -216,21 +214,21 @@ namespace libmsstyle
                 throw new IOException("Could not write the changes to the file!");
             }
 
-            // signature
-            byte[] signature = new byte[]
-            {
-                0x72, 0x68, 0xC5, 0x5F, 0x1F, 0x00, 0xA4, 0x9B, 0xFF, 0x90, 0xB2, 0x94, 0x7F, 0x76, 0x38, 0x38,
-                0x48, 0xD3, 0x9D, 0x80, 0xB2, 0x69, 0x0C, 0x52, 0xBC, 0x82, 0xDA, 0x1D, 0xC8, 0x54, 0xD4, 0xE3,
-                0xD4, 0xC7, 0xA6, 0x79, 0xD1, 0x06, 0xBD, 0x44, 0xDD, 0x99, 0x57, 0x9C, 0x3E, 0xDD, 0xAD, 0xA6,
-                0x58, 0x16, 0x49, 0xC7, 0x55, 0x93, 0x0E, 0xD1, 0x89, 0xB0, 0x71, 0x63, 0x2E, 0xE9, 0xDF, 0x02,
-                0x26, 0x88, 0xEF, 0x56, 0x25, 0x5A, 0xA4, 0x04, 0xD5, 0xAB, 0x71, 0x31, 0xC2, 0x48, 0x29, 0xC4,
-                0x13, 0xD0, 0x5B, 0x81, 0x3D, 0xCC, 0x27, 0x0A, 0xD6, 0xEE, 0x5C, 0x9E, 0x99, 0xE9, 0x53, 0x6D,
-                0x87, 0x72, 0x41, 0x44, 0xAF, 0x61, 0xA0, 0x87, 0xE2, 0x3C, 0xE0, 0x62, 0x98, 0x26, 0xBF, 0xE7,
-                0x80, 0xFF, 0x23, 0xCA, 0xF7, 0xC6, 0x34, 0x6C, 0x9A, 0xA8, 0xA1, 0xA6, 0xEE, 0xA4, 0xB6, 0xEE
-            };
-            Signature.AppendSignature(file, signature);
-
+            Signature.AppendSignature(file, PackthemSignature);
         }
+
+        /// <summary>the signature msstyleEditor appends to every saved style.</summary>
+        internal static readonly byte[] PackthemSignature = new byte[]
+        {
+            0x72, 0x68, 0xC5, 0x5F, 0x1F, 0x00, 0xA4, 0x9B, 0xFF, 0x90, 0xB2, 0x94, 0x7F, 0x76, 0x38, 0x38,
+            0x48, 0xD3, 0x9D, 0x80, 0xB2, 0x69, 0x0C, 0x52, 0xBC, 0x82, 0xDA, 0x1D, 0xC8, 0x54, 0xD4, 0xE3,
+            0xD4, 0xC7, 0xA6, 0x79, 0xD1, 0x06, 0xBD, 0x44, 0xDD, 0x99, 0x57, 0x9C, 0x3E, 0xDD, 0xAD, 0xA6,
+            0x58, 0x16, 0x49, 0xC7, 0x55, 0x93, 0x0E, 0xD1, 0x89, 0xB0, 0x71, 0x63, 0x2E, 0xE9, 0xDF, 0x02,
+            0x26, 0x88, 0xEF, 0x56, 0x25, 0x5A, 0xA4, 0x04, 0xD5, 0xAB, 0x71, 0x31, 0xC2, 0x48, 0x29, 0xC4,
+            0x13, 0xD0, 0x5B, 0x81, 0x3D, 0xCC, 0x27, 0x0A, 0xD6, 0xEE, 0x5C, 0x9E, 0x99, 0xE9, 0x53, 0x6D,
+            0x87, 0x72, 0x41, 0x44, 0xAF, 0x61, 0xA0, 0x87, 0xE2, 0x3C, 0xE0, 0x62, 0x98, 0x26, 0xBF, 0xE7,
+            0x80, 0xFF, 0x23, 0xCA, 0xF7, 0xC6, 0x34, 0x6C, 0x9A, 0xA8, 0xA1, 0xA6, 0xEE, 0xA4, 0xB6, 0xEE
+        };
 
 
         private bool SaveResources(IntPtr moduleHandle, IntPtr updateHandle)
@@ -292,11 +290,11 @@ namespace libmsstyle
                 {
                     foreach (var state in part.Value.States.OrderBy(s => s.Key))
                     {
-                        state.Value.Properties.Sort(Comparer<StyleProperty>.Create(
-                            (p1, p2) =>
-                            {
-                                return p1.Header.nameID.CompareTo(p2.Header.nameID);
-                            }));
+                        // stable: a state can hold several records with one name id (DWMWindow's
+                        // ATLASRECTs). List.Sort is unstable and reordered them differently from run to run.
+                        var sorted = state.Value.Properties.OrderBy(p => p.Header.nameID).ToList();
+                        state.Value.Properties.Clear();
+                        state.Value.Properties.AddRange(sorted);
 
                         foreach (var prop in state.Value.Properties)
                         {
@@ -779,6 +777,7 @@ namespace libmsstyle
         {
             m_platform = Platform.WinXP;
             m_xpColorSchemes = XpStyleIniParser.ParseThemesIni(themesIniData);
+            XpThemeDisplayName = XpStyleIniParser.ThemeDisplayName(themesIniData);
 
             if (m_xpColorSchemes.Count == 0)
             {
@@ -792,63 +791,193 @@ namespace libmsstyle
         /// <summary>
         /// Loads or reloads the XP style with the specified color scheme.
         /// Called initially from LoadXp() and can be called again when user selects a different scheme.
+        ///
+        /// After parsing, XP's text references are turned into what a packed win10 style holds, so
+        /// the rest of libmsstyle (and the importer) reads them like any other style:
+        /// IMAGEFILE*/GLYPHIMAGEFILE get a style-local IMAGE id whose bytes are the BITMAP converted
+        /// to a premultiplied png with XP's transparency applied, FONT gets an id into a string table
+        /// built from the INI font strings. The ids exist only in memory (<see cref="GetRawResource"/>).
         /// </summary>
-        public void LoadXpWithScheme(XpColorScheme scheme)
+        /// <param name="size">one of <see cref="XpColorScheme.Sizes"/>; null = NormalSize.</param>
+        public void LoadXpWithScheme(XpColorScheme scheme, XpSize size = null)
         {
             m_xpColorScheme = scheme;
+            m_xpSize = size;
             m_classes.Clear();
-            m_xpImageMap.Clear();
+            m_xpImages.Clear();
+            m_xpDiagnostics.Clear();
             m_numProps = 0;
 
-            byte[] iniData = ResourceAccess.GetResource(m_moduleHandle, "TEXTFILE", scheme.IniResourceName);
+            string iniName = size?.IniResourceName ?? scheme.IniResourceName;
+            byte[] iniData = ResourceAccess.GetResource(m_moduleHandle, "TEXTFILE", iniName);
             if (iniData == null)
             {
-                throw new Exception($"Could not load INI resource '{scheme.IniResourceName}'!");
+                throw new Exception($"Could not load INI resource '{iniName}'!");
             }
 
-            XpStyleIniParser.ParseSchemeIni(iniData, m_classes);
+            XpStyleIniParser.ParseSchemeIni(iniData, m_classes, m_xpDiagnostics);
 
-            // Build image map: scan all FILENAME properties and map file paths to resource names
-            foreach (var cls in m_classes)
+            var fonts = new Dictionary<int, string>();
+            var fontIds = new Dictionary<string, int>(StringComparer.Ordinal);
+            var imageIds = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var cls in m_classes.Values)
             {
-                foreach (var part in cls.Value.Parts)
+                foreach (var part in cls.Parts.Values)
                 {
-                    foreach (var state in part.Value.States)
+                    foreach (var state in part.States.Values)
                     {
-                        foreach (var prop in state.Value.Properties)
+                        foreach (var prop in state.Properties.ToList())
                         {
-                            if (prop.Header.typeID == (int)IDENTIFIER.FILENAME)
-                            {
-                                string filePath = prop.GetValue() as string;
-                                if (!string.IsNullOrEmpty(filePath))
-                                {
-                                    string resName = XpStyleIniParser.ImageFileToResourceName(filePath);
-                                    m_xpImageMap[filePath] = resName;
-                                }
-                            }
                             ++m_numProps;
+                            string text = prop.GetValue() as string;
+                            if (prop.Header.typeID == (int)IDENTIFIER.FONT)
+                            {
+                                if (!fontIds.TryGetValue(text, out int fid))
+                                {
+                                    fid = XpFontIdBase + fontIds.Count;
+                                    fontIds[text] = fid;
+                                    fonts[fid] = text;
+                                }
+                                prop.SetValue(fid);
+                                // the INI text set sizeInBytes from the string length; a packed FONT record
+                                // declares a LOGFONTW (0x5C), and win10 uxtheme rejects the theme otherwise.
+                                prop.Header.sizeInBytes = new PropertyHeader(prop.Header.nameID, prop.Header.typeID).sizeInBytes;
+                            }
+                            else if (prop.Header.typeID == (int)IDENTIFIER.FILENAME && XpImageIds.Contains(prop.Header.nameID))
+                            {
+                                int id = ResolveXpImage(cls, part.PartId, state.StateId, prop, text, imageIds);
+                                if (id > 0)
+                                {
+                                    prop.SetValue(id);
+                                    prop.Header.sizeInBytes = new PropertyHeader(prop.Header.nameID, prop.Header.typeID).sizeInBytes;
+                                }
+                                else state.Properties.Remove(prop);
+                            }
                         }
                     }
                 }
             }
+
+            // xp imagefile.cpp: a missing IMAGELAYOUT means HORIZONTAL; win10 defaults to VERTICAL.
+            // Write xp's default into every state that has a strip and inherits no layout, so the
+            // meaning survives on win10.
+            foreach (var cls in m_classes.Values)
+                foreach (var part in cls.Parts.Values)
+                    foreach (var state in part.States.Values)
+                    {
+                        if (!state.Properties.Any(p => p.Header.typeID == (int)IDENTIFIER.FILENAME && p.Header.nameID != (int)IDENTIFIER.GLYPHIMAGEFILE)) continue;
+                        if (FindXpEffective(cls, part.PartId, state.StateId, IDENTIFIER.IMAGELAYOUT) != null) continue;
+                        var layout = new StyleProperty(new PropertyHeader((int)IDENTIFIER.IMAGELAYOUT, (int)IDENTIFIER.ENUM)
+                            { classID = cls.ClassId, partID = part.PartId, stateID = state.StateId });
+                        layout.SetValue(1);
+                        state.Properties.Add(layout);
+                        ++m_numProps;
+                    }
+
+            m_stringTables.Clear();
+            m_stringTables[XpStringLanguage] = fonts;
+            m_stringTable = fonts;
+        }
+
+        private const int XpFontIdBase = 1000;
+        private const int XpStringLanguage = 1033;
+
+        // IMAGEFILE..IMAGEFILE5, STOCKIMAGEFILE, GLYPHIMAGEFILE (XP tmschema.h 3001-3008).
+        internal static readonly HashSet<int> XpImageIds = new HashSet<int> { 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008 };
+
+        // style-local IMAGE id -> png bytes, XP only.
+        private readonly Dictionary<int, byte[]> m_xpImages = new Dictionary<int, byte[]>();
+        private readonly List<string> m_xpDiagnostics = new List<string>();
+
+        /// <summary>
+        /// XP only: INI sections and properties XP's own parser would reject (unknown names, bad
+        /// values) and image references without a bitmap. Each was skipped, nothing was guessed.
+        /// </summary>
+        public IReadOnlyList<string> XpDiagnostics => m_xpDiagnostics;
+
+        public XpColorScheme XpColorScheme => m_xpColorScheme;
+        /// <summary>XP only: the loaded size, null for NormalSize.</summary>
+        public XpSize XpSize => m_xpSize;
+        private XpSize m_xpSize;
+        /// <summary>XP only: THEMES_INI [Documentation] DisplayName.</summary>
+        public string XpThemeDisplayName { get; private set; }
+
+        /// <summary>XP only: stores a png under a fresh style-local IMAGE id (the importer re-cuts strips this way).</summary>
+        internal int AddXpImage(byte[] png)
+        {
+            if (m_platform != Platform.WinXP) throw new InvalidOperationException("in-memory images exist only for xp styles");
+            int id = m_xpImages.Count == 0 ? 1 : m_xpImages.Keys.Max() + 1;
+            m_xpImages[id] = png;
+            return id;
+        }
+
+        private int ResolveXpImage(StyleClass cls, int part, int state, StyleProperty prop, string file, Dictionary<string, int> ids)
+        {
+            string resName = XpStyleIniParser.ImageFileToResourceName(file);
+            // RT_BITMAP = "#2"
+            byte[] dib = ResourceAccess.GetResource(m_moduleHandle, "#2", resName);
+            if (dib == null)
+            {
+                m_xpDiagnostics.Add($"{cls.ClassName} part {part} state {state} {SemanticPropertyName(prop)} = {file}: no BITMAP {resName} in the style; property skipped");
+                return 0;
+            }
+
+            Color? key = XpColorKey(cls, part, state, prop.Header.nameID);
+
+            string k = resName + "|" + (key.HasValue ? key.Value.ToArgb().ToString("X8") : "-");
+            if (ids.TryGetValue(k, out int id)) return id;
+            byte[] png;
+            try
+            {
+                png = ImageConverter.ConvertXpDibToPremultipliedPng(dib, key);
+            }
+            catch (Exception ex)
+            {
+                m_xpDiagnostics.Add($"{cls.ClassName} part {part} state {state}: BITMAP {resName} can't be converted ({ex.Message}); property skipped");
+                return 0;
+            }
+            id = ids.Count + 1;
+            ids[k] = id;
+            m_xpImages[id] = png;
+            return id;
         }
 
         /// <summary>
-        /// Loads a BITMAP resource from the PE for XP styles.
-        /// RT_BITMAP resources contain raw DIB data (no BITMAPFILEHEADER).
-        /// Converts to PNG bytes with proper 32bpp alpha support.
+        /// The color key xp draws this image with, or null for none.
+        /// uxtheme imagefile.cpp: TRANSPARENT/TRANSPARENTCOLOR for the background image,
+        /// GLYPHTRANSPARENT/GLYPHTRANSPARENTCOLOR for the glyph; magenta when no color is set.
+        /// With GlyphType = ImageGlyph and an ImageSelectType, ImageFile1-5 are sizes of the glyph
+        /// (their parent is _GlyphInfo), so they take the glyph's transparency: ScrollBar ARROWBTN's
+        /// 8bpp glyph strips otherwise keep their magenta.
         /// </summary>
-        public byte[] GetXpBitmapResource(string resourceName)
+        internal Color? XpColorKey(StyleClass cls, int part, int state, int nameId)
         {
-            if (string.IsNullOrEmpty(resourceName))
-                return null;
+            bool sizeSlot = nameId >= (int)IDENTIFIER.IMAGEFILE1 && nameId <= (int)IDENTIFIER.IMAGEFILE5;
+            var gt = FindXpEffective(cls, part, state, IDENTIFIER.GLYPHTYPE);
+            var ist = FindXpEffective(cls, part, state, IDENTIFIER.IMAGESELECTTYPE);
+            bool imageGlyph = gt?.GetValue() is int g && g == XpSchema.Enums["GLYPHTYPE"]["IMAGEGLYPH"]
+                && ist?.GetValue() is int s && s != XpSchema.Enums["IMAGESELECTTYPE"]["NONE"];
+            bool glyph = nameId == (int)IDENTIFIER.GLYPHIMAGEFILE || (sizeSlot && imageGlyph);
 
-            // RT_BITMAP = "#2"
-            byte[] dib = ResourceAccess.GetResource(m_moduleHandle, "#2", resourceName);
-            if (dib == null)
-                return null;
+            var tp = FindXpEffective(cls, part, state, glyph ? IDENTIFIER.GLYPHTRANSPARENT : IDENTIFIER.TRANSPARENT_);
+            if (!(tp?.GetValue() is bool b && b)) return null;
+            var tc = FindXpEffective(cls, part, state, glyph ? IDENTIFIER.GLYPHTRANSPARENTCOLOR : IDENTIFIER.TRANSPARENTCOLOR);
+            return tc?.GetValue() is Color c ? c : Color.FromArgb(255, 0, 255);
+        }
 
-            return ImageConverter.ConvertDibToPng(dib);
+        private static string SemanticPropertyName(StyleProperty p) =>
+            VisualStyleProperties.PROPERTY_INFO_MAP.TryGetValue(p.Header.nameID, out var info) ? info.Name : "PROP" + p.Header.nameID;
+
+        // XP lookup order inside a section family: state, part state 0, class part 0, then globals.
+        private StyleProperty FindXpEffective(StyleClass cls, int part, int state, IDENTIFIER name)
+        {
+            StyleProperty Local(StyleClass c, int p, int s) =>
+                c.Parts.TryGetValue(p, out var sp) && sp.States.TryGetValue(s, out var ss)
+                    ? ss.Properties.FirstOrDefault(x => x.Header.nameID == (int)name) : null;
+            var hit = Local(cls, part, state) ?? Local(cls, part, 0) ?? Local(cls, 0, 0);
+            if (hit != null) return hit;
+            var globals = m_classes.Values.FirstOrDefault(c => c.ClassName.Equals("globals", StringComparison.OrdinalIgnoreCase));
+            return globals == null ? null : Local(globals, 0, 0);
         }
 
         void LoadClassmap(byte[] cmap)
@@ -1318,24 +1447,7 @@ namespace libmsstyle
                 case (int)IDENTIFIER.FILENAME:
                 case (int)IDENTIFIER.FILENAME_LITE:
                     {
-                        // XP: FILENAME value is a string path, load from BITMAP resource
-                        if (m_platform == Platform.WinXP)
-                        {
-                            string filePath = prop.GetValue() as string;
-                            if (string.IsNullOrEmpty(filePath))
-                                return null;
-
-                            string resName;
-                            if (!m_xpImageMap.TryGetValue(filePath, out resName))
-                                resName = XpStyleIniParser.ImageFileToResourceName(filePath);
-
-                            byte[] data = GetXpBitmapResource(resName);
-                            // Use the hash code as a pseudo resource ID for XP
-                            int resId = resName.GetHashCode();
-                            return new StyleResource(data, resId, StyleResourceType.Image);
-                        }
-
-                        byte[] imgData = ResourceAccess.GetResource(m_moduleHandle, "IMAGE", (uint)prop.Header.shortFlag);
+                        byte[] imgData = GetRawResource("IMAGE", prop.Header.shortFlag & 0xFFFF);
                         return new StyleResource(imgData, prop.Header.shortFlag, StyleResourceType.Image);
                     }
                 case (int)IDENTIFIER.DISKSTREAM:
@@ -1352,10 +1464,13 @@ namespace libmsstyle
 
         /// <summary>
         /// Bytes of an IMAGE or STREAM resource as stored in the loaded file (queued updates ignored).
+        /// XP styles have no IMAGE resources; their converted bitmaps are served from memory.
         /// </summary>
         public byte[] GetRawResource(string type, int id)
         {
             if (id <= 0 || id > 0xFFFF) return null;
+            if (m_platform == Platform.WinXP)
+                return type == "IMAGE" && m_xpImages.TryGetValue(id, out var png) ? png : null;
             return ResourceAccess.GetResource(m_moduleHandle, type, (uint)id);
         }
 

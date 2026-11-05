@@ -43,28 +43,34 @@ namespace libmsstyle.Import
         public ImportReport Execute()
         {
             var r = m_report;
+            bool xp = m_opt.SourcePlatform == Platform.WinXP;
+            if (xp) r.Tool = "msstyleEditor xp importer";
             r.DryRun = m_opt.DryRun;
-            r.Inputs["source"] = m_opt.SourcePath;
-            r.Inputs["base"] = string.IsNullOrEmpty(m_opt.BasePath) ? "(built-in stock windows 7 aero)" : m_opt.BasePath;
+            r.Inputs["source"] = m_opt.SourcePath + (xp ? $" (scheme {m_opt.SourceScheme ?? "first"})" : "");
+            r.Inputs["base"] = (string.IsNullOrEmpty(m_opt.BasePath) ? (xp ? "(built-in stock windows xp luna)" : "(built-in stock windows 7 aero)") : m_opt.BasePath)
+                + (xp ? $" (scheme {m_opt.BaseScheme ?? "first"})" : "");
             r.Inputs["template"] = m_opt.TemplatePath;
 
             string candidate = null;
             try
             {
-                if (string.IsNullOrEmpty(m_opt.BasePath)) m_opt.BasePath = Win7StockAero.GetPath();
+                if (string.IsNullOrEmpty(m_opt.BasePath)) m_opt.BasePath = xp ? StockStyles.XpLunaPath() : StockStyles.Win7AeroPath();
                 CheckPaths();
                 using (var baseStyle = new VisualStyle())
                 using (var sourceStyle = new VisualStyle())
                 using (var target = new VisualStyle())
                 using (var targetInv = new ResourceInventory(m_opt.TemplatePath))
                 {
-                    LoadChecked(baseStyle, m_opt.BasePath, "base", Platform.Win7);
-                    LoadChecked(sourceStyle, m_opt.SourcePath, "source", Platform.Win7);
-                    LoadChecked(target, m_opt.TemplatePath, "template", Platform.Win10);
+                    LoadChecked(baseStyle, m_opt.BasePath, "base", m_opt.SourcePlatform, m_opt.BaseScheme);
+                    LoadChecked(sourceStyle, m_opt.SourcePath, "source", m_opt.SourcePlatform, m_opt.SourceScheme);
+                    LoadChecked(target, m_opt.TemplatePath, "template", Platform.Win10, null);
                     if (r.Errors.Count > 0)
                     {
                         return Finish(null);
                     }
+                    AlignClassNames(sourceStyle, target);
+                    AlignClassNames(baseStyle, target);
+                    if (xp) new XpStripRemap(baseStyle, sourceStyle, target, r).Run();
 
                     m_source = new SemanticModel(sourceStyle);
                     m_base = new SemanticModel(baseStyle);
@@ -89,7 +95,10 @@ namespace libmsstyle.Import
                     CompareClasses();
                     BuildThreeWayDiff();
                     new DwmImport(this).Run();
+                    var shell = xp ? OpenShellStyles() : null;
+                    shell?.Snapshot();
                     MergeGenericClasses();
+                    shell?.Run();
                     ReportTemplateOnlyImages();
                     CollectFrameWaivers();
 
@@ -129,6 +138,78 @@ namespace libmsstyle.Import
         }
 
         private string m_validationDir;
+
+        private XpShellStyle m_srcShell, m_baseShell;
+
+        /// <summary>
+        /// source and stock shellstyle for this scheme. A source without Shell\&lt;scheme&gt;\shellstyle.dll is drawn
+        /// on xp with %SystemRoot%\System32\shellstyle.dll (shell32 SHGetShellStyleHInstance falls back to it),
+        /// the classic one: system color names, resolved here with the source's own SysMetrics colors.
+        /// </summary>
+        private XpShellImport OpenShellStyles()
+        {
+            string src = m_opt.SourceShellStylePath ?? XpShellImport.FindShellStyle(m_opt.SourcePath, m_opt.SourceScheme ?? "NormalColor");
+            IReadOnlyDictionary<string, Color> sysColors = null;
+            if (src == null)
+            {
+                src = StockStyles.XpClassicShellPath();
+                sysColors = SourceSysColors();
+                m_report.Notes.Add($"shellstyle: no Shell\\{m_opt.SourceScheme ?? "NormalColor"}\\shellstyle.dll next to the source; xp draws its task pane with the classic System32 shellstyle in the theme's system colors, so that's the source shellstyle.");
+            }
+            try
+            {
+                m_srcShell = new XpShellStyle(src, sysColors);
+                m_baseShell = new XpShellStyle(StockStyles.XpLunaShellPath(m_opt.BaseScheme));
+            }
+            catch (Exception ex) when (ex is IOException || ex is InvalidDataException || ex is ArgumentException)
+            {
+                m_report.Warnings.Add($"shellstyle \"{src}\" not used: {ex.Message}");
+                return null;
+            }
+            m_report.Inputs["shellstyle"] = src;
+            return new XpShellImport(this, m_srcShell, m_baseShell, classicFallback: sysColors != null);
+        }
+
+        // DUI color names (directui parser.cpp _sct) -> the SysMetrics color they read, and the value xp uses when
+        // the theme leaves it out (uxtheme loader.cpp DefaultColors; matches GetSysColor on the xp vm under Flarn).
+        private static readonly (string Name, IDENTIFIER Id, Color Default)[] DuiSysColors =
+        {
+            ("window", IDENTIFIER.WINDOW, Color.FromArgb(255, 255, 255)), ("windowtext", IDENTIFIER.WINDOWTEXT, Color.FromArgb(0, 0, 0)),
+            ("buttonface", IDENTIFIER.BTNFACE, Color.FromArgb(212, 208, 200)), ("buttontext", IDENTIFIER.BTNTEXT, Color.FromArgb(0, 0, 0)),
+            ("activecaption", IDENTIFIER.ACTIVECAPTION, Color.FromArgb(10, 36, 106)), ("captiontext", IDENTIFIER.CAPTIONTEXT, Color.FromArgb(255, 255, 255)),
+            ("inactivecaption", IDENTIFIER.INACTIVECAPTION, Color.FromArgb(128, 128, 128)), ("highlight", IDENTIFIER.HIGHLIGHT, Color.FromArgb(10, 36, 106)),
+            ("highlighttext", IDENTIFIER.HIGHLIGHTTEXT, Color.FromArgb(255, 255, 255)), ("graytext", IDENTIFIER.GRAYTEXT, Color.FromArgb(128, 128, 128)),
+            ("buttonshadow", IDENTIFIER.BTNSHADOW, Color.FromArgb(128, 128, 128)), ("buttonhighlight", IDENTIFIER.BTNHIGHLIGHT, Color.FromArgb(255, 255, 255)),
+        };
+
+        private Dictionary<string, Color> SourceSysColors()
+        {
+            var d = new Dictionary<string, Color>(StringComparer.OrdinalIgnoreCase);
+            m_source.ClassesByName.TryGetValue("sysmetrics", out var sc);
+            foreach (var (name, id, def) in DuiSysColors)
+                d[name] = sc != null && SemanticModel.FindEffective(m_source.Style, sc, 0, 0, id)?.GetValue() is Color c ? c : def;
+            return d;
+        }
+
+        /// <summary>the copied win10 shellstyle (Shell\NormalColor, the only folder the .theme names) gets the source's bitmaps.</summary>
+        private void PatchShellBitmaps()
+        {
+            if (m_srcShell == null) return;
+            string target = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(m_opt.OutputPath)), "Shell", "NormalColor", "shellstyle.dll");
+            if (!File.Exists(target)) return;
+            try
+            {
+                var ids = XpShellImport.PatchShellStyleBitmaps(target, m_srcShell, m_baseShell, false);
+                m_report.Notes.Add(ids.Count > 0
+                    ? $"shellstyle: replaced bitmaps {string.Join(", ", ids)} in Shell\\NormalColor\\shellstyle.dll with the source shellstyle's."
+                    : "shellstyle: the source shellstyle's bitmaps are stock; the win10 shellstyle's stay.");
+                m_report.Count("shellstyle-bitmaps-replaced", ids.Count);
+            }
+            catch (IOException ex)
+            {
+                m_report.Warnings.Add("shellstyle bitmaps not replaced: " + ex.Message);
+            }
+        }
         private string CompanionSource => string.IsNullOrEmpty(m_opt.CompanionSourcePath) ? m_opt.TemplatePath : m_opt.CompanionSourcePath;
 
         private ImportReport Finish(string candidate)
@@ -146,6 +227,7 @@ namespace libmsstyle.Import
                     r.Notes.Add(copied.Count > 0
                         ? "copied next to the candidate (windows needs them to load the shellstyle and strings): " + string.Join(", ", copied)
                         : $"no Shell folder or .mui next to \"{CompanionSource}\"; without a Shell folder windows can't load a shellstyle for this style.");
+                    PatchShellBitmaps();
                 }
                 catch (Exception ex)
                 {
@@ -156,6 +238,8 @@ namespace libmsstyle.Import
             {
                 try { Directory.Delete(m_validationDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
             }
+            m_srcShell?.Dispose();
+            m_baseShell?.Dispose();
 
             if (r.Status == ImportStatus.Blocked)
                 r.StatusText = "blocked: offline validation or import failed, no candidate was kept.";
@@ -193,21 +277,65 @@ namespace libmsstyle.Import
             Directory.CreateDirectory(outDir);
         }
 
-        private void LoadChecked(VisualStyle style, string path, string role, Platform expected)
+        private void LoadChecked(VisualStyle style, string path, string role, Platform expected, string xpScheme)
         {
             style.Load(path);
             foreach (var d in style.LoadDiagnostics)
             {
                 m_report.Errors.Add($"{role} \"{path}\" has property stream damage: {d}");
             }
-            bool ok = expected == Platform.Win7
-                ? style.Platform == Platform.Win7 || style.Platform == Platform.Vista
+            bool ok = expected == Platform.WinXP ? style.Platform == Platform.WinXP
+                : expected == Platform.Win7 ? style.Platform == Platform.Win7 || style.Platform == Platform.Vista
                 : style.Platform == Platform.Win10 || style.Platform == Platform.Win11;
             if (!ok)
             {
                 m_report.Errors.Add($"{role} \"{path}\" was detected as {style.Platform.ToDisplayString()}, expected {expected.ToDisplayString()}.");
+                return;
+            }
+            if (style.Platform == Platform.WinXP)
+            {
+                if (!string.IsNullOrEmpty(xpScheme))
+                {
+                    var scheme = style.XpColorSchemes.FirstOrDefault(s => s.InternalName.Equals(xpScheme, StringComparison.OrdinalIgnoreCase))
+                        ?? style.XpColorSchemes.FirstOrDefault(s => s.DisplayName.Equals(xpScheme, StringComparison.OrdinalIgnoreCase));
+                    if (scheme == null)
+                    {
+                        m_report.Errors.Add($"{role} \"{path}\" has no color scheme \"{xpScheme}\" (has: {string.Join(", ", style.XpColorSchemes.Select(s => s.InternalName))}).");
+                        return;
+                    }
+                    XpSize size = null;
+                    if (role == "source" && !string.IsNullOrEmpty(m_opt.SourceSize) && !m_opt.SourceSize.Equals("NormalSize", StringComparison.OrdinalIgnoreCase))
+                    {
+                        size = scheme.Sizes.FirstOrDefault(z => z.InternalName.Equals(m_opt.SourceSize, StringComparison.OrdinalIgnoreCase));
+                        if (size == null)
+                        {
+                            m_report.Errors.Add($"{role} scheme {scheme.InternalName} has no size \"{m_opt.SourceSize}\" (has: NormalSize{string.Concat(scheme.Sizes.Select(z => ", " + z.InternalName))}).");
+                            return;
+                        }
+                    }
+                    if (scheme != style.XpColorScheme || size != style.XpSize) style.LoadXpWithScheme(scheme, size);
+                }
+                // the same INI lines xp's own parser rejects; skipped, so the import matches what xp drew.
+                foreach (var d in style.XpDiagnostics)
+                    m_report.Warnings.Add($"{role} ini: {d}");
+                m_report.Notes.Add($"{role}: color scheme {style.XpColorScheme} ({style.XpSize?.IniResourceName ?? style.XpColorScheme.IniResourceName}).");
             }
             m_report.Notes.Add($"{role}: {style.Platform.ToDisplayString()}, {style.Classes.Count} classes, {style.NumProperties} properties.");
+        }
+
+        /// <summary>
+        /// XP class names are case-insensitive ("button", "SysMetrics"), the semantic keys aren't:
+        /// classes the template also has take the template's spelling.
+        /// </summary>
+        private static void AlignClassNames(VisualStyle style, VisualStyle template)
+        {
+            if (style.Platform != Platform.WinXP) return;
+            var names = template.Classes.Values.GroupBy(c => c.ClassName, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().ClassName, StringComparer.OrdinalIgnoreCase);
+            foreach (var c in style.Classes.Values)
+            {
+                if (names.TryGetValue(c.ClassName, out var n)) c.ClassName = n;
+            }
         }
 
         /// <summary>
@@ -348,10 +476,104 @@ namespace libmsstyle.Import
                 ThreeWay(any.ClassName, any.PartName, any.StateId, any.PropertyName, b, s, a, m_source, any.PartNameKnown);
             }
 
+            if (m_source.Platform == Platform.WinXP) FollowMovedImages(locked);
             PropagateImages(locked);
             FillDpiSlots(locked);
             CopyIntoTemplateOverrides();
             MirrorIntoWin10Classes();
+            if (m_source.Platform == Platform.WinXP) FillFlatFromXp();
+            if (m_source.Platform == Platform.WinXP) SingleImageIntoDpiSlots();
+        }
+
+        // win10 class/part that draws what an xp class/part drew, and the xp class/part whose picture it takes.
+        // Explorer::TreeView doesn't inherit TreeView; its HOTGLYPH (no xp counterpart) shows the same +/- as GLYPH.
+        private static readonly (string Class, string Part, string FromClass, string FromPart)[] XpImageHeirs =
+        {
+            ("Explorer::TreeView", "GLYPH", "TreeView", "GLYPH"),
+            ("Explorer::TreeView", "HOTGLYPH", "TreeView", "GLYPH"),
+        };
+
+        /// <summary>
+        /// xp only. A source state with one IMAGEFILE where the template picks its picture from IMAGEFILE1-7
+        /// (IMAGESELECTTYPE set): uxtheme then never reads IMAGEFILE, so GSM's tree +/- glyphs showed Luna10's.
+        /// Every template dpi slot of that state gets the source's picture, in the part itself and in the
+        /// win10 parts that replaced it (<see cref="XpImageHeirs"/>). Only when the source changed the picture.
+        /// </summary>
+        private void SingleImageIntoDpiSlots()
+        {
+            foreach (var s in m_source.Entries.Where(e => e.ResourceType == "IMAGE" && e.NameId == (int)IDENTIFIER.IMAGEFILE).ToList())
+            {
+                if (m_source.Entries.Any(o => o.StateKey == s.StateKey && DpiSlotIds.Contains(o.NameId))) continue;
+                if (m_base.ByKey.TryGetValue(s.Key, out var b) && Same(m_base, b, m_source, s)) continue;
+                var targets = new[] { (s.ClassName, s.PartName) }.Concat(XpImageHeirs
+                    .Where(h => string.Equals(h.FromClass, s.ClassName, StringComparison.OrdinalIgnoreCase) && h.FromPart == s.PartName)
+                    .Select(h => (h.Class, h.Part)));
+                foreach (var (cls, partName) in targets)
+                {
+                    if (m_target.DuplicateClassNames.Contains(cls) || KeyPattern.Matches(m_opt.Exclude, cls, partName, "IMAGEFILE*")) continue;
+                    var slots = m_target.Entries.Where(t => t.ClassName == cls && t.PartName == partName && t.StateId == s.StateId
+                        && t.ResourceType == "IMAGE" && DpiSlotIds.Contains(t.NameId) && !m_touched.Contains(t.Property)).ToList();
+                    if (slots.Count == 0) continue;
+                    var tcls = m_target.Style.Classes[slots[0].Property.Header.classID];
+                    if (SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, s.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ist && ist == 0) continue;
+                    foreach (var t in slots.Where(t => !Same(m_source, s, m_target, t)))
+                        ApplyExtra(t, s, b, "applied-single-image-slot",
+                            $"xp sets one IMAGEFILE; the template picks {t.PropertyName} by dpi, so it gets the source's picture"
+                            + (cls == s.ClassName && partName == s.PartName ? "" : $" ({cls} {partName} draws what xp's {s.ClassName} {s.PartName} drew)"));
+                }
+            }
+        }
+
+        // win10 parts the template draws with a light picture, and the xp color that filled the same area on xp.
+        private static readonly (string Class, int Part, string FromClass, int FromPart, IDENTIFIER FromProp, string Why)[] XpFlatFills =
+        {
+            // xp has no Edit BACKGROUND: a text box's inside is the EDITTEXT fill. win10's themed edit paints
+            // EP_BACKGROUND first, and Luna10's white picture made GSM's dark address bar and text boxes white.
+            ("Edit", 3, "Edit", 1, IDENTIFIER.FILLCOLOR, "win10 paints Edit BACKGROUND under the text; xp's EDITTEXT fill"),
+            // explorer's pane splitters (shellstyle dtb(PreviewPane, 3/4, 0)): Luna10 has a beige 3px picture.
+            // xp's folders pane splitter was a plain BTNFACE bar.
+            ("PreviewPane", 3, "sysmetrics", 0, IDENTIFIER.BTNFACE, "the nav pane splitter was xp's BTNFACE"),
+            ("PreviewPane", 4, "sysmetrics", 0, IDENTIFIER.BTNFACE, "the reading pane splitter was xp's BTNFACE"),
+        };
+
+        /// <summary>
+        /// xp only: <see cref="XpFlatFills"/>. When the source's color differs from stock, the template picture
+        /// (state 0, BGTYPE imagefile) becomes a borderless fill in that color.
+        /// </summary>
+        private void FillFlatFromXp()
+        {
+            foreach (var f in XpFlatFills)
+            {
+                if (!m_target.ClassesByName.TryGetValue(f.Class, out var tc) || m_target.DuplicateClassNames.Contains(f.Class)
+                    || !m_source.ClassesByName.TryGetValue(f.FromClass, out var sc) || !m_base.ClassesByName.TryGetValue(f.FromClass, out var bc)
+                    || KeyPattern.Matches(m_opt.Exclude, f.Class, "*", "FILLCOLOR")) continue;
+                var sp = SemanticModel.FindEffective(m_source.Style, sc, f.FromPart, 0, f.FromProp);
+                var bp = SemanticModel.FindEffective(m_base.Style, bc, f.FromPart, 0, f.FromProp);
+                if (!(sp?.GetValue() is Color fill) || (bp?.GetValue() is Color stock && stock.ToArgb() == fill.ToArgb())) continue;
+                if (!tc.Parts.TryGetValue(f.Part, out var part) || !part.States.TryGetValue(0, out var state)) continue;
+                var bg = state.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.BGTYPE);
+                if (bg == null || !(bg.GetValue() is int t) || t != 0 || m_touched.Contains(bg)) continue; // only an untouched imagefile background
+
+                string label = $"{f.Class}|{part.PartName}|S0|";
+                bg.SetValue(1); // BORDERFILL
+                MarkTouched(bg, label + "BGTYPE");
+                foreach (var (id, type, value) in new (IDENTIFIER, IDENTIFIER, object)[] { (IDENTIFIER.BORDERSIZE, IDENTIFIER.INT, 0), (IDENTIFIER.FILLCOLOR, IDENTIFIER.COLOR, fill) })
+                {
+                    var p = state.Properties.FirstOrDefault(x => x.Header.nameID == (int)id);
+                    if (p == null)
+                    {
+                        p = new StyleProperty(new PropertyHeader((int)id, (int)type) { classID = tc.ClassId, partID = f.Part, stateID = 0 });
+                        state.Properties.Add(p);
+                        AddedRecords.Add($"{tc.ClassId}/{f.Part}/0/{(int)id}/{(int)type}");
+                    }
+                    if (value is Color c) p.SetValue(c); else p.SetValue((int)value);
+                    MarkTouched(p, label + id);
+                }
+                var s = m_source.Entries.First(e => ReferenceEquals(e.Property, sp));
+                Decide(s, "applied-flat-fill", $"{f.Why} replaces the template's picture on {f.Class} part {f.Part}",
+                    null, s, null, $"BORDERFILL {SemanticModel.FormatValue(sp)}");
+                m_report.Count("applied-flat-fill");
+            }
         }
 
         // confidence belongs to the role mapping, not just to the destination property's consumer.
@@ -362,10 +584,21 @@ namespace libmsstyle.Import
             // win7's nav pane is ProperTree's FILLCOLORHINT (shellstyle UIFILE), not the tree's own fill;
             // a style can set the two differently and win7 shows the hint.
             ("ExplorerNavPane", 0, 0, IDENTIFIER.FILLCOLOR, "ProperTree", 2, 0, IDENTIFIER.FILLCOLORHINT, true),
+            // xp's folders pane is a plain TreeView. win10 draws it with ExplorerNavPane and Explorer::TreeView,
+            // win10-only classes that don't inherit TreeView, so GSM's dark tree pane stayed white.
+            ("ExplorerNavPane", 0, 0, IDENTIFIER.FILLCOLOR, "TreeView", 0, 0, IDENTIFIER.FILLCOLOR, false),
+            ("Explorer::TreeView", 0, 0, IDENTIFIER.FILLCOLOR, "TreeView", 0, 0, IDENTIFIER.FILLCOLOR, false),
+            ("Explorer::TreeView", 0, 0, IDENTIFIER.BORDERCOLOR, "TreeView", 0, 0, IDENTIFIER.BORDERCOLOR, false),
+            // the win10 shellstyle pads the tree host 1px left / 3px right and paints the padding with
+            // gtc(PROPERTREE, 2, 0, 3802): white strips beside GSM's dark tree. xp had no ProperTree.
+            ("ProperTree", 2, 0, IDENTIFIER.FILLCOLOR, "TreeView", 0, 0, IDENTIFIER.FILLCOLOR, false),
             // verified unique-color probe: normal nav labels and drive titles use WINDOWTEXT on win7.
             ("ExplorerNavPane", 0, 0, IDENTIFIER.TEXTCOLOR, "sysmetrics", 0, 0, IDENTIFIER.WINDOWTEXT, true),
             // win10 drive titles use ItemsView's common text, not LISTITEM state text.
             ("ItemsView", 0, 0, IDENTIFIER.TEXTCOLOR, "sysmetrics", 0, 0, IDENTIFIER.WINDOWTEXT, true),
+            // win10 defview paints the folder list with ItemsView's common fill (GSM's dark window stayed white);
+            // xp drew the list in the WINDOW system color.
+            ("ItemsView", 0, 0, IDENTIFIER.FILLCOLOR, "sysmetrics", 0, 0, IDENTIFIER.WINDOW, false),
             // verified open-dialog probe: win10 reads PROPERTY filename states; win7 uses WINDOWTEXT.
             ("ItemsView", 4, 2, IDENTIFIER.TEXTCOLOR, "sysmetrics", 0, 0, IDENTIFIER.WINDOWTEXT, true),
             ("ItemsView", 4, 3, IDENTIFIER.TEXTCOLOR, "sysmetrics", 0, 0, IDENTIFIER.WINDOWTEXT, true),
@@ -423,6 +656,12 @@ namespace libmsstyle.Import
                 var sp = SemanticModel.FindEffective(m_source.Style, sc, part, a.StateId, (IDENTIFIER)a.NameId);
                 var bp = SemanticModel.FindEffective(m_base.Style, bc, part, a.StateId, (IDENTIFIER)a.NameId);
                 if (sp == null || sp.Header.typeID != a.TypeId) continue;
+                // a non-color value only found through the part-0 fallback describes the whole control, not
+                // this part: TangoLux's Combobox common BGTYPE=imagefile turned Address::ComboBox
+                // TRANSPARENTBACKGROUND (BGTYPE none, a part xp never had) into the combo border image,
+                // and the address bar stuck out. colors still follow through the fallback.
+                if (a.TypeId != (int)IDENTIFIER.COLOR && part != 0
+                    && !m_source.Entries.Any(e => e.ClassName == sc.ClassName && e.PartId == part && e.NameId == a.NameId)) continue;
                 bool sourceChanged = bp == null || SemanticModel.FormatValue(sp) != SemanticModel.FormatValue(bp);
                 if (sourceChanged)
                     CopyInto(a, sp, "copied-into-override", $"template-only {a.PropertyName} hid the source's {sc.ClassName} value; copied it in");
@@ -465,9 +704,12 @@ namespace libmsstyle.Import
                 if (s0 != null && SemanticModel.FormatValue(sv) == SemanticModel.FormatValue(s0)) continue;
                 var bv = SemanticModel.FindEffective(m_base.Style, bc, sourcePart, state, (IDENTIFIER)a.NameId);
                 var tv = SemanticModel.FindEffective(m_target.Style, cls, a.PartId, state, (IDENTIFIER)a.NameId);
+                bool sourceStock = bv != null && SemanticModel.FormatValue(sv) == SemanticModel.FormatValue(bv);
                 // stock win7 had this per-state value too and the template already shows it: nothing to fix.
-                if (bv != null && tv != null && SemanticModel.FormatValue(sv) == SemanticModel.FormatValue(bv)
-                    && SemanticModel.FormatValue(tv) == SemanticModel.FormatValue(bv)) continue;
+                if (sourceStock && tv != null && SemanticModel.FormatValue(tv) == SemanticModel.FormatValue(bv)) continue;
+                // xp ports were written for win10, so a win10-only class showing something else in a state
+                // the source left stock is the port author's choice (Luna's *GoComposited::Toolbar pressed text).
+                if (sourceStock && m_source.Platform == Platform.WinXP) continue;
                 if (KeyPattern.Matches(m_opt.Exclude, a.ClassName, a.PartName, a.PropertyName)) continue;
                 var s = m_source.Entries.First(e => ReferenceEquals(e.Property, sv));
                 var prop = new StyleProperty((PropertyHeader)a.Property.Header.Clone());
@@ -527,6 +769,28 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
+        /// xp only: the ports moved some stock pictures to another slot of the same part and state
+        /// (TrayNotifyHoriz::Button: xp IMAGEFILE, the Luna port IMAGEFILE1 of a dpi set). The merge
+        /// then sees the source's IMAGEFILE as a property the template dropped. A template picture
+        /// that is pixel-equal to stock xp's picture of another slot in the same part/state follows
+        /// the source's version of that slot, if the source changed it and it fits the template's frames.
+        /// </summary>
+        private void FollowMovedImages(Dictionary<string, string> locked)
+        {
+            foreach (var a in m_target.Entries.Where(e => e.ResourceType == "IMAGE" && !m_touched.Contains(e.Property)
+                && !locked.ContainsKey(e.PartKey) && !m_target.DuplicateClassNames.Contains(e.ClassName)
+                && !KeyPattern.Matches(m_opt.Exclude, e.ClassName, e.PartName, e.PropertyName)).ToList())
+            {
+                if (m_base.ByKey.TryGetValue(a.Key, out var own) && Same(m_base, own, m_target, a)) continue;
+                var stock = m_base.Entries.FirstOrDefault(b => b.ResourceType == "IMAGE" && b.ClassName == a.ClassName
+                    && b.PartName == a.PartName && b.StateId == a.StateId && b.NameId != a.NameId && Same(m_base, b, m_target, a));
+                if (stock == null || !m_source.ByKey.TryGetValue(stock.Key, out var s) || Same(m_base, stock, m_source, s)) continue;
+                ApplyExtra(a, s, stock, "applied-moved-slot",
+                    $"template moved the stock {stock.PropertyName} picture to {a.PropertyName}; took the source's {stock.PropertyName}");
+            }
+        }
+
+        /// <summary>
         /// Second pass over template images nobody touched, including template-only properties
         /// (win10 classes, dark mode copies, extra dpi sizes):
         /// 1. the picture is a stock win7 picture (pixel compare) -> the source's version of it;
@@ -566,6 +830,13 @@ namespace libmsstyle.Import
                     continue;
                 }
                 int id = set.First();
+                // the replacement is a picture this run added: its bytes are in the allocator.
+                if (m_source.Platform == Platform.WinXP && m_alloc.Added.TryGetValue("IMAGE/" + id, out var bytes)
+                    && !FitsTargetFrames(m_source, null, e.Property, ImageIdentity.Analyze(bytes), out string why))
+                {
+                    r.Warnings.Add($"{e.ClassName}|{e.PartName}|S{e.StateId}|{e.PropertyName}: shares IMAGE {e.ResourceId} with replaced properties, but {why}.");
+                    continue;
+                }
                 e.Property.SetValue(id);
                 MarkTouched(e.Property, $"{e.ClassName}|{e.PartName}|S{e.StateId}|{e.PropertyName}");
                 Decide(e, "applied-shared-id", $"uses IMAGE {e.ResourceId} like properties that were replaced; follows them to {id}", null, null, e, id.ToString());
@@ -605,6 +876,8 @@ namespace libmsstyle.Import
         // the source's whole strip geometry, extra dpi slots included.
         private HashSet<string> m_scalarChanges = new HashSet<string>(StringComparer.Ordinal);
         private HashSet<string> m_sourceGeometryParts = new HashSet<string>(StringComparer.Ordinal);
+        // xp: parts whose template geometry was retuned around stock art the source replaced; the source's numbers win there.
+        private HashSet<string> m_stockArtParts = new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>
         /// Parts (class|part) where taking the source's strip geometry piecemeal would mix it with
@@ -637,6 +910,14 @@ namespace libmsstyle.Import
                 // (applied-picture-with-geometry). only template art the source left alone (template-only
                 // slots above) would end up cut with the wrong numbers.
                 if (b.ResourceType == "IMAGE") continue;
+                // xp: the template retuned a number but still draws stock pictures in this part
+                // (Luna10 TrayNotifyHoriz::TrayNotify SIZINGMARGINS l34 -> l20 on the stock strip). that
+                // number was fitted to stock art; with the source's own pictures, the source's numbers fit.
+                if (conflict && StockArtReplacedBySource(b.ClassName, b.PartName))
+                {
+                    conflict = false;
+                    m_stockArtParts.Add(b.PartKey);
+                }
                 if (conflict)
                     locked[b.PartKey] = $"{b.PropertyName} in this part is a template adaptation, so the part's strip geometry stays with the template";
                 else
@@ -650,6 +931,25 @@ namespace libmsstyle.Import
             }
             m_scalarChanges = new HashSet<string>(scalarChange.Keys, StringComparer.Ordinal);
             return locked;
+        }
+
+        /// <summary>
+        /// xp only: every picture of the part in the template is still the stock one of its own key, and
+        /// the source replaced at least one of them. ExplorerBar is left out: its task pane art comes from
+        /// the shellstyle (<see cref="XpShellImport"/>), not the msstyles pictures.
+        /// </summary>
+        private bool StockArtReplacedBySource(string cls, string part)
+        {
+            if (m_source.Platform != Platform.WinXP || string.Equals(cls, "ExplorerBar", StringComparison.OrdinalIgnoreCase)) return false;
+            var imgs = m_target.Entries.Where(t => t.ResourceType == "IMAGE" && t.ClassName == cls && t.PartName == part).ToList();
+            if (imgs.Count == 0) return false;
+            bool replaced = false;
+            foreach (var t in imgs)
+            {
+                if (!m_base.ByKey.TryGetValue(t.Key, out var b) || !Same(m_base, b, m_target, t)) return false;
+                if (m_source.ByKey.TryGetValue(t.Key, out var s) && !Same(m_base, b, m_source, s)) replaced = true;
+            }
+            return replaced;
         }
 
         /// <summary>
@@ -675,14 +975,23 @@ namespace libmsstyle.Import
                     && o.ResourceType == "IMAGE" && (o.NameId == (int)IDENTIFIER.IMAGEFILE || DpiSlotIds.Contains(o.NameId))
                     && m_touched.Contains(o.Property));
                 if (!replaced) continue;
-                var from = m_source.Entries
-                    .Where(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE"
-                        && (DpiSlotIds.Contains(s.NameId) || s.NameId == (int)IDENTIFIER.IMAGEFILE))
-                    .OrderByDescending(s => DpiSlotIds.Contains(s.NameId) ? s.NameId : 0)
-                    .FirstOrDefault();
+                // a part drawn as an image glyph with IMAGESELECTTYPE (Luna10 Toolbar SPLITBUTTONDROPDOWN, the
+                // back/forward dropdown arrows) picks its glyph from IMAGEFILE1-7: those slots are glyph sizes
+                // and get the source's GLYPHIMAGEFILE. Filling them with the button background left no arrow.
+                bool glyphSlots = m_target.Style.Classes.TryGetValue(e.Property.Header.classID, out var tcls)
+                    && SemanticModel.FindEffective(m_target.Style, tcls, e.PartId, e.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int gt && gt == 1
+                    && SemanticModel.FindEffective(m_target.Style, tcls, e.PartId, e.StateId, IDENTIFIER.IMAGESELECTTYPE) != null;
+                var from = glyphSlots
+                    ? m_source.Entries.FirstOrDefault(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE" && s.NameId == (int)IDENTIFIER.GLYPHIMAGEFILE)
+                    : m_source.Entries
+                        .Where(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE"
+                            && (DpiSlotIds.Contains(s.NameId) || s.NameId == (int)IDENTIFIER.IMAGEFILE))
+                        .OrderByDescending(s => DpiSlotIds.Contains(s.NameId) ? s.NameId : 0)
+                        .FirstOrDefault();
                 if (from == null || Same(m_source, from, m_target, e)) continue;
                 ApplyExtra(e, from, null, "applied-dpi-fill",
-                    $"template-only dpi slot in a state that now uses the source's pictures; took the source's largest ({from.PropertyName})");
+                    glyphSlots ? "template-only dpi slot of an image glyph in a state that now uses the source's pictures; took the source's GLYPHIMAGEFILE"
+                               : $"template-only dpi slot in a state that now uses the source's pictures; took the source's largest ({from.PropertyName})");
             }
         }
 
@@ -845,6 +1154,18 @@ namespace libmsstyle.Import
             }
             if (a == null)
             {
+                // xp: BGTYPE says how the part's records are drawn. the win10 port often never had one (Luna10's
+                // Combobox is a plain border fill), so uxtheme's default (BORDERFILL) would ignore the source's
+                // IMAGEFILE that does come over: TangoLux's address box lost its frame picture. it's added.
+                // the same goes for colors: Luna10 dropped Combobox's FILLCOLOR, and GSM's address box came out white.
+                if (src.Platform == Platform.WinXP && (s.NameId == (int)IDENTIFIER.BGTYPE || s.TypeId == (int)IDENTIFIER.COLOR) && TryAddRecord(s, src, out string bgWhy))
+                {
+                    Decide(s, "added", s.TypeId == (int)IDENTIFIER.COLOR
+                        ? "template dropped this color; xp still draws with it, so the source's color was added"
+                        : "template has no BGTYPE here; without it uxtheme ignores the source's image, so the source's BGTYPE was added", b, s, null, null);
+                    r.Count("added");
+                    return true;
+                }
                 string why = m_target.ClassesByName.ContainsKey(cls)
                     ? "template has no such property here (removed or renamed for win10)"
                     : "class doesn't exist in the template";
@@ -883,6 +1204,8 @@ namespace libmsstyle.Import
                         if (a.ResourceType == "IMAGE" && ReferenceEquals(src, m_source)
                             && !string.Equals(cls, DwmClass, StringComparison.OrdinalIgnoreCase) && GeometryIsSource(s, a))
                             pictureFollows = true;
+                        else if (m_stockArtParts.Contains(s.PartKey) && GeometryIds.Contains(s.NameId))
+                            forced = true;
                         else
                         {
                             Decide(s, "kept-target", "template changed this away from stock win7 (intentional win10 adaptation)", b, s, a, null);
@@ -1134,6 +1457,37 @@ namespace libmsstyle.Import
             return true;
         }
 
+        /// <summary>
+        /// xp only: a strip picture must divide into the frame count the target property ends up
+        /// with. The win10 xp ports re-cut strips into frame counts xp never had (Header HEADERITEM
+        /// 5 -> 12 with new art); an xp picture there would be sliced into garbage, so the template's
+        /// picture stays. Win7 imports keep their own rule (validator frame waivers).
+        /// </summary>
+        private bool FitsTargetFrames(SemanticModel src, SemanticEntry s, StyleProperty target, ImageInfo info, out string error)
+        {
+            error = null;
+            if (src.Platform != Platform.WinXP || info == null || !info.Decodable || target.Header.nameID == (int)IDENTIFIER.GLYPHIMAGEFILE
+                || target.Header.typeID != (int)IDENTIFIER.FILENAME) return true;
+            if (!m_target.Style.Classes.TryGetValue(target.Header.classID, out var cls)) return true;
+            var countProp = SemanticModel.FindEffective(m_target.Style, cls, target.Header.partID, target.Header.stateID, IDENTIFIER.IMAGECOUNT);
+            var layoutProp = SemanticModel.FindEffective(m_target.Style, cls, target.Header.partID, target.Header.stateID, IDENTIFIER.IMAGELAYOUT);
+            int count = countProp?.GetValue() is int c && c > 0 ? c : 1;
+            bool horizontal = layoutProp?.GetValue() is int l && l == 1;
+            int len = horizontal ? info.Width : info.Height;
+            if (len % count == 0) return true;
+            // xp drew this very strip with the same cut: uxtheme slices length / count (integer division) on xp and
+            // win10 alike, the spare rows are never shown. appows' 53px frame borders with ImageCount 2.
+            if (s != null && src.Style.Classes.TryGetValue(s.Property.Header.classID, out var sc)
+                && SemanticModel.FindEffective(src.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int scount && scount == count
+                && (SemanticModel.FindEffective(src.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int sl && sl == 1) == horizontal)
+            {
+                FrameWaivers.Add(StyleValidator.FrameWaiverKey(info.PixelSha1, count));
+                return true;
+            }
+            error = $"source picture {info.Width}x{info.Height} doesn't split into the template's {count} {(horizontal ? "horizontal" : "vertical")} frames; template picture kept";
+            return false;
+        }
+
         /// <summary>Writes the source value into the template property, translating resource and string ids.</summary>
         internal bool ApplySourceValue(SemanticModel src, SemanticEntry s, StyleProperty target, out string error)
         {
@@ -1169,6 +1523,7 @@ namespace libmsstyle.Import
                     error = $"source {s.ResourceType} {s.ResourceId} isn't a decodable png ({info?.Error})";
                     return false;
                 }
+                if (!FitsTargetFrames(src, s, target, info, out error)) return false;
                 int id = PlaceResource(s.ResourceType, s.ResourceId, data, info != null && info.Decodable ? info : null);
                 if (sp.Header.typeID == (int)IDENTIFIER.STREAM)
                     target.Header.shortFlag = id; // StyleProperty.SetValue(int) only maps the id for FILENAME-like types

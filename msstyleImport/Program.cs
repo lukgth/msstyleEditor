@@ -19,6 +19,8 @@ namespace msstyleImport
                 switch (args[0])
                 {
                     case "import": return Import(args.Skip(1).ToArray());
+                    case "import-xp": return ImportXp(args.Skip(1).ToArray());
+                    case "schemes": return args.Length == 2 ? Schemes(args[1]) : Usage();
                     case "noop": return NoOp(args.Skip(1).ToArray());
                     case "inventory": return args.Length == 3 ? Inventory(args[1], args[2]) : Usage();
                     default: return Usage();
@@ -41,6 +43,19 @@ namespace msstyleImport
                        [--prefer-source Class|Part|Prop]... [--exclude Class|Part|Prop]...
                        [--image-tolerance N]
       dry run unless --write is given. reports: <prefix>.json, <prefix>.md, <prefix>.threeway.json
+  msstyleImport import-xp --source <custom xp.msstyles> --template <working win10 xp port.msstyles>
+                       --out-dir <dir> [--scheme <name>]... [--base <stock xp luna.msstyles, default: built in>]
+                       [--base-scheme NormalColor|Metallic|HomeStead] [--name <display name>]
+                       [--shellstyle <xp shellstyle.dll, default: Shell\<scheme>\shellstyle.dll next to the source>]
+                       [--wallpaper <path>] [--write]
+                       [--prefer-source Class|Part|Prop]... [--exclude Class|Part|Prop]... [--image-tolerance N]
+      one output per color scheme (all schemes unless --scheme is given):
+        <out-dir>\<Label>\<Label>.msstyles + Shell\ (the template's, with the source shellstyle's bitmaps),
+        <out-dir>\<Label>.theme, reports in <out-dir>\reports\. <Label> is <Name>, or <Name> <scheme> when the
+        style has several schemes. Copy <out-dir>\<Label> to %WINDIR%\Resources\Themes and open the .theme.
+      dry run (reports only) unless --write is given.
+  msstyleImport schemes <xp.msstyles>
+      lists the color schemes of an xp style.
   msstyleImport noop --template <style> --out <copy.msstyles>
       saves the template through libmsstyle without changes and validates the copy against it.
   msstyleImport inventory <style> <out.tsv>
@@ -90,7 +105,12 @@ nothing here applies or installs a theme.");
 
             var report = Win7StyleImporter.Run(opt);
             var files = ImportReportWriter.Write(report, prefix);
+            PrintReport(report, files);
+            return report.Status == ImportStatus.ReadyForVmTest ? 0 : 1;
+        }
 
+        static void PrintReport(ImportReport report, IEnumerable<string> files)
+        {
             Console.WriteLine($"status: {report.Status}");
             Console.WriteLine(report.StatusText);
             foreach (var kv in report.Counts.OrderBy(k => k.Key)) Console.WriteLine($"  {kv.Key}: {kv.Value}");
@@ -98,7 +118,49 @@ nothing here applies or installs a theme.");
             Console.WriteLine($"{report.Warnings.Count} warnings, {report.Validation.Checks.Count} validation checks passed, {report.Validation.Errors.Count} failed");
             if (report.Output != null) Console.WriteLine("candidate: " + report.Output);
             foreach (var f in files) Console.WriteLine("report: " + f);
-            return report.Status == ImportStatus.ReadyForVmTest ? 0 : 1;
+        }
+
+        static int Schemes(string path)
+        {
+            foreach (var s in XpThemeImport.ReadSchemes(path)) Console.WriteLine($"{s.InternalName}\t{s.DisplayName}\t{s.IniResourceName}");
+            return 0;
+        }
+
+        /// <summary>
+        /// Ports every chosen color scheme of an xp style onto a win10 xp port, one style + .theme
+        /// per scheme. Returns 0 only when every scheme passed.
+        /// </summary>
+        static int ImportXp(string[] args)
+        {
+            var a = ParseArgs(args);
+            var o = new XpThemeImportOptions
+            {
+                SourcePath = One(a, "source"),
+                TemplatePath = One(a, "template"),
+                OutDir = One(a, "out-dir"),
+                Schemes = a.TryGetValue("scheme", out var ws) ? ws : null,
+                Name = One(a, "name", required: false),
+                BasePath = One(a, "base", required: false),
+                BaseScheme = One(a, "base-scheme", required: false) ?? "NormalColor",
+                ShellStylePath = One(a, "shellstyle", required: false),
+                Wallpaper = One(a, "wallpaper", required: false) ?? XpThemeFiles.DefaultWallpaper,
+                Write = a.ContainsKey("write"),
+                PreferSource = a.TryGetValue("prefer-source", out var ps) ? ps : new List<string>(),
+                Exclude = a.TryGetValue("exclude", out var ex) ? ex : new List<string>(),
+            };
+            if (a.ContainsKey("image-tolerance")) o.ImageTolerance = int.Parse(One(a, "image-tolerance"));
+
+            var results = XpThemeImport.Run(o, (scheme, file) => Console.WriteLine($"== {scheme} -> {file}"));
+            foreach (var r in results)
+            {
+                PrintReport(r.Report, r.ReportFiles);
+                if (r.ThemePath != null) Console.WriteLine("theme: " + r.ThemePath);
+            }
+            var written = results.Where(x => x.ThemePath != null).ToList();
+            if (written.Count > 0)
+                Console.WriteLine($"install: copy \"{written[0].StyleFolder}\" to %WINDIR%\\Resources\\Themes\\{Path.GetFileName(written[0].StyleFolder)} and the .theme files next to it, then open one of: "
+                    + string.Join(", ", written.Select(r => "\"" + r.ThemePath + "\"")));
+            return results.All(r => r.Ok) ? 0 : 1;
         }
 
         static int NoOp(string[] args)

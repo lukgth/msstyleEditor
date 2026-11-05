@@ -15,853 +15,395 @@ namespace libmsstyle
     {
         public string InternalName { get; set; } // e.g. "NormalColor", "Metallic", "HomeStead"
         public string DisplayName { get; set; }  // e.g. "Default (blue)", "Silver", "Olive Green"
-        public string IniResourceName { get; set; } // e.g. "NORMALBLUE_INI"
+        public string IniResourceName { get; set; } // e.g. "NORMALBLUE_INI", the NormalSize file
+        /// <summary>the other sizes xp offers for this scheme (Font size in Display Properties), NormalSize excluded.</summary>
+        public List<XpSize> Sizes { get; } = new List<XpSize>();
+        public override string ToString() => DisplayName == InternalName ? InternalName : $"{DisplayName} ({InternalName})";
+    }
+
+    /// <summary>a [Size.X] of THEMES_INI and the scheme INI drawing that size.</summary>
+    public class XpSize
+    {
+        public string InternalName { get; set; } // "LargeFonts", "ExtraLargeFonts"
+        public string DisplayName { get; set; }  // "Large Fonts"
+        public string IniResourceName { get; set; } // "LARGEFONTSBLUE_INI"
     }
 
     /// <summary>
-    /// Parses THEMES_INI and scheme-specific INI resources from Windows XP .msstyles files.
+    /// Parses THEMES_INI and the per scheme INI resources of a packed Windows XP .msstyles.
+    /// Class, part and state ids come from the XP schema (<see cref="XpSchema"/>, generated
+    /// from tmschema.h), resolved the way XP's themeldr parser.cpp does it:
+    /// [app::class.part(state)], parts from the "&lt;class&gt;PARTS" enum, states from
+    /// "&lt;part&gt;STATES" (or "&lt;class&gt;STATES" without a part). Anything XP itself would
+    /// reject is skipped and reported in the diagnostics list instead of guessed.
     /// </summary>
     public static class XpStyleIniParser
     {
-        // Maps INI property names (lowercase) to (nameID, typeID) pairs.
-        private static readonly Dictionary<string, (int nameID, int typeID)> s_propertyNameMap;
-
-        // Maps INI enum value names (lowercase) to integer values, keyed by nameID.
-        private static readonly Dictionary<int, Dictionary<string, int>> s_enumValueMap;
-
-        static XpStyleIniParser()
-        {
-            s_propertyNameMap = BuildPropertyNameMap();
-            s_enumValueMap = BuildEnumValueMap();
-        }
-
         /// <summary>
-        /// Parses UTF-16LE THEMES_INI resource to extract color scheme information.
-        /// Always filters for NormalSize only.
+        /// Parses UTF-16LE THEMES_INI resource to extract color scheme information: the NormalSize file of every
+        /// scheme, and its other sizes in <see cref="XpColorScheme.Sizes"/>. Schemes without a NormalSize file are dropped.
         /// </summary>
         public static List<XpColorScheme> ParseThemesIni(byte[] data)
         {
-            string text = DecodeUtf16LE(data);
-            var sections = ParseIniSections(text);
+            var sections = ParseIniSections(DecodeUtf16LE(data));
 
-            // Parse [ColorScheme.*] sections to get scheme names + display names
             var schemes = new Dictionary<string, XpColorScheme>(StringComparer.OrdinalIgnoreCase);
+            var sizeNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var section in sections)
             {
-                if (section.Key.StartsWith("ColorScheme.", StringComparison.OrdinalIgnoreCase))
+                if (section.Name.StartsWith("Size.", StringComparison.OrdinalIgnoreCase))
                 {
-                    string schemeName = section.Key.Substring("ColorScheme.".Length);
-                    string displayName = schemeName;
-                    if (section.Value.TryGetValue("displayname", out string dn))
-                        displayName = dn;
-
-                    schemes[schemeName] = new XpColorScheme
-                    {
-                        InternalName = schemeName,
-                        DisplayName = displayName,
-                    };
+                    string sizeName = section.Name.Substring("Size.".Length);
+                    sizeNames[sizeName] = section.Get("displayname") ?? sizeName;
                 }
+                if (!section.Name.StartsWith("ColorScheme.", StringComparison.OrdinalIgnoreCase)) continue;
+                string schemeName = section.Name.Substring("ColorScheme.".Length);
+                schemes[schemeName] = new XpColorScheme
+                {
+                    InternalName = schemeName,
+                    DisplayName = section.Get("displayname") ?? schemeName,
+                };
             }
 
-            // Parse [File.*] sections to map scheme → INI resource name for NormalSize
             foreach (var section in sections)
             {
-                if (!section.Key.StartsWith("File.", StringComparison.OrdinalIgnoreCase))
-                    continue;
+                if (!section.Name.StartsWith("File.", StringComparison.OrdinalIgnoreCase)) continue;
+                string sizes = section.Get("sizes"), colorScheme = section.Get("colorschemes");
+                if (sizes == null || colorScheme == null) continue;
 
-                var props = section.Value;
-                if (!props.TryGetValue("sizes", out string sizes))
-                    continue;
-                if (!props.TryGetValue("colorschemes", out string colorScheme))
-                    continue;
-
-                // Only care about NormalSize
-                if (!sizes.Equals("NormalSize", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                // Match by internal name first, then fall back to display name.
                 // Some themes use DisplayName in ColorSchemes (e.g. "Lakrits" instead of "NormalColor").
-                XpColorScheme matchedScheme = null;
-                if (schemes.TryGetValue(colorScheme, out var schemeByName))
-                {
-                    matchedScheme = schemeByName;
-                }
-                else
-                {
-                    matchedScheme = schemes.Values.FirstOrDefault(s =>
-                        s.DisplayName.Equals(colorScheme, StringComparison.OrdinalIgnoreCase));
-                }
-
-                if (matchedScheme != null)
-                {
-                    string fileSectionSuffix = section.Key.Substring("File.".Length);
-                    matchedScheme.IniResourceName = fileSectionSuffix.ToUpperInvariant() + "_INI";
-                }
+                if (!schemes.TryGetValue(colorScheme, out var matched))
+                    matched = schemes.Values.FirstOrDefault(s => s.DisplayName.Equals(colorScheme, StringComparison.OrdinalIgnoreCase));
+                if (matched == null) continue;
+                string ini = section.Name.Substring("File.".Length).ToUpperInvariant() + "_INI";
+                if (sizes.Equals("NormalSize", StringComparison.OrdinalIgnoreCase))
+                    matched.IniResourceName = ini;
+                else if (!matched.Sizes.Any(s => s.InternalName.Equals(sizes, StringComparison.OrdinalIgnoreCase)))
+                    matched.Sizes.Add(new XpSize
+                    {
+                        InternalName = sizes,
+                        DisplayName = sizeNames.TryGetValue(sizes, out var dn) ? dn : sizes,
+                        IniResourceName = ini,
+                    });
             }
 
-            // Return only schemes that have an INI resource mapped
             return schemes.Values.Where(s => !string.IsNullOrEmpty(s.IniResourceName)).ToList();
         }
 
+        /// <summary>[Documentation] DisplayName of THEMES_INI, null when it has none.</summary>
+        public static string ThemeDisplayName(byte[] themesIni)
+            => ParseIniSections(DecodeUtf16LE(themesIni)).FirstOrDefault(s => s.Name.Equals("Documentation", StringComparison.OrdinalIgnoreCase))?.Get("displayname");
+
         /// <summary>
-        /// Parses a scheme-specific INI resource (e.g. NORMALBLUE_INI) into the style class hierarchy.
+        /// Parses a scheme INI resource (e.g. NORMALBLUE_INI) into <paramref name="classes"/>.
+        /// IMAGEFILE-like FILENAME and FONT properties keep their INI text as a string value;
+        /// <see cref="VisualStyle"/> turns them into resource / string ids afterwards.
         /// </summary>
-        public static void ParseSchemeIni(byte[] data, Dictionary<int, StyleClass> classes)
+        public static void ParseSchemeIni(byte[] data, Dictionary<int, StyleClass> classes, List<string> diagnostics)
         {
-            string text = DecodeUtf16LE(data);
-            var sections = ParseIniSections(text);
-
-            // Track class/part/state assignments. XP uses text names, we assign numeric IDs.
-            // className (case-insensitive) → StyleClass
-            var classLookup = new Dictionary<string, StyleClass>(StringComparer.OrdinalIgnoreCase);
-            int nextClassId = 0;
-
-            foreach (var section in sections)
+            var byName = new Dictionary<string, StyleClass>(StringComparer.OrdinalIgnoreCase);
+            foreach (var section in ParseIniSections(DecodeUtf16LE(data)))
             {
-                ParseSection(section.Key, section.Value, classes, classLookup, ref nextClassId);
+                ParseSection(section, classes, byName, diagnostics);
             }
         }
 
-        private static void ParseSection(
-            string sectionName,
-            Dictionary<string, string> properties,
-            Dictionary<int, StyleClass> classes,
-            Dictionary<string, StyleClass> classLookup,
-            ref int nextClassId)
+        private static void ParseSection(IniSection section, Dictionary<int, StyleClass> classes,
+            Dictionary<string, StyleClass> byName, List<string> diag)
         {
-            // Parse section name: [class], [class.part], [class.part(state)], [class(state)]
-            // Also: [scope::class.part(state)]
-            string className;
-            string partName = null;
-            string stateName = null;
-
-            // Extract state name from parentheses
-            string sectionBody = sectionName;
-            int parenOpen = sectionBody.IndexOf('(');
-            if (parenOpen >= 0)
+            if (!TryParseSectionName(section.Name, out string fullClass, out string cls, out string part, out string state, out string err))
             {
-                int parenClose = sectionBody.IndexOf(')', parenOpen);
-                if (parenClose > parenOpen)
-                {
-                    stateName = sectionBody.Substring(parenOpen + 1, parenClose - parenOpen - 1).Trim();
-                    sectionBody = sectionBody.Substring(0, parenOpen).Trim();
-                }
-            }
-
-            // Split by '.' to get class and part
-            int dotIndex = sectionBody.IndexOf('.');
-            if (dotIndex >= 0)
-            {
-                className = sectionBody.Substring(0, dotIndex).Trim();
-                partName = sectionBody.Substring(dotIndex + 1).Trim();
-            }
-            else
-            {
-                className = sectionBody.Trim();
-            }
-
-            if (string.IsNullOrEmpty(className))
+                diag.Add($"[{section.Name}]: {err}; section skipped");
                 return;
-
-            // Get or create StyleClass
-            if (!classLookup.TryGetValue(className, out StyleClass styleClass))
-            {
-                styleClass = new StyleClass
-                {
-                    ClassId = nextClassId,
-                    ClassName = className,
-                };
-                classLookup[className] = styleClass;
-                classes[nextClassId] = styleClass;
-                nextClassId++;
             }
 
-            // Determine part ID
-            int partId = 0; // 0 = common properties / class-level
-            if (!string.IsNullOrEmpty(partName))
+            int partId = 0, stateId = 0;
+            if (part != null)
             {
-                // Look for existing part with this name
-                var existingPart = styleClass.Parts.Values.FirstOrDefault(
-                    p => p.PartName.Equals(partName, StringComparison.OrdinalIgnoreCase));
-                if (existingPart != null)
+                if (!XpSchema.Enums.TryGetValue(cls + "PARTS", out var parts))
                 {
-                    partId = existingPart.PartId;
+                    diag.Add($"[{section.Name}]: class {cls} has no parts in the XP schema; section skipped");
+                    return;
                 }
-                else
+                if (!parts.TryGetValue(part, out partId))
                 {
-                    // Assign next available part ID (starting from 1, since 0 = common)
-                    partId = styleClass.Parts.Count > 0 ? styleClass.Parts.Keys.Max() + 1 : 1;
+                    diag.Add($"[{section.Name}]: {part} isn't a part of {cls}; section skipped");
+                    return;
+                }
+            }
+            if (state != null)
+            {
+                string owner = part ?? cls;
+                if (!XpSchema.Enums.TryGetValue(owner + "STATES", out var states))
+                {
+                    diag.Add($"[{section.Name}]: {owner} has no states in the XP schema; section skipped");
+                    return;
+                }
+                if (!states.TryGetValue(state, out stateId))
+                {
+                    diag.Add($"[{section.Name}]: {state} isn't a state of {owner}; section skipped");
+                    return;
                 }
             }
 
-            // Get or create StylePart
-            if (!styleClass.Parts.TryGetValue(partId, out StylePart stylePart))
+            if (!byName.TryGetValue(fullClass, out var styleClass))
             {
-                stylePart = new StylePart
-                {
-                    PartId = partId,
-                    PartName = partName ?? "Common Properties",
-                };
+                int id = classes.Count == 0 ? 0 : classes.Keys.Max() + 1;
+                styleClass = new StyleClass { ClassId = id, ClassName = fullClass };
+                byName[fullClass] = styleClass;
+                classes[id] = styleClass;
+            }
+            if (!styleClass.Parts.TryGetValue(partId, out var stylePart))
+            {
+                stylePart = new StylePart { PartId = partId, PartName = part?.ToUpperInvariant() ?? "Common Properties" };
                 styleClass.Parts[partId] = stylePart;
             }
-
-            // Determine state ID
-            int stateId = 0; // 0 = default/no state
-            if (!string.IsNullOrEmpty(stateName))
+            if (!stylePart.States.TryGetValue(stateId, out var styleState))
             {
-                var existingState = stylePart.States.Values.FirstOrDefault(
-                    s => s.StateName.Equals(stateName, StringComparison.OrdinalIgnoreCase));
-                if (existingState != null)
-                {
-                    stateId = existingState.StateId;
-                }
-                else
-                {
-                    stateId = stylePart.States.Count > 0 ? stylePart.States.Keys.Max() + 1 : 1;
-                }
-            }
-
-            // Get or create StyleState
-            if (!stylePart.States.TryGetValue(stateId, out StyleState styleState))
-            {
-                styleState = new StyleState
-                {
-                    StateId = stateId,
-                    StateName = stateName ?? "Common Properties",
-                };
+                styleState = new StyleState { StateId = stateId, StateName = state?.ToUpperInvariant() ?? "Common Properties" };
                 stylePart.States[stateId] = styleState;
             }
 
-            // Parse properties and add to state
-            foreach (var kvp in properties)
+            foreach (var kv in section.Properties)
             {
-                var prop = ParseProperty(kvp.Key, kvp.Value, styleClass.ClassId, partId, stateId);
-                if (prop != null)
+                var prop = ParseProperty(kv.Key, kv.Value, styleClass.ClassId, partId, stateId, out string why);
+                if (prop == null)
                 {
-                    styleState.Properties.Add(prop);
+                    diag.Add($"[{section.Name}] {kv.Key} = {kv.Value}: {why}; property skipped");
+                    continue;
                 }
+                // a key repeated in a reopened section: the last one wins, like XP.
+                styleState.Properties.RemoveAll(p => p.Header.nameID == prop.Header.nameID);
+                styleState.Properties.Add(prop);
             }
         }
 
-        private static StyleProperty ParseProperty(string name, string value, int classId, int partId, int stateId)
+        /// <summary>[app::class.part(state)] with every piece but the class optional.</summary>
+        internal static bool TryParseSectionName(string name, out string fullClass, out string cls, out string part, out string state, out string error)
         {
-            string nameLower = name.ToLowerInvariant();
-
-            if (!s_propertyNameMap.TryGetValue(nameLower, out var mapping))
+            fullClass = cls = part = state = error = null;
+            string body = name.Trim();
+            int open = body.IndexOf('(');
+            if (open >= 0)
             {
-                // Unknown property — skip
+                int close = body.IndexOf(')', open);
+                if (close < 0 || body.Substring(close + 1).Trim().Length > 0)
+                {
+                    error = "malformed state";
+                    return false;
+                }
+                state = body.Substring(open + 1, close - open - 1).Trim();
+                body = body.Substring(0, open).Trim();
+            }
+
+            string app = null;
+            int colons = body.IndexOf("::", StringComparison.Ordinal);
+            if (colons >= 0)
+            {
+                app = body.Substring(0, colons).Trim();
+                body = body.Substring(colons + 2).Trim();
+            }
+            int dot = body.IndexOf('.');
+            if (dot >= 0)
+            {
+                part = body.Substring(dot + 1).Trim();
+                body = body.Substring(0, dot).Trim();
+            }
+            cls = body;
+            if (cls.Length == 0 || (app != null && app.Length == 0) || (part != null && part.Length == 0) || (state != null && state.Length == 0))
+            {
+                error = "empty name component";
+                return false;
+            }
+            if (app != null && cls.Equals("SysMetrics", StringComparison.OrdinalIgnoreCase))
+            {
+                error = "SysMetrics can't be scoped to an application";
+                return false;
+            }
+            fullClass = app == null ? cls : app + "::" + cls;
+            return true;
+        }
+
+        private static readonly Dictionary<string, IDENTIFIER> PrimTypes = new Dictionary<string, IDENTIFIER>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ENUM"] = IDENTIFIER.ENUM,
+            ["STRING"] = IDENTIFIER.STRING,
+            ["INT"] = IDENTIFIER.INT,
+            ["BOOL"] = IDENTIFIER.BOOLTYPE,
+            ["COLOR"] = IDENTIFIER.COLOR,
+            ["MARGINS"] = IDENTIFIER.MARGINS,
+            ["FILENAME"] = IDENTIFIER.FILENAME,
+            ["SIZE"] = IDENTIFIER.SIZE,
+            ["POSITION"] = IDENTIFIER.POSITION,
+            ["RECT"] = IDENTIFIER.RECTTYPE,
+            ["FONT"] = IDENTIFIER.FONT,
+            ["INTLIST"] = IDENTIFIER.INTLIST,
+        };
+
+        internal static StyleProperty ParseProperty(string name, string value, int classId, int partId, int stateId, out string error)
+        {
+            error = null;
+            if (!XpSchema.Properties.TryGetValue(name.Trim(), out var info))
+            {
+                error = "unknown property";
+                return null;
+            }
+            // the schema's first entries are the primitive types (STRING = 201 ... INTLIST = 211). Only
+            // FONT and COLOR are also real properties (TMT_FONT/TMT_COLOR, "Font = Tahoma, 8" in [Rebar]).
+            if (info.Id < 300 && info.Id != (int)IDENTIFIER.FONT && info.Id != (int)IDENTIFIER.COLOR)
+            {
+                error = "type name, not a property";
+                return null;
+            }
+            if (!PrimTypes.TryGetValue(info.Prim, out var type))
+            {
+                error = $"unsupported XP type {info.Prim}";
+                return null;
+            }
+            if (value.Contains("##"))
+            {
+                error = "unresolved ## substitution";
                 return null;
             }
 
-            int nameID = mapping.nameID;
-            int typeID = mapping.typeID;
-
-            var header = new PropertyHeader(nameID, typeID);
-            header.classID = classId;
-            header.partID = partId;
-            header.stateID = stateId;
-
+            var header = new PropertyHeader(info.Id, (int)type) { classID = classId, partID = partId, stateID = stateId };
             var prop = new StyleProperty(header);
-
-            try
+            string v = value.Trim();
+            int[] n;
+            switch (type)
             {
-                switch ((IDENTIFIER)typeID)
-                {
-                    case IDENTIFIER.ENUM:
-                        prop.SetValue(ParseEnumValue(nameID, value));
-                        break;
-                    case IDENTIFIER.STRING:
-                        prop.SetValue(value);
-                        break;
-                    case IDENTIFIER.INT:
-                    case IDENTIFIER.SIZE:
-                        prop.SetValue(ParseInt(value));
-                        break;
-                    case IDENTIFIER.BOOLTYPE:
-                        prop.SetValue(ParseBool(value));
-                        break;
-                    case IDENTIFIER.COLOR:
-                        prop.SetValue(ParseColor(value));
-                        break;
-                    case IDENTIFIER.MARGINS:
-                        prop.SetValue(ParseMargins(value));
-                        break;
-                    case IDENTIFIER.FILENAME:
-                        // For XP, store the filename string as string value.
-                        // The resource ID mapping happens at load time.
-                        prop.SetValue(value.Trim());
-                        break;
-                    case IDENTIFIER.POSITION:
-                        prop.SetValue(ParsePosition(value));
-                        break;
-                    case IDENTIFIER.RECTTYPE:
-                        prop.SetValue(ParseMargins(value)); // same format as margins
-                        break;
-                    case IDENTIFIER.FONT:
-                        // XP fonts are specified as "FontName, Size[, bold|italic]"
-                        // Store as string for now — font handling in string table
-                        prop.SetValue(value.Trim());
-                        break;
-                    default:
-                        prop.SetValue(value.Trim());
-                        break;
-                }
+                case IDENTIFIER.ENUM:
+                    if (!XpSchema.Enums.TryGetValue(name.Trim(), out var values) || !values.TryGetValue(v, out int ev))
+                    {
+                        error = "unknown enum value";
+                        return null;
+                    }
+                    prop.SetValue(ev);
+                    break;
+                case IDENTIFIER.BOOLTYPE:
+                    if (v.Equals("true", StringComparison.OrdinalIgnoreCase) || v == "1") prop.SetValue(true);
+                    else if (v.Equals("false", StringComparison.OrdinalIgnoreCase) || v == "0") prop.SetValue(false);
+                    else { error = "not a bool"; return null; }
+                    break;
+                case IDENTIFIER.INT:
+                case IDENTIFIER.SIZE:
+                    if (!Ints(v, 1, 1, out n)) { error = "not an integer"; return null; }
+                    prop.SetValue(n[0]);
+                    break;
+                case IDENTIFIER.COLOR:
+                    if (!Ints(v, 3, 3, out n) || n.Any(c => c < 0 || c > 255)) { error = "not an \"r g b\" color"; return null; }
+                    prop.SetValue(Color.FromArgb(n[0], n[1], n[2]));
+                    break;
+                case IDENTIFIER.MARGINS:
+                    // XP MARGINS is cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight (uxtheme.h).
+                    if (!Ints(v, 4, 4, out n)) { error = "not 4 margins"; return null; }
+                    prop.SetValue(new Margins(n[0], n[2], n[1], n[3]));
+                    break;
+                case IDENTIFIER.RECTTYPE:
+                    if (!Ints(v, 4, 4, out n)) { error = "not a 4 value rect"; return null; }
+                    prop.SetValue(new Margins(n[0], n[1], n[2], n[3]));
+                    break;
+                case IDENTIFIER.POSITION:
+                    if (!Ints(v, 2, 2, out n)) { error = "not an x, y position"; return null; }
+                    prop.SetValue(new Size(n[0], n[1]));
+                    break;
+                case IDENTIFIER.INTLIST:
+                    if (!Ints(v, 1, int.MaxValue, out n)) { error = "not an integer list"; return null; }
+                    prop.SetValue(n.ToList());
+                    break;
+                default: // STRING, FILENAME, FONT
+                    if (v.Length == 0) { error = "empty value"; return null; }
+                    prop.SetValue(v);
+                    break;
             }
-            catch
-            {
-                // If parsing fails, store raw string value
-                prop.SetValue(value.Trim());
-            }
-
             return prop;
         }
 
-        #region Value Parsers
-
-        private static int ParseEnumValue(int nameID, string value)
+        private static bool Ints(string v, int min, int max, out int[] result)
         {
-            string trimmed = value.Trim().ToLowerInvariant();
-
-            if (s_enumValueMap.TryGetValue(nameID, out var enumMap))
+            var parts = v.Split(new[] { ' ', ',', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            result = new int[parts.Length];
+            if (parts.Length < min || parts.Length > max) return false;
+            for (int i = 0; i < parts.Length; ++i)
             {
-                if (enumMap.TryGetValue(trimmed, out int enumVal))
-                    return enumVal;
+                if (!int.TryParse(parts[i], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out result[i])) return false;
             }
-
-            // Try parsing as integer
-            if (int.TryParse(trimmed, out int intVal))
-                return intVal;
-
-            return 0;
+            return true;
         }
 
-        private static int ParseInt(string value)
+        #region INI text
+
+        internal class IniSection
         {
-            string trimmed = value.Trim();
-            // Remove any trailing comment
-            int semicolon = trimmed.IndexOf(';');
-            if (semicolon >= 0)
-                trimmed = trimmed.Substring(0, semicolon).Trim();
-
-            if (int.TryParse(trimmed, out int result))
-                return result;
-            return 0;
+            public string Name;
+            /// <summary>keys in file order, the last occurrence of a repeated key wins.</summary>
+            public List<KeyValuePair<string, string>> Properties = new List<KeyValuePair<string, string>>();
+            public string Get(string key) => Properties.LastOrDefault(p => p.Key.Equals(key, StringComparison.OrdinalIgnoreCase)).Value;
         }
-
-        private static bool ParseBool(string value)
-        {
-            string trimmed = value.Trim().ToLowerInvariant();
-            return trimmed == "true" || trimmed == "1";
-        }
-
-        private static Color ParseColor(string value)
-        {
-            string trimmed = value.Trim();
-            // Remove trailing comment
-            int semicolon = trimmed.IndexOf(';');
-            if (semicolon >= 0)
-                trimmed = trimmed.Substring(0, semicolon).Trim();
-
-            // Format: "R G B" or "R, G, B"
-            var parts = trimmed.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 3)
-            {
-                int r = int.Parse(parts[0].Trim());
-                int g = int.Parse(parts[1].Trim());
-                int b = int.Parse(parts[2].Trim());
-                return Color.FromArgb(r, g, b);
-            }
-            return Color.Black;
-        }
-
-        private static Margins ParseMargins(string value)
-        {
-            string trimmed = value.Trim();
-            int semicolon = trimmed.IndexOf(';');
-            if (semicolon >= 0)
-                trimmed = trimmed.Substring(0, semicolon).Trim();
-
-            var parts = trimmed.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 4)
-            {
-                return new Margins(
-                    int.Parse(parts[0].Trim()),
-                    int.Parse(parts[1].Trim()),
-                    int.Parse(parts[2].Trim()),
-                    int.Parse(parts[3].Trim()));
-            }
-            return new Margins(0, 0, 0, 0);
-        }
-
-        private static System.Drawing.Size ParsePosition(string value)
-        {
-            string trimmed = value.Trim();
-            int semicolon = trimmed.IndexOf(';');
-            if (semicolon >= 0)
-                trimmed = trimmed.Substring(0, semicolon).Trim();
-
-            var parts = trimmed.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 2)
-            {
-                return new System.Drawing.Size(
-                    int.Parse(parts[0].Trim()),
-                    int.Parse(parts[1].Trim()));
-            }
-            return new System.Drawing.Size(0, 0);
-        }
-
-        #endregion
-
-        #region INI Helper Methods
 
         private static string DecodeUtf16LE(byte[] data)
         {
-            if (data == null || data.Length < 2)
-                return string.Empty;
-
-            // Check for BOM
-            int start = 0;
-            if (data[0] == 0xFF && data[1] == 0xFE)
-                start = 2;
-
-            return Encoding.Unicode.GetString(data, start, data.Length - start);
+            if (data == null || data.Length < 2) return string.Empty;
+            int start = data[0] == 0xFF && data[1] == 0xFE ? 2 : 0;
+            return Encoding.Unicode.GetString(data, start, data.Length - start).TrimEnd('\0');
         }
 
         /// <summary>
-        /// Parses INI text into sections. Each section maps to a dictionary of key-value pairs.
-        /// Keys are stored lowercase for case-insensitive matching.
+        /// Sections in file order; a reopened section continues the first one. ';' starts a
+        /// comment anywhere on a line, the way the XP scanner reads it.
         /// </summary>
-        private static Dictionary<string, Dictionary<string, string>> ParseIniSections(string text)
+        internal static List<IniSection> ParseIniSections(string text)
         {
-            var sections = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-            string currentSection = null;
-            Dictionary<string, string> currentProps = null;
-
+            var list = new List<IniSection>();
+            var byName = new Dictionary<string, IniSection>(StringComparer.OrdinalIgnoreCase);
+            IniSection current = null;
             using (var reader = new StringReader(text))
             {
                 string line;
                 while ((line = reader.ReadLine()) != null)
                 {
+                    int semi = line.IndexOf(';');
+                    if (semi >= 0) line = line.Substring(0, semi);
                     line = line.Trim();
+                    if (line.Length == 0) continue;
 
-                    // Skip empty lines and comments
-                    if (string.IsNullOrEmpty(line) || line.StartsWith(";"))
-                        continue;
-
-                    // Section header
-                    if (line.StartsWith("[") && line.Contains("]"))
+                    if (line.StartsWith("["))
                     {
                         int end = line.IndexOf(']');
-                        currentSection = line.Substring(1, end - 1).Trim();
-                        if (!sections.TryGetValue(currentSection, out currentProps))
+                        if (end < 0) { current = null; continue; }
+                        string name = line.Substring(1, end - 1).Trim();
+                        if (!byName.TryGetValue(name, out current))
                         {
-                            currentProps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                            sections[currentSection] = currentProps;
+                            current = new IniSection { Name = name };
+                            byName[name] = current;
+                            list.Add(current);
                         }
                         continue;
                     }
 
-                    // Key = Value
-                    if (currentSection != null)
+                    int eq = line.IndexOf('=');
+                    if (current != null && eq > 0)
                     {
-                        int eq = line.IndexOf('=');
-                        if (eq > 0)
-                        {
-                            string key = line.Substring(0, eq).Trim();
-                            string val = line.Substring(eq + 1).Trim();
-                            currentProps[key] = val;
-                        }
+                        string key = line.Substring(0, eq).Trim();
+                        current.Properties.RemoveAll(p => p.Key.Equals(key, StringComparison.OrdinalIgnoreCase));
+                        current.Properties.Add(new KeyValuePair<string, string>(key, line.Substring(eq + 1).Trim()));
                     }
                 }
             }
-
-            return sections;
+            return list;
         }
 
         #endregion
 
-        #region Image Resource Name Mapping
-
         /// <summary>
         /// Converts an INI image file reference (e.g. "Blue\CloseButton.bmp") to a PE BITMAP resource name.
-        /// Convention from luna.rc: path separators → '_', remove extension, uppercase, prefix with scheme prefix.
+        /// Convention from luna.rc: path separators → '_', '.' → '_', uppercase.
         /// E.g. "Blue\CloseButton.bmp" → "BLUE_CLOSEBUTTON_BMP"
         /// </summary>
         public static string ImageFileToResourceName(string imageFile)
         {
-            if (string.IsNullOrEmpty(imageFile))
-                return string.Empty;
-
-            // Remove quotes if present
-            imageFile = imageFile.Trim().Trim('"');
-
-            // Replace path separators with underscore, remove extension
-            string name = imageFile
-                .Replace('\\', '_')
-                .Replace('/', '_');
-
-            // Replace the '.' before extension with '_'
-            int lastDot = name.LastIndexOf('.');
-            if (lastDot >= 0)
-            {
-                name = name.Substring(0, lastDot) + "_" + name.Substring(lastDot + 1);
-            }
-
-            return name.ToUpperInvariant();
+            if (string.IsNullOrEmpty(imageFile)) return string.Empty;
+            return imageFile.Trim().Trim('"').Replace('\\', '_').Replace('/', '_').Replace('.', '_').ToUpperInvariant();
         }
-
-        #endregion
-
-        #region Property Name → IDENTIFIER Mapping
-
-        private static Dictionary<string, (int nameID, int typeID)> BuildPropertyNameMap()
-        {
-            // Map XP INI property names (lowercase) to (nameID, typeID).
-            // Based on VisualStyleDefinitions IDENTIFIER enum values and VisualStylePropertyMap.
-            var map = new Dictionary<string, (int, int)>(StringComparer.OrdinalIgnoreCase)
-            {
-                // Enum properties
-                ["bgtype"] = ((int)IDENTIFIER.BGTYPE, (int)IDENTIFIER.ENUM),
-                ["bordertype"] = ((int)IDENTIFIER.BORDERTYPE, (int)IDENTIFIER.ENUM),
-                ["filltype"] = ((int)IDENTIFIER.FILLTYPE, (int)IDENTIFIER.ENUM),
-                ["sizingtype"] = ((int)IDENTIFIER.SIZINGTYPE, (int)IDENTIFIER.ENUM),
-                ["halign"] = ((int)IDENTIFIER.HALIGN, (int)IDENTIFIER.ENUM),
-                ["contentalignment"] = ((int)IDENTIFIER.CONTENTALIGNMENT, (int)IDENTIFIER.ENUM),
-                ["valign"] = ((int)IDENTIFIER.VALIGN, (int)IDENTIFIER.ENUM),
-                ["offsettype"] = ((int)IDENTIFIER.OFFSETTYPE, (int)IDENTIFIER.ENUM),
-                ["iconeffect"] = ((int)IDENTIFIER.ICONEFFECT, (int)IDENTIFIER.ENUM),
-                ["textshadowtype"] = ((int)IDENTIFIER.TEXTSHADOWTYPE, (int)IDENTIFIER.ENUM),
-                ["imagelayout"] = ((int)IDENTIFIER.IMAGELAYOUT, (int)IDENTIFIER.ENUM),
-                ["glyphtype"] = ((int)IDENTIFIER.GLYPHTYPE, (int)IDENTIFIER.ENUM),
-                ["imageselecttype"] = ((int)IDENTIFIER.IMAGESELECTTYPE, (int)IDENTIFIER.ENUM),
-                ["glyphfontsizingtype"] = ((int)IDENTIFIER.GLYPHFONTSIZINGTYPE, (int)IDENTIFIER.ENUM),
-                ["truesizescalingtype"] = ((int)IDENTIFIER.TRUESIZESCALINGTYPE, (int)IDENTIFIER.ENUM),
-
-                // Bool properties
-                ["transparent"] = ((int)IDENTIFIER.TRANSPARENT_, (int)IDENTIFIER.BOOLTYPE),
-                ["autosize"] = ((int)IDENTIFIER.AUTOSIZE, (int)IDENTIFIER.BOOLTYPE),
-                ["borderonly"] = ((int)IDENTIFIER.BORDERONLY, (int)IDENTIFIER.BOOLTYPE),
-                ["composited"] = ((int)IDENTIFIER.COMPOSITED, (int)IDENTIFIER.BOOLTYPE),
-                ["bgfill"] = ((int)IDENTIFIER.BGFILL, (int)IDENTIFIER.BOOLTYPE),
-                ["glyphtransparent"] = ((int)IDENTIFIER.GLYPHTRANSPARENT, (int)IDENTIFIER.BOOLTYPE),
-                ["glyphonly"] = ((int)IDENTIFIER.GLYPHONLY, (int)IDENTIFIER.BOOLTYPE),
-                ["alwaysshowsizingbar"] = ((int)IDENTIFIER.ALWAYSSHOWSIZINGBAR, (int)IDENTIFIER.BOOLTYPE),
-                ["mirrorimage"] = ((int)IDENTIFIER.MIRRORIMAGE, (int)IDENTIFIER.BOOLTYPE),
-                ["uniformsizing"] = ((int)IDENTIFIER.UNIFORMSIZING, (int)IDENTIFIER.BOOLTYPE),
-                ["integralsizing"] = ((int)IDENTIFIER.INTEGRALSIZING, (int)IDENTIFIER.BOOLTYPE),
-                ["sourcegrow"] = ((int)IDENTIFIER.SOURCEGROW, (int)IDENTIFIER.BOOLTYPE),
-                ["sourceshrink"] = ((int)IDENTIFIER.SOURCESHRINK, (int)IDENTIFIER.BOOLTYPE),
-                ["userpicture"] = ((int)IDENTIFIER.USERPICTURE, (int)IDENTIFIER.BOOLTYPE),
-                ["flatmenus"] = ((int)IDENTIFIER.FLATMENUS, (int)IDENTIFIER.BOOLTYPE),
-                ["localizedmirrorimage"] = ((int)IDENTIFIER.LOCALIZEDMIRRORIMAGE, (int)IDENTIFIER.BOOLTYPE),
-
-                // Int properties
-                ["imagecount"] = ((int)IDENTIFIER.IMAGECOUNT, (int)IDENTIFIER.INT),
-                ["alphalevel"] = ((int)IDENTIFIER.ALPHALEVEL, (int)IDENTIFIER.INT),
-                ["bordersize"] = ((int)IDENTIFIER.BORDERSIZE, (int)IDENTIFIER.INT),
-                ["roundcornerwidth"] = ((int)IDENTIFIER.ROUNDCORNERWIDTH, (int)IDENTIFIER.INT),
-                ["roundcornerheight"] = ((int)IDENTIFIER.ROUNDCORNERHEIGHT, (int)IDENTIFIER.INT),
-                ["gradientratio1"] = ((int)IDENTIFIER.GRADIENTRATIO1, (int)IDENTIFIER.INT),
-                ["gradientratio2"] = ((int)IDENTIFIER.GRADIENTRATIO2, (int)IDENTIFIER.INT),
-                ["gradientratio3"] = ((int)IDENTIFIER.GRADIENTRATIO3, (int)IDENTIFIER.INT),
-                ["gradientratio4"] = ((int)IDENTIFIER.GRADIENTRATIO4, (int)IDENTIFIER.INT),
-                ["gradientratio5"] = ((int)IDENTIFIER.GRADIENTRATIO5, (int)IDENTIFIER.INT),
-                ["progresschunksize"] = ((int)IDENTIFIER.PROGRESSCHUNKSIZE, (int)IDENTIFIER.INT),
-                ["progressspacesize"] = ((int)IDENTIFIER.PROGRESSSPACESIZE, (int)IDENTIFIER.INT),
-                ["saturation"] = ((int)IDENTIFIER.SATURATION, (int)IDENTIFIER.INT),
-                ["textbordersize"] = ((int)IDENTIFIER.TEXTBORDERSIZE, (int)IDENTIFIER.INT),
-                ["alphathreshold"] = ((int)IDENTIFIER.ALPHATHRESHOLD, (int)IDENTIFIER.INT),
-                ["width"] = ((int)IDENTIFIER.WIDTH, (int)IDENTIFIER.INT),
-                ["height"] = ((int)IDENTIFIER.HEIGHT, (int)IDENTIFIER.INT),
-                ["glyphindex"] = ((int)IDENTIFIER.GLYPHINDEX, (int)IDENTIFIER.INT),
-                ["truesizestretchmark"] = ((int)IDENTIFIER.TRUESIZESTRETCHMARK, (int)IDENTIFIER.INT),
-                ["mindpi1"] = ((int)IDENTIFIER.MINDPI1, (int)IDENTIFIER.INT),
-                ["mindpi2"] = ((int)IDENTIFIER.MINDPI2, (int)IDENTIFIER.INT),
-                ["mindpi3"] = ((int)IDENTIFIER.MINDPI3, (int)IDENTIFIER.INT),
-                ["mindpi4"] = ((int)IDENTIFIER.MINDPI4, (int)IDENTIFIER.INT),
-                ["mindpi5"] = ((int)IDENTIFIER.MINDPI5, (int)IDENTIFIER.INT),
-                ["textglowsize"] = ((int)IDENTIFIER.TEXTGLOWSIZE, (int)IDENTIFIER.INT),
-                ["framespersecond"] = ((int)IDENTIFIER.FRAMESPERSECOND, (int)IDENTIFIER.INT),
-                ["pixelsperframe"] = ((int)IDENTIFIER.PIXELSPERFRAME, (int)IDENTIFIER.INT),
-                ["animationdelay"] = ((int)IDENTIFIER.ANIMATIONDELAY, (int)IDENTIFIER.INT),
-                ["glowintensity"] = ((int)IDENTIFIER.GLOWINTENSITY, (int)IDENTIFIER.INT),
-                ["opacity"] = ((int)IDENTIFIER.OPACITY, (int)IDENTIFIER.INT),
-                ["mincolordepth"] = ((int)IDENTIFIER.MINCOLORDEPTH, (int)IDENTIFIER.INT),
-
-                // Size properties (uses SIZE type = 207, same as INT in binary)
-                ["sizingborderwidth"] = ((int)IDENTIFIER.SIZINGBORDERWIDTH, (int)IDENTIFIER.SIZE),
-                ["scrollbarwidth"] = ((int)IDENTIFIER.SCROLLBARWIDTH, (int)IDENTIFIER.SIZE),
-                ["scrollbarheight"] = ((int)IDENTIFIER.SCROLLBARHEIGHT, (int)IDENTIFIER.SIZE),
-                ["captionbarwidth"] = ((int)IDENTIFIER.CAPTIONBARWIDTH, (int)IDENTIFIER.SIZE),
-                ["captionbarheight"] = ((int)IDENTIFIER.CAPTIONBARHEIGHT, (int)IDENTIFIER.SIZE),
-                ["smcaptionbarwidth"] = ((int)IDENTIFIER.SMCAPTIONBARWIDTH, (int)IDENTIFIER.SIZE),
-                ["smcaptionbarheight"] = ((int)IDENTIFIER.SMCAPTIONBARHEIGHT, (int)IDENTIFIER.SIZE),
-                ["menubarwidth"] = ((int)IDENTIFIER.MENUBARWIDTH, (int)IDENTIFIER.SIZE),
-                ["menubarheight"] = ((int)IDENTIFIER.MENUBARHEIGHT, (int)IDENTIFIER.SIZE),
-
-                // Color properties
-                ["bordercolor"] = ((int)IDENTIFIER.BORDERCOLOR, (int)IDENTIFIER.COLOR),
-                ["fillcolor"] = ((int)IDENTIFIER.FILLCOLOR, (int)IDENTIFIER.COLOR),
-                ["textcolor"] = ((int)IDENTIFIER.TEXTCOLOR, (int)IDENTIFIER.COLOR),
-                ["edgelightcolor"] = ((int)IDENTIFIER.EDGELIGHTCOLOR, (int)IDENTIFIER.COLOR),
-                ["edgehighlightcolor"] = ((int)IDENTIFIER.EDGEHIGHLIGHTCOLOR, (int)IDENTIFIER.COLOR),
-                ["edgeshadowcolor"] = ((int)IDENTIFIER.EDGESHADOWCOLOR, (int)IDENTIFIER.COLOR),
-                ["edgedkshadowcolor"] = ((int)IDENTIFIER.EDGEDKSHADOWCOLOR, (int)IDENTIFIER.COLOR),
-                ["edgefillcolor"] = ((int)IDENTIFIER.EDGEFILLCOLOR, (int)IDENTIFIER.COLOR),
-                ["transparentcolor"] = ((int)IDENTIFIER.TRANSPARENTCOLOR, (int)IDENTIFIER.COLOR),
-                ["gradientcolor1"] = ((int)IDENTIFIER.GRADIENTCOLOR1, (int)IDENTIFIER.COLOR),
-                ["gradientcolor2"] = ((int)IDENTIFIER.GRADIENTCOLOR2, (int)IDENTIFIER.COLOR),
-                ["gradientcolor3"] = ((int)IDENTIFIER.GRADIENTCOLOR3, (int)IDENTIFIER.COLOR),
-                ["gradientcolor4"] = ((int)IDENTIFIER.GRADIENTCOLOR4, (int)IDENTIFIER.COLOR),
-                ["gradientcolor5"] = ((int)IDENTIFIER.GRADIENTCOLOR5, (int)IDENTIFIER.COLOR),
-                ["shadowcolor"] = ((int)IDENTIFIER.SHADOWCOLOR, (int)IDENTIFIER.COLOR),
-                ["glowcolor"] = ((int)IDENTIFIER.GLOWCOLOR, (int)IDENTIFIER.COLOR),
-                ["textbordercolor"] = ((int)IDENTIFIER.TEXTBORDERCOLOR, (int)IDENTIFIER.COLOR),
-                ["textshadowcolor"] = ((int)IDENTIFIER.TEXTSHADOWCOLOR, (int)IDENTIFIER.COLOR),
-                ["glyphtextcolor"] = ((int)IDENTIFIER.GLYPHTEXTCOLOR, (int)IDENTIFIER.COLOR),
-                ["glyphtransparentcolor"] = ((int)IDENTIFIER.GLYPHTRANSPARENTCOLOR, (int)IDENTIFIER.COLOR),
-                ["fillcolorhint"] = ((int)IDENTIFIER.FILLCOLORHINT, (int)IDENTIFIER.COLOR),
-                ["bordercolorhint"] = ((int)IDENTIFIER.BORDERCOLORHINT, (int)IDENTIFIER.COLOR),
-                ["accentcolorhint"] = ((int)IDENTIFIER.ACCENTCOLORHINT, (int)IDENTIFIER.COLOR),
-                ["textcolorhint"] = ((int)IDENTIFIER.TEXTCOLORHINT, (int)IDENTIFIER.COLOR),
-                ["heading1textcolor"] = ((int)IDENTIFIER.HEADING1TEXTCOLOR, (int)IDENTIFIER.COLOR),
-                ["heading2textcolor"] = ((int)IDENTIFIER.HEADING2TEXTCOLOR, (int)IDENTIFIER.COLOR),
-                ["bodytextcolor"] = ((int)IDENTIFIER.BODYTEXTCOLOR, (int)IDENTIFIER.COLOR),
-                ["blendcolor"] = ((int)IDENTIFIER.BLENDCOLOR, (int)IDENTIFIER.COLOR),
-
-                // System metric colors (globals section)
-                ["scrollbar"] = ((int)IDENTIFIER.SCROLLBAR, (int)IDENTIFIER.COLOR),
-                ["background"] = ((int)IDENTIFIER.BACKGROUND, (int)IDENTIFIER.COLOR),
-                ["activecaption"] = ((int)IDENTIFIER.ACTIVECAPTION, (int)IDENTIFIER.COLOR),
-                ["inactivecaption"] = ((int)IDENTIFIER.INACTIVECAPTION, (int)IDENTIFIER.COLOR),
-                ["menu"] = ((int)IDENTIFIER.MENU, (int)IDENTIFIER.COLOR),
-                ["window"] = ((int)IDENTIFIER.WINDOW, (int)IDENTIFIER.COLOR),
-                ["windowframe"] = ((int)IDENTIFIER.WINDOWFRAME, (int)IDENTIFIER.COLOR),
-                ["menutext"] = ((int)IDENTIFIER.MENUTEXT, (int)IDENTIFIER.COLOR),
-                ["windowtext"] = ((int)IDENTIFIER.WINDOWTEXT, (int)IDENTIFIER.COLOR),
-                ["captiontext"] = ((int)IDENTIFIER.CAPTIONTEXT, (int)IDENTIFIER.COLOR),
-                ["activeborder"] = ((int)IDENTIFIER.ACTIVEBORDER, (int)IDENTIFIER.COLOR),
-                ["inactiveborder"] = ((int)IDENTIFIER.INACTIVEBORDER, (int)IDENTIFIER.COLOR),
-                ["appworkspace"] = ((int)IDENTIFIER.APPWORKSPACE, (int)IDENTIFIER.COLOR),
-                ["highlight"] = ((int)IDENTIFIER.HIGHLIGHT, (int)IDENTIFIER.COLOR),
-                ["highlighttext"] = ((int)IDENTIFIER.HIGHLIGHTTEXT, (int)IDENTIFIER.COLOR),
-                ["btnface"] = ((int)IDENTIFIER.BTNFACE, (int)IDENTIFIER.COLOR),
-                ["btnshadow"] = ((int)IDENTIFIER.BTNSHADOW, (int)IDENTIFIER.COLOR),
-                ["graytext"] = ((int)IDENTIFIER.GRAYTEXT, (int)IDENTIFIER.COLOR),
-                ["btntext"] = ((int)IDENTIFIER.BTNTEXT, (int)IDENTIFIER.COLOR),
-                ["inactivecaptiontext"] = ((int)IDENTIFIER.INACTIVECAPTIONTEXT, (int)IDENTIFIER.COLOR),
-                ["btnhighlight"] = ((int)IDENTIFIER.BTNHIGHLIGHT, (int)IDENTIFIER.COLOR),
-                ["dkshadow3d"] = ((int)IDENTIFIER.DKSHADOW3D, (int)IDENTIFIER.COLOR),
-                ["light3d"] = ((int)IDENTIFIER.LIGHT3D, (int)IDENTIFIER.COLOR),
-                ["infotext"] = ((int)IDENTIFIER.INFOTEXT, (int)IDENTIFIER.COLOR),
-                ["infobk"] = ((int)IDENTIFIER.INFOBK, (int)IDENTIFIER.COLOR),
-                ["buttonalternateface"] = ((int)IDENTIFIER.BUTTONALTERNATEFACE, (int)IDENTIFIER.COLOR),
-                ["hottracking"] = ((int)IDENTIFIER.HOTTRACKING, (int)IDENTIFIER.COLOR),
-                ["gradientactivecaption"] = ((int)IDENTIFIER.GRADIENTACTIVECAPTION, (int)IDENTIFIER.COLOR),
-                ["gradientinactivecaption"] = ((int)IDENTIFIER.GRADIENTINACTIVECAPTION, (int)IDENTIFIER.COLOR),
-                ["menuhilight"] = ((int)IDENTIFIER.MENUHILIGHT, (int)IDENTIFIER.COLOR),
-                ["menubar"] = ((int)IDENTIFIER.MENUBAR, (int)IDENTIFIER.COLOR),
-
-                // Filename / image properties
-                ["imagefile"] = ((int)IDENTIFIER.IMAGEFILE, (int)IDENTIFIER.FILENAME),
-                ["imagefile1"] = ((int)IDENTIFIER.IMAGEFILE1, (int)IDENTIFIER.FILENAME),
-                ["imagefile2"] = ((int)IDENTIFIER.IMAGEFILE2, (int)IDENTIFIER.FILENAME),
-                ["imagefile3"] = ((int)IDENTIFIER.IMAGEFILE3, (int)IDENTIFIER.FILENAME),
-                ["imagefile4"] = ((int)IDENTIFIER.IMAGEFILE4, (int)IDENTIFIER.FILENAME),
-                ["imagefile5"] = ((int)IDENTIFIER.IMAGEFILE5, (int)IDENTIFIER.FILENAME),
-                ["glyphimagefile"] = ((int)IDENTIFIER.GLYPHIMAGEFILE, (int)IDENTIFIER.FILENAME),
-                ["stockimagefile"] = ((int)IDENTIFIER.IMAGEFILE, (int)IDENTIFIER.FILENAME), // alias
-
-                // Position properties
-                ["offset"] = ((int)IDENTIFIER.OFFSET, (int)IDENTIFIER.POSITION),
-                ["textshadowoffset"] = ((int)IDENTIFIER.TEXTSHADOWOFFSET, (int)IDENTIFIER.POSITION),
-                ["minsize"] = ((int)IDENTIFIER.MINSIZE, (int)IDENTIFIER.POSITION),
-                ["minsize1"] = ((int)IDENTIFIER.MINSIZE1, (int)IDENTIFIER.POSITION),
-                ["minsize2"] = ((int)IDENTIFIER.MINSIZE2, (int)IDENTIFIER.POSITION),
-                ["minsize3"] = ((int)IDENTIFIER.MINSIZE3, (int)IDENTIFIER.POSITION),
-                ["minsize4"] = ((int)IDENTIFIER.MINSIZE4, (int)IDENTIFIER.POSITION),
-                ["minsize5"] = ((int)IDENTIFIER.MINSIZE5, (int)IDENTIFIER.POSITION),
-                ["normalsize"] = ((int)IDENTIFIER.NORMALSIZE, (int)IDENTIFIER.POSITION),
-
-                // Margins properties
-                ["sizingmargins"] = ((int)IDENTIFIER.SIZINGMARGINS, (int)IDENTIFIER.MARGINS),
-                ["contentmargins"] = ((int)IDENTIFIER.CONTENTMARGINS, (int)IDENTIFIER.MARGINS),
-                ["captionmargins"] = ((int)IDENTIFIER.CAPTIONMARGINS, (int)IDENTIFIER.MARGINS),
-
-                // Rect properties
-                ["defaultpanesize"] = ((int)IDENTIFIER.DEFAULTPANESIZE, (int)IDENTIFIER.RECTTYPE),
-                ["customsplitrect"] = ((int)IDENTIFIER.CUSTOMSPLITRECT, (int)IDENTIFIER.RECTTYPE),
-                ["animationbuttonrect"] = ((int)IDENTIFIER.ANIMATIONBUTTONRECT, (int)IDENTIFIER.RECTTYPE),
-
-                // Font properties
-                ["font"] = ((int)IDENTIFIER.FONT, (int)IDENTIFIER.FONT),
-                ["captionfont"] = ((int)IDENTIFIER.CAPTIONFONT, (int)IDENTIFIER.FONT),
-                ["smallcaptionfont"] = ((int)IDENTIFIER.SMALLCAPTIONFONT, (int)IDENTIFIER.FONT),
-                ["menufont"] = ((int)IDENTIFIER.MENUFONT, (int)IDENTIFIER.FONT),
-                ["statusfont"] = ((int)IDENTIFIER.STATUSFONT, (int)IDENTIFIER.FONT),
-                ["msgboxfont"] = ((int)IDENTIFIER.MSGBOXFONT, (int)IDENTIFIER.FONT),
-                ["icontitlefont"] = ((int)IDENTIFIER.ICONTITLEFONT, (int)IDENTIFIER.FONT),
-                ["heading1font"] = ((int)IDENTIFIER.HEADING1FONT, (int)IDENTIFIER.FONT),
-                ["heading2font"] = ((int)IDENTIFIER.HEADING2FONT, (int)IDENTIFIER.FONT),
-                ["bodyfont"] = ((int)IDENTIFIER.BODYFONT, (int)IDENTIFIER.FONT),
-                ["glyphfont"] = ((int)IDENTIFIER.GLYPHFONT, (int)IDENTIFIER.FONT),
-
-                // String properties
-                ["text"] = ((int)IDENTIFIER.TEXT, (int)IDENTIFIER.STRING),
-                ["classicvalue"] = ((int)IDENTIFIER.CLASSICVALUE, (int)IDENTIFIER.STRING),
-                ["cssname"] = ((int)IDENTIFIER.CSSNAME, (int)IDENTIFIER.STRING),
-                ["xmlname"] = ((int)IDENTIFIER.XMLNAME, (int)IDENTIFIER.STRING),
-                ["lastupdated"] = ((int)IDENTIFIER.LASTUPDATED, (int)IDENTIFIER.STRING),
-                ["alias"] = ((int)IDENTIFIER.ALIAS, (int)IDENTIFIER.STRING),
-
-                // Int properties (animation duration)
-                ["animationduration"] = ((int)IDENTIFIER.ANIMATIONDURATION, (int)IDENTIFIER.INT),
-            };
-
-            return map;
-        }
-
-        private static Dictionary<int, Dictionary<string, int>> BuildEnumValueMap()
-        {
-            var map = new Dictionary<int, Dictionary<string, int>>();
-
-            // BGTYPE
-            map[(int)IDENTIFIER.BGTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["imagefile"] = 0,
-                ["borderfill"] = 1,
-                ["none"] = 2,
-            };
-
-            // IMAGELAYOUT
-            map[(int)IDENTIFIER.IMAGELAYOUT] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["vertical"] = 0,
-                ["horizontal"] = 1,
-            };
-
-            // BORDERTYPE
-            map[(int)IDENTIFIER.BORDERTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["rect"] = 0,
-                ["roundrect"] = 1,
-                ["ellipse"] = 2,
-            };
-
-            // FILLTYPE
-            map[(int)IDENTIFIER.FILLTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["solid"] = 0,
-                ["vertgradient"] = 1,
-                ["horizontalgradient"] = 2,
-                ["horzgradient"] = 2,
-                ["radialgradient"] = 3,
-                ["tileimage"] = 4,
-            };
-
-            // SIZINGTYPE
-            map[(int)IDENTIFIER.SIZINGTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["truesize"] = 0,
-                ["stretch"] = 1,
-                ["tile"] = 2,
-            };
-
-            // HALIGN
-            map[(int)IDENTIFIER.HALIGN] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["left"] = 0,
-                ["center"] = 1,
-                ["right"] = 2,
-            };
-
-            // CONTENTALIGNMENT
-            map[(int)IDENTIFIER.CONTENTALIGNMENT] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["left"] = 0,
-                ["center"] = 1,
-                ["right"] = 2,
-            };
-
-            // VALIGN
-            map[(int)IDENTIFIER.VALIGN] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["top"] = 0,
-                ["center"] = 1,
-                ["bottom"] = 2,
-            };
-
-            // OFFSETTYPE
-            map[(int)IDENTIFIER.OFFSETTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["topleft"] = 0,
-                ["topright"] = 1,
-                ["topmiddle"] = 2,
-                ["bottomleft"] = 3,
-                ["bottomright"] = 4,
-                ["bottommiddle"] = 5,
-                ["middleright"] = 6,
-                ["leftofcaption"] = 7,
-                ["rightofcaption"] = 8,
-                ["leftoflastbutton"] = 9,
-                ["rightoflastbutton"] = 10,
-                ["abovelastbutton"] = 11,
-                ["belowlastbutton"] = 12,
-            };
-
-            // ICONEFFECT
-            map[(int)IDENTIFIER.ICONEFFECT] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["none"] = 0,
-                ["glow"] = 1,
-                ["shadow"] = 2,
-                ["pulse"] = 3,
-                ["alpha"] = 4,
-            };
-
-            // TEXTSHADOWTYPE
-            map[(int)IDENTIFIER.TEXTSHADOWTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["none"] = 0,
-                ["single"] = 1,
-                ["continuous"] = 2,
-            };
-
-            // GLYPHTYPE
-            map[(int)IDENTIFIER.GLYPHTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["none"] = 0,
-                ["imageglyph"] = 1,
-                ["fontglyph"] = 2,
-            };
-
-            // IMAGESELECTTYPE
-            map[(int)IDENTIFIER.IMAGESELECTTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["none"] = 0,
-                ["size"] = 1,
-                ["dpi"] = 2,
-            };
-
-            // GLYPHFONTSIZINGTYPE
-            map[(int)IDENTIFIER.GLYPHFONTSIZINGTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["none"] = 0,
-                ["size"] = 1,
-                ["dpi"] = 2,
-            };
-
-            // TRUESIZESCALINGTYPE
-            map[(int)IDENTIFIER.TRUESIZESCALINGTYPE] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["none"] = 0,
-                ["size"] = 1,
-                ["dpi"] = 2,
-            };
-
-            return map;
-        }
-
-        #endregion
     }
 }

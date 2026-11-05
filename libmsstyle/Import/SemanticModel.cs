@@ -160,6 +160,8 @@ namespace libmsstyle.Import
 
         private static bool IsImageFileId(int nameId, Platform platform)
         {
+            // XP adds STOCKIMAGEFILE (3007); the loader turned all of them into in-memory IMAGE ids.
+            if (platform == Platform.WinXP) return VisualStyle.XpImageIds.Contains(nameId);
             return platform <= Platform.Win7 ? ImageFileIdsWin7.Contains(nameId) : ImageFileIds.Contains(nameId);
         }
 
