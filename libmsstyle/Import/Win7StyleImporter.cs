@@ -1643,10 +1643,16 @@ namespace libmsstyle.Import
                 // source's layout the source's strip is sliced the wrong way (Lion's 3 side-by-side tray frames, where
                 // Luna10 dropped TrayNotifyVert's layout record). Its IMAGECOUNT goes along for the same reason.
                 bool cut = s.NameId == (int)IDENTIFIER.IMAGELAYOUT || s.NameId == (int)IDENTIFIER.IMAGECOUNT;
-                if (src.Platform == Platform.WinXP && (s.NameId == (int)IDENTIFIER.BGTYPE || s.TypeId == (int)IDENTIFIER.COLOR || cut) && TryAddRecord(s, src, out string bgWhy))
+                // xp centres some captions (NOOTOR GTK, Xanadu). win10 reads CONTENTALIGNMENT with a left default and
+                // Luna10 kept that record only for MAXCAPTION (as 0), so a centred style's maximized title fell back
+                // to left while its normal caption stayed centered. the source's non-default alignment is added.
+                bool centeredCaption = s.NameId == (int)IDENTIFIER.CONTENTALIGNMENT && string.Equals(cls, "Window", StringComparison.OrdinalIgnoreCase)
+                    && s.Property.GetValue() is int align && align != 0;
+                if (src.Platform == Platform.WinXP && (s.NameId == (int)IDENTIFIER.BGTYPE || s.TypeId == (int)IDENTIFIER.COLOR || cut || centeredCaption) && TryAddRecord(s, src, out string bgWhy))
                 {
                     Decide(s, "added", s.TypeId == (int)IDENTIFIER.COLOR
                         ? "template dropped this color; xp still draws with it, so the source's color was added"
+                        : centeredCaption ? "template has no alignment for this caption part; win10 would draw it left, xp aligned it where the source says, so the source's CONTENTALIGNMENT was added"
                         : cut ? "template has no frame layout/count here; win10's default would cut the source's strip differently than xp, so the source's was added"
                         : "template has no BGTYPE here; without it uxtheme ignores the source's image, so the source's BGTYPE was added", b, s, null, null);
                     r.Count("added");

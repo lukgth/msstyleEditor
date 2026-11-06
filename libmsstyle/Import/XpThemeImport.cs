@@ -162,6 +162,34 @@ namespace libmsstyle.Import
                     report.Notes.Add($"variants: theme \"{themeName}\", color {scheme.InternalName} \"{scheme.DisplayName.Trim()}\", sizes NormalSize{string.Concat(sizes.Select(z => ", " + z.Name))}.");
                     CheckVariantsLoad(opt.OutputPath, scheme.InternalName, sizes, report);
                 }
+
+                // the xp pack's own desktop picture, if it shipped one: xp themes point at a path that assumed the
+                // machine they were made on ("C:\WINDOWS\xanadu.jpg"), so the file travels with the style and the
+                // generated .theme points at the copy. Resolved before the report is written, so the note lands in it.
+                XpThemeFiles.Desktop desktop = null;
+                string wallpaper = o.Wallpaper;
+                if (wallpaper == null)
+                {
+                    desktop = XpThemeFiles.ReadDesktop(o.SourcePath, scheme.InternalName);
+                    if (desktop != null && res.Ok && o.Write)
+                    {
+                        if (desktop.WallpaperPath != null && File.Exists(desktop.WallpaperPath))
+                        {
+                            Directory.CreateDirectory(styleDir);
+                            string wallpaperFile = XpThemeFiles.SafeName(Path.GetFileName(desktop.WallpaperPath));
+                            File.Copy(desktop.WallpaperPath, Path.Combine(styleDir, wallpaperFile), true);
+                            // %WinDir% expands wherever the value ends up (Control Panel\Desktop\Wallpaper too);
+                            // %ResourceDir% is only resolved inside [VisualStyles] Path.
+                            wallpaper = $@"%WinDir%\Resources\Themes\{name}\{wallpaperFile}";
+                            report.Notes.Add($"desktop: wallpaper \"{Path.GetFileName(desktop.WallpaperPath)}\" copied from {Path.GetFileName(desktop.ThemePath)}; xp showed it with TileWallpaper={(desktop.TileWallpaper ? 1 : 0)} WallpaperStyle={desktop.WallpaperStyle}");
+                        }
+                        else if (desktop.Wallpaper != null)
+                        {
+                            report.Warnings.Add($"desktop: {Path.GetFileName(desktop.ThemePath)} names wallpaper \"{desktop.Wallpaper}\" but that file isn't next to the style; using {XpThemeFiles.DefaultWallpaper}");
+                        }
+                    }
+                }
+                wallpaper = wallpaper ?? XpThemeFiles.DefaultWallpaper;
                 res.ReportFiles = ImportReportWriter.Write(report, Path.Combine(reportDir, label));
                 if (!res.Ok || !o.Write) continue;
 
@@ -181,7 +209,7 @@ namespace libmsstyle.Import
                     written.Load(res.StylePath);
                     colors = XpThemeFiles.SysColors(written);
                 }
-                XpThemeFiles.WriteTheme(res.ThemePath, XpThemeFiles.BuildTheme(display, name, file, o.Wallpaper ?? XpThemeFiles.DefaultWallpaper, colors, scheme.InternalName));
+                XpThemeFiles.WriteTheme(res.ThemePath, XpThemeFiles.BuildTheme(display, name, file, wallpaper, colors, scheme.InternalName, desktop));
             }
             if (o.Write) try { Directory.Delete(Path.Combine(outDir, ".work"), true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
             return results;

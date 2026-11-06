@@ -16,6 +16,113 @@ namespace libmsstyle.Import
     {
         public const string DefaultWallpaper = @"%WinDir%\Web\Wallpaper\Bliss.bmp";
 
+        /// <summary>
+        /// The desktop section of an xp theme file: which picture xp showed and how it fitted.
+        /// <see cref="WallpaperPath"/> is the resolved file when it exists next to or beside the theme file.
+        /// </summary>
+        public class Desktop
+        {
+            /// <summary>the .theme the values came from, null when the source ships none.</summary>
+            public string ThemePath { get; set; }
+            /// <summary>[VisualStyles] ColorStyle of that file.</summary>
+            public string ColorStyle { get; set; }
+            /// <summary>the raw Wallpaper value from that file.</summary>
+            public string Wallpaper { get; set; }
+            /// <summary>xp: 0 centered, 1 tiled, 2 stretched.</summary>
+            public int WallpaperStyle { get; set; }
+            public bool TileWallpaper { get; set; }
+            /// <summary>the wallpaper file, resolved through %windir%, the theme's own folder and the style's folder.</summary>
+            public string WallpaperPath { get; set; }
+        }
+
+        /// <summary>
+        /// Reads the desktop section xp shipped for a color scheme: the .theme files beside the .msstyles, the one whose
+        /// [VisualStyles] ColorStyle is the scheme's (xp theme packs name them per scheme, xanadu01..06). A theme file that
+        /// names a wallpaper wins over one that doesn't, so a pack whose first file carries no picture still ports it.
+        /// </summary>
+        public static Desktop ReadDesktop(string sourceStylePath, string colorStyle)
+        {
+            string dir = Path.GetDirectoryName(Path.GetFullPath(sourceStylePath));
+            if (!Directory.Exists(dir)) return null;
+            var files = Directory.GetFiles(dir, "*.theme");
+            if (files.Length == 0) return null;
+            Desktop best = null;
+            int bestRank = -1;
+            foreach (var f in files)
+            {
+                var d = ReadThemeFile(f);
+                if (d == null) continue;
+                bool sameScheme = string.Equals(d.ColorStyle, colorStyle, StringComparison.OrdinalIgnoreCase);
+                bool hasWallpaper = !string.IsNullOrEmpty(d.Wallpaper);
+                int rank = (sameScheme ? 2 : 0) + (hasWallpaper ? 1 : 0);
+                if (rank <= bestRank) continue;
+                bestRank = rank;
+                best = d;
+            }
+            if (best == null) return null;
+            best.WallpaperPath = ResolveWallpaper(best.Wallpaper, best.ThemePath, dir);
+            return best;
+        }
+
+        private static Desktop ReadThemeFile(string path)
+        {
+            var d = new Desktop { ThemePath = path };
+            string section = "";
+            foreach (var raw in File.ReadAllLines(path))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line[0] == ';' || line[0] == '#') continue;
+                if (line[0] == '[' && line.IndexOf(']') > 0)
+                {
+                    section = line.Substring(1, line.IndexOf(']') - 1).Trim();
+                    continue;
+                }
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                string key = line.Substring(0, eq).Trim(), value = line.Substring(eq + 1).Trim();
+                if (section.Equals(@"Control Panel\Desktop", StringComparison.OrdinalIgnoreCase))
+                {
+                    switch (key.ToLowerInvariant())
+                    {
+                        case "wallpaper": d.Wallpaper = value; break;
+                        case "wallpaperstyle": if (int.TryParse(value, out int ws)) d.WallpaperStyle = ws; break;
+                        case "tilewallpaper": d.TileWallpaper = value.Trim() == "1" || value.Trim().Equals("true", StringComparison.OrdinalIgnoreCase); break;
+                    }
+                }
+                else if (section.Equals("VisualStyles", StringComparison.OrdinalIgnoreCase) && key.Equals("ColorStyle", StringComparison.OrdinalIgnoreCase))
+                {
+                    d.ColorStyle = value;
+                }
+            }
+            return d;
+        }
+
+        private static string ResolveWallpaper(string raw, string themePath, string styleDir)
+        {
+            if (string.IsNullOrEmpty(raw)) return null;
+            string v = raw.Trim().Trim('"');
+            if (v.Length == 0) return null;
+            // xp theme packs spell it as an absolute path that assumed the machine the pack was made on.
+            string expanded = Environment.ExpandEnvironmentVariables(v.Replace("%ResourceDir%", "%SystemRoot%"));
+            var candidates = new List<string>();
+            if (Path.IsPathRooted(expanded)) candidates.Add(expanded);
+            string styleParent = Path.GetDirectoryName(styleDir);
+            candidates.Add(Path.Combine(styleDir, Path.GetFileName(v)));
+            candidates.Add(Path.Combine(styleDir, "Wallpaper", Path.GetFileName(v)));
+            candidates.Add(Path.Combine(Path.GetDirectoryName(themePath) ?? styleDir, Path.GetFileName(v)));
+            // packs often keep the picture in the folder above the .msstyles ("xanadu_vs\xanadu.jpg", the style in
+            // "xanadu_vs\Xanadu\"); xp itself read it from C:\WINDOWS because the pack's readme put it there.
+            if (styleParent != null)
+            {
+                candidates.Add(Path.Combine(styleParent, Path.GetFileName(v)));
+                candidates.Add(Path.Combine(styleParent, "Wallpaper", Path.GetFileName(v)));
+            }
+            foreach (var c in candidates)
+                if (File.Exists(c)) return Path.GetFullPath(c);
+            return null;
+        }
+
+
         /// <summary>[Control Panel\Colors] key names, in sysmetrics order (TMT_SCROLLBAR 1601 .. TMT_MENUBAR 1631).</summary>
         private static readonly string[] ColorNames =
         {
@@ -51,14 +158,20 @@ namespace libmsstyle.Import
         /// <param name="wallpaper">value for [Control Panel\Desktop] Wallpaper (environment variables allowed).</param>
         /// <param name="colors">[Control Panel\Colors] entries (<see cref="SysColors"/>); null or empty writes no section.</param>
         /// <param name="colorStyle">the style's color variant name ([VisualStyles] ColorStyle; windows loads Shell\&lt;it&gt;).</param>
+        /// <param name="fit">how xp fitted that picture; null keeps this generator's default (fill).</param>
         public static string BuildTheme(string displayName, string styleFolder, string styleFile, string wallpaper, IDictionary<string, Color> colors = null,
-            string colorStyle = "NormalColor")
+            string colorStyle = "NormalColor", Desktop fit = null)
         {
             foreach (var v in new[] { displayName, styleFolder, styleFile, wallpaper, colorStyle })
             {
                 if (string.IsNullOrEmpty(v) || v.IndexOfAny(new[] { '\r', '\n' }) >= 0)
                     throw new ArgumentException("theme values must be single, non-empty lines");
             }
+            // xp's WallpaperStyle/ TileWallpaper carried over into the pair win10 reads (Win10 stores the same idea
+            // under WallpaperStyle + PicturePosition). null fit = this generator's default, fill.
+            bool tile = fit?.TileWallpaper ?? false;
+            int wallStyle = fit == null ? 10 : tile ? 0 : fit.WallpaperStyle == 2 ? 2 : 0;
+            int picturePosition = fit == null ? 2 : tile ? 3 : fit.WallpaperStyle == 2 ? 2 : 4;
             var sb = new StringBuilder();
             void L(string s = "") => sb.Append(s).Append("\r\n");
             L("; Generated by msstyleImport import-xp");
@@ -99,9 +212,9 @@ namespace libmsstyle.Import
             }
             L(@"[Control Panel\Desktop]");
             L("Wallpaper=" + wallpaper);
-            L("TileWallpaper=0");
-            L("WallpaperStyle=10");
-            L("PicturePosition=2");
+            L("TileWallpaper=" + (tile ? "1" : "0"));
+            L("WallpaperStyle=" + wallStyle);
+            L("PicturePosition=" + picturePosition);
             L("Pattern=");
             L();
             L("[VisualStyles]");

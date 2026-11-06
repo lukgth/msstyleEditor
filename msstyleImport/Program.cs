@@ -49,6 +49,8 @@ namespace msstyleImport
                        [--shellstyle <xp shellstyle.dll, default: Shell\<scheme>\shellstyle.dll next to the source>]
                        [--wallpaper <path>] [--write]
                        [--prefer-source Class|Part|Prop]... [--exclude Class|Part|Prop]... [--image-tolerance N]
+      the wallpaper is the one the xp pack's .theme files name next to the source (copied into the style folder);
+      --wallpaper overrides it, and %WinDir%\Web\Wallpaper\Bliss.bmp is used when the pack ships none.
       one output per color scheme (all schemes unless --scheme is given):
         <out-dir>\<Label>\<Label>.msstyles + Shell\ (the template's, with the source shellstyle's bitmaps),
         <out-dir>\<Label>.theme, reports in <out-dir>\reports\. <Label> is <Name>, or <Name> <scheme> when the
@@ -143,7 +145,7 @@ nothing here applies or installs a theme.");
                 BasePath = One(a, "base", required: false),
                 BaseScheme = One(a, "base-scheme", required: false) ?? "NormalColor",
                 ShellStylePath = One(a, "shellstyle", required: false),
-                Wallpaper = One(a, "wallpaper", required: false) ?? XpThemeFiles.DefaultWallpaper,
+                Wallpaper = One(a, "wallpaper", required: false),
                 Write = a.ContainsKey("write"),
                 PreferSource = a.TryGetValue("prefer-source", out var ps) ? ps : new List<string>(),
                 Exclude = a.TryGetValue("exclude", out var ex) ? ex : new List<string>(),
