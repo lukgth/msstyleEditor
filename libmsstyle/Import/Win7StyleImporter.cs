@@ -749,6 +749,10 @@ namespace libmsstyle.Import
                     if (slots.Count == 0) continue;
                     var tcls = m_target.Style.Classes[slots[0].Property.Header.classID];
                     if (SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, s.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ist && ist == 0) continue;
+                    // an image glyph with IMAGESELECTTYPE picks its glyph from IMAGEFILE1-7 (Luna10 Toolbar SPLITBUTTONDROPDOWN,
+                    // the back/forward dropdown arrows): those slots are glyph sizes, which FillDpiSlots gives the source's
+                    // GLYPHIMAGEFILE. The button background there left ElementA's arrows blank.
+                    if (SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, s.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int gt && gt == 1) continue;
                     foreach (var t in slots.Where(t => !Same(m_source, s, m_target, t)))
                         ApplyExtra(t, s, b, "applied-single-image-slot",
                             $"xp sets one IMAGEFILE; the template picks {t.PropertyName} by dpi, so it gets the source's picture"
