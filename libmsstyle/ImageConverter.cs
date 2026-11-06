@@ -36,6 +36,34 @@ namespace libmsstyle
         }
 
         /// <summary>
+        /// True when a 32bpp DIB carries a two-level alpha mask: some pixels fully transparent, some fully
+        /// opaque. xp itself only blends alpha when a pixel is partially transparent (utils.cpp
+        /// PreMultiplyAlpha), so a 0/255 mask only means anything where xp copies the bitmap into a 32bpp
+        /// DIB and keeps its alpha (see VisualStyle.XpKeepsImageAlpha).
+        /// </summary>
+        public static bool HasAlphaMask(byte[] dib)
+        {
+            if (dib == null || dib.Length < 40) return false;
+            short biBitCount = BitConverter.ToInt16(dib, 14);
+            if (biBitCount != 32) return false;
+            int biSize = BitConverter.ToInt32(dib, 0);
+            int width = BitConverter.ToInt32(dib, 4);
+            int height = Math.Abs(BitConverter.ToInt32(dib, 8));
+            int biCompression = BitConverter.ToInt32(dib, 16);
+            int biClrUsed = BitConverter.ToInt32(dib, 32);
+            int pixelOffset = biSize + (biCompression == 3 && biSize == 40 ? 12 : 0) + Math.Max(0, biClrUsed) * 4;
+            int end = Math.Min(dib.Length, pixelOffset + width * 4 * height);
+            bool transparent = false, opaque = false;
+            for (int p = pixelOffset + 3; p < end; p += 4)
+            {
+                if (dib[p] == 0) transparent = true;
+                else if (dib[p] == 255) opaque = true;
+                if (transparent && opaque) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// Converts an XP RT_BITMAP (raw DIB) into a png the way uxtheme stores IMAGE resources:
         /// premultiplied ARGB.
         /// 32bpp: XP's themeldr only uses the alpha channel when some pixel is partially

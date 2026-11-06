@@ -143,6 +143,53 @@ namespace libmsstyleTests
         }
 
         [TestMethod]
+        public void StartPanelLogoffButtonsKeepTheirBitmapAlphaMask()
+        {
+            // xp draws StartPanel LOGOFFBUTTONS with DTBG_DRAWSOLID (nt5src logoff.cpp) and uxtheme then
+            // copies the bitmap's alpha into the log off toolbar's ILC_COLOR32 imagelist, so a 0/255 mask
+            // is what xp showed even when the record says Transparent = false (Xanadu's log off and shut
+            // down icons on magenta). Other parts only get the color key.
+            using (var s = new VisualStyle())
+            {
+                s.Load(XpLuna);
+                var start = s.Classes.Values.Single(c => c.ClassName.Equals("StartPanel", StringComparison.OrdinalIgnoreCase));
+                Assert.IsTrue(VisualStyle.XpKeepsImageAlpha(start, 9));
+                Assert.IsFalse(VisualStyle.XpKeepsImageAlpha(start, 8));
+                var button = s.Classes.Values.Single(c => c.ClassName.Equals("Button", StringComparison.OrdinalIgnoreCase));
+                Assert.IsFalse(VisualStyle.XpKeepsImageAlpha(button, 1));
+            }
+        }
+
+        [TestMethod]
+        public void AlphaMaskOnlyCountsForPartsXpKeepsTheAlphaOf()
+        {
+            // 2x1 32bpp DIB: one transparent magenta pixel, one opaque white pixel. xp ignores a 0/255-only
+            // alpha channel (utils.cpp PreMultiplyAlpha wants a partial pixel), so it is only honored where
+            // xp keeps the bitmap's alpha.
+            int w = 2, h = 1;
+            var dib = new byte[40 + w * h * 4];
+            BitConverter.GetBytes(40).CopyTo(dib, 0);
+            BitConverter.GetBytes(w).CopyTo(dib, 4);
+            BitConverter.GetBytes(h).CopyTo(dib, 8);
+            BitConverter.GetBytes((short)1).CopyTo(dib, 12);
+            BitConverter.GetBytes((short)32).CopyTo(dib, 14);
+            int px = 40;
+            dib[px + 0] = 255; dib[px + 1] = 0; dib[px + 2] = 255; dib[px + 3] = 0;     // magenta, transparent
+            dib[px + 4] = 255; dib[px + 5] = 255; dib[px + 6] = 255; dib[px + 7] = 255; // white, opaque
+
+            Assert.IsTrue(ImageConverter.HasAlphaMask(dib));
+            var masked = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null, anyAlpha: true));
+            Assert.AreEqual(0u, masked.Pixels[0], "masked pixel not transparent");
+            Assert.AreEqual(0xFFFFFFFFu, masked.Pixels[1]);
+
+            var opaque = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null));
+            Assert.AreEqual(0xFFFF00FFu, opaque.Pixels[0], "xp's default draw keeps the mask pixel opaque");
+
+            dib[px + 3] = 255;
+            Assert.IsFalse(ImageConverter.HasAlphaMask(dib), "all-opaque alpha is not a mask");
+        }
+
+        [TestMethod]
         public void StockLunaOntoTheLunaPortChangesNothing()
         {
             if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");

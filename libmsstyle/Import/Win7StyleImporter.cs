@@ -26,6 +26,8 @@ namespace libmsstyle.Import
         private readonly Dictionary<string, ArgbImage> m_decoded = new Dictionary<string, ArgbImage>();
         // properties already rewritten, so the generic pass can't touch DWM records twice.
         private readonly HashSet<StyleProperty> m_touched = new HashSet<StyleProperty>();
+        // band pictures already reported as rebuilt, one note per source picture instead of per record.
+        private readonly HashSet<string> m_bandStripsNoted = new HashSet<string>(StringComparer.Ordinal);
 
         internal List<SpriteExpectation> SpriteChecks { get; } = new List<SpriteExpectation>();
         internal Dictionary<StyleProperty, string> ChangedProperties { get; } = new Dictionary<StyleProperty, string>();
@@ -1947,6 +1949,57 @@ namespace libmsstyle.Import
         /// 5 -> 12 with new art); an xp picture there would be sliced into garbage, so the template's
         /// picture stays. Win7 imports keep their own rule (validator frame waivers).
         /// </summary>
+        /// <summary>
+        /// xp's band backdrops (rebar, toolbar, status) are often one pixel wide: a vertical strip holding
+        /// the band's top edge rows, its fill row and its bottom edge rows, stretched with xp's own
+        /// SIZINGMARGINS. win10 keeps the same record but the template's picture is a whole band, drawn with
+        /// the template's margins; stretching the strip's edge rows to band height turned Xanadu's menu bar
+        /// band black. So the strip is rebuilt into a picture of the template's size: the fill row fills
+        /// everything the template's top margin leaves, and the strip's bottom edge rows are sampled into
+        /// the template's bottom margin. The art (fill color and bottom edge) survives, the geometry is the
+        /// one win10 stretches.
+        /// </summary>
+        private byte[] RebuildBandPicture(SemanticModel src, SemanticEntry s, StyleProperty target, byte[] data, ImageInfo info, out bool rebuilt)
+        {
+            rebuilt = false;
+            if (info == null || !info.Decodable || info.Width != 1 || info.Height < 3 || info.HasAlpha) return data;
+            var tref = SemanticModel.ResourceRef(target, Platform.Win10);
+            if (tref == null) return data;
+            var tinfo = m_target.GetImageInfo(tref.Item1, tref.Item2);
+            if (tinfo == null || !tinfo.Decodable || tinfo.Width < 8 || tinfo.Height < 3) return data;
+            if (s == null || !src.Style.Classes.TryGetValue(s.Property.Header.classID, out var sc)) return data;
+            if (!(SemanticModel.FindEffective(src.Style, sc, s.PartId, s.StateId, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins sm)) return data;
+            if (!m_target.Style.Classes.TryGetValue(target.Header.classID, out var tc)
+                || !(SemanticModel.FindEffective(m_target.Style, tc, target.Header.partID, target.Header.stateID, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins tm)) return data;
+            // only the rebar's band backdrop: part 0 is xp's rebar background, part 6 is win10's BACKGROUND.
+            if (!tc.ClassName.EndsWith("Rebar", StringComparison.OrdinalIgnoreCase)) return data;
+            if (target.Header.partID != 0 && target.Header.partID != 6) return data;
+            if (sm.Top <= 0 && sm.Bottom <= 0) return data;
+            var column = ImageIdentity.Decode(data);
+            if (column.Width != 1) return data;
+            int fillRow = Math.Min(Math.Max(sm.Top, 0), column.Height - 1);
+            int bottomRows = Math.Min(Math.Max(sm.Bottom, 0), column.Height - 1);
+            int band = Math.Max(tm.Bottom, 0);
+            band = Math.Min(band, tinfo.Height - 1);
+            int top = Math.Min(Math.Max(tm.Top, 0), tinfo.Height - band - 1);
+            var wide = new ArgbImage(tinfo.Width, tinfo.Height);
+            int fillEnd = wide.Height - band;
+            for (int y = 0; y < fillEnd; ++y)
+            {
+                uint px = column.Pixels[y < top && sm.Top > 0 ? (y * sm.Top / Math.Max(top, 1)) : fillRow];
+                for (int x = 0; x < wide.Width; ++x) wide.Pixels[y * wide.Width + x] = px;
+            }
+            for (int i = 0; i < band; ++i)
+            {
+                int srcRow = column.Height - bottomRows + (bottomRows == 0 ? 0 : i * bottomRows / band);
+                if (srcRow > column.Height - 1) srcRow = column.Height - 1;
+                uint px = column.Pixels[srcRow];
+                for (int x = 0; x < wide.Width; ++x) wide.Pixels[(fillEnd + i) * wide.Width + x] = px;
+            }
+            rebuilt = true;
+            return ImageIdentity.EncodePngVerified(wide);
+        }
+
         private bool FitsTargetFrames(SemanticModel src, SemanticEntry s, StyleProperty target, ImageInfo info, out string error)
         {
             error = null;
@@ -2010,6 +2063,16 @@ namespace libmsstyle.Import
                 {
                     error = $"source {s.ResourceType} {s.ResourceId} isn't a decodable png ({info?.Error})";
                     return false;
+                }
+                data = RebuildBandPicture(src, s, target, data, info, out bool bandRebuilt);
+                if (bandRebuilt)
+                {
+                    string stripDims = $"{info.Width}x{info.Height}";
+                    var band = ImageIdentity.Analyze(data);
+                    if (band.Decodable) info = band;
+                    string note = $"{s.ClassName}|{s.PartName}|S{s.StateId}|{s.PropertyName}: xp's {stripDims} band strip rebuilt at the template's picture size, so win10 stretches it the way xp did";
+                    if (m_bandStripsNoted.Add(s.ResourceType + "/" + s.ResourceId) && !m_report.Notes.Contains(note))
+                        m_report.Notes.Add(note);
                 }
                 if (!FitsTargetFrames(src, s, target, info, out error)) return false;
                 int id = PlaceResource(s.ResourceType, s.ResourceId, data, info != null && info.Decodable ? info : null);

@@ -959,13 +959,14 @@ namespace libmsstyle
             }
 
             Color? key = XpColorKey(cls, part, state, prop.Header.nameID);
+            bool alpha = XpKeepsImageAlpha(cls, part) && ImageConverter.HasAlphaMask(dib);
 
-            string k = resName + "|" + (key.HasValue ? key.Value.ToArgb().ToString("X8") : "-");
+            string k = resName + "|" + (key.HasValue ? key.Value.ToArgb().ToString("X8") : "-") + (alpha ? "|alpha" : "");
             if (ids.TryGetValue(k, out int id)) return id;
             byte[] png;
             try
             {
-                png = ImageConverter.ConvertXpDibToPremultipliedPng(dib, key);
+                png = ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, alpha);
             }
             catch (Exception ex)
             {
@@ -976,6 +977,19 @@ namespace libmsstyle
             ids[k] = id;
             m_xpImages[id] = png;
             return id;
+        }
+
+        /// <summary>
+        /// True for parts xp composes into a 32bpp DIB itself instead of painting them on the screen:
+        /// StartPanel LOGOFFBUTTONS is drawn with DTBG_DRAWSOLID (nt5src shell\explorer\desktop2\logoff.cpp),
+        /// which makes uxtheme skip its transparency/alpha handling (imagefile.cpp DrawBackgroundDNG) and
+        /// copy the bitmap's alpha channel into the log off toolbar's ILC_COLOR32 imagelist. The image then
+        /// works as an alpha mask even when the record says Transparent = false, as Xanadu's log off and
+        /// shut down icons (holes are alpha 0 over magenta) do.
+        /// </summary>
+        internal static bool XpKeepsImageAlpha(StyleClass cls, int part)
+        {
+            return part == 9 && cls.ClassName.Equals("StartPanel", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
