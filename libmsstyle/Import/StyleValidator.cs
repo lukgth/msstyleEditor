@@ -518,7 +518,7 @@ namespace libmsstyle.Import
                 }
                 fonts++;
             }
-            Check($"{fonts} font properties parse the way uxtheme reads them (known style words only, face and positive size).");
+            Check($"{fonts} font properties parse the way uxtheme reads them (known style words only, face and nonzero size).");
         }
 
         // sysmetrics font -> the bar its text sits in. uxtheme copies both into NONCLIENTMETRICS
@@ -560,7 +560,7 @@ namespace libmsstyle.Import
             string text = m.ResolveString(fe.Property.Header.shortFlag);
             var f = text == null ? null : FontSpec.Parse(text);
             if (f == null || !f.IsSane) return null;
-            return Tuple.Create(f.PixelHeight96, height);
+            return Tuple.Create(Math.Abs(f.PixelHeight96), height);
         }
     }
 }

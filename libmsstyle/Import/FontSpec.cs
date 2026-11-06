@@ -73,7 +73,9 @@ namespace libmsstyle.Import
             }
             f.Points = ParseNumber(sizeToken, out bool trailing);
             if (trailing) f.Warnings.Add($"size \"{sizeToken}\" isn't a plain integer, uxtheme reads {f.Points}");
-            if (f.Points <= 0) f.Warnings.Add($"size {f.Points} isn't a usable point size");
+            // a negative size is a pixel height: themeldr parser.cpp ParseSizeInfoUnits stores -MulDiv(points, 96, 72), so
+            // "-1" is lfHeight +1, a 1px cell. XPMC hides the Start button's text that way ("Arial, -1").
+            if (f.Points == 0) f.Warnings.Add("size 0 isn't a usable point size");
 
             foreach (var tok in styles.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries))
             {
@@ -110,8 +112,8 @@ namespace libmsstyle.Import
             return unchecked((int)(v * sign));
         }
 
-        /// <summary>usable as a theme font: parses, positive size, has a face.</summary>
-        public bool IsSane => Error == null && Points > 0 && Face.Trim().Length > 0;
+        /// <summary>usable as a theme font: parses, nonzero size, has a face.</summary>
+        public bool IsSane => Error == null && Points != 0 && Face.Trim().Length > 0;
 
         public bool Equals(FontSpec o)
         {

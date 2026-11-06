@@ -499,6 +499,41 @@ namespace libmsstyle.Import
             if (m_source.Platform == Platform.WinXP) ThemeWholeClientEdge();
             if (m_source.Platform == Platform.WinXP) OpaqueSpinBackgrounds();
             if (m_source.Platform == Platform.WinXP) MenuColorsFromXp();
+            if (m_source.Platform == Platform.WinXP) TransparentForTrueAlpha();
+        }
+
+        /// <summary>
+        /// xp only. xp's uxtheme blends a picture with true alpha (some pixel partly transparent) by its alpha channel
+        /// whatever TRANSPARENT says: fAlphaChannel comes from the bitmap header (imagefile.cpp SetImageInfo,
+        /// pdi->fAlphaChannel = fTrueAlpha) and TRANSPARENT only switches the color key. Windows 10 doesn't blend a part
+        /// with TRANSPARENT false: XPMC's toolbar buttons (TRANSPARENT = False on a 32bpp alpha strip) were drawn on
+        /// black. Every state that now shows a picture with partial alpha and says TRANSPARENT false gets true,
+        /// which is how xp drew it. Template pictures stay as they are (Luna10's frames are opaque).
+        /// </summary>
+        private void TransparentForTrueAlpha()
+        {
+            foreach (var cls in m_target.Style.Classes.Values)
+                foreach (var part in cls.Parts.Values)
+                    foreach (var st in part.States.Values)
+                    {
+                        var tr = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.TRANSPARENT_ && p.Header.typeID == (int)IDENTIFIER.BOOLTYPE);
+                        if (tr == null || !(tr.GetValue() is bool on) || on) continue;
+                        if (KeyPattern.Matches(m_opt.Exclude, cls.ClassName, part.PartName, "TRANSPARENT")) continue;
+                        bool alpha = st.Properties.Where(p => p.Header.nameID == (int)IDENTIFIER.IMAGEFILE || DpiSlotIds.Contains(p.Header.nameID))
+                            .Select(p => p.GetValue() is int id && m_alloc.Added.TryGetValue("IMAGE/" + id, out var bytes) ? bytes : null)
+                            .Where(b => b != null)
+                            .Any(b => ImageIdentity.Decode(b).Pixels.Any(px => (px >> 24) != 0 && (px >> 24) != 0xFF));
+                        if (!alpha) continue;
+                        tr.SetValue(true);
+                        MarkTouched(tr, $"{cls.ClassName}|{part.PartName}|S{st.StateId}|TRANSPARENT");
+                        m_report.Decisions.Add(new MergeDecision
+                        {
+                            Class = cls.ClassName, Part = part.PartName, State = st.StateId, Property = "TRANSPARENT", Action = "applied-true-alpha",
+                            Reason = "the picture has partial alpha, which xp blended whatever TRANSPARENT said; windows 10 only blends with TRANSPARENT true",
+                            Result = "true",
+                        });
+                        m_report.Count("applied-true-alpha");
+                    }
         }
 
         /// <summary>
@@ -762,18 +797,29 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// xp only. An image glyph picked by size (GLYPHTYPE IMAGEGLYPH, IMAGESELECTTYPE SIZE) is IMAGEFILE1-7 with
-        /// MINSIZE1-7: uxtheme draws the largest one whose MINSIZE fits the part (imagefile.cpp SelectCorrectImageFile).
-        /// The template's slots have their own min sizes (Luna10 ScrollBar ARROWBTN: 17/21/26 where xp's were 7/9),
-        /// so a slot copied one to one shows a different source glyph than xp did at that size. Ana Muslims Vista's 7px
-        /// glyph file is empty and xp never showed it: at 17px it drew IMAGEFILE2 (MINSIZE2 9). Each template slot gets
-        /// the source glyph xp picks at the slot's MINSIZE, so a 17px scrollbar shows what it showed on xp.
+        /// xp only. An image glyph picked by size (GLYPHTYPE IMAGEGLYPH, IMAGESELECTTYPE SIZE) is IMAGEFILE1-5 with
+        /// MINSIZE1-5: uxtheme draws the largest one whose min size fits the part (imagefile.cpp SelectCorrectImageFile),
+        /// a missing MINSIZE being the glyph's own frame size (SetImageInfo: szMinSize = iSingleWidth x iSingleHeight).
+        /// The template's slots have their own min sizes (Luna10 ScrollBar ARROWBTN: 17/21/26 where xp's were 7/9; its
+        /// caption buttons none, so their redrawn glyphs' frame sizes), so a slot copied one to one shows a different
+        /// glyph than xp did at that size: Ana Muslims Vista's empty 7px arrow, Luna10's white caption glyphs on
+        /// XPMC's small buttons. Each template slot gets the source glyph xp picks at that slot's min size.
         /// </summary>
         private void GlyphSizeSlotsFromXp()
         {
             // MINSIZE1-5 go with IMAGEFILE1-5; win10's IMAGEFILE6/7 have no min size and are only reached past MINSIZE5.
             var minSizeIds = new[] { IDENTIFIER.MINSIZE1, IDENTIFIER.MINSIZE2, IDENTIFIER.MINSIZE3, IDENTIFIER.MINSIZE4, IDENTIFIER.MINSIZE5 };
             var slotIds = new[] { IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3, IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5 };
+            // the min size uxtheme uses for one slot: MINSIZEn, or the picture's frame (IMAGECOUNT frames, IMAGELAYOUT).
+            Size? MinSize(SemanticModel m, StyleClass c, int part, int stateId, int slot, SemanticEntry e)
+            {
+                if (slot >= 0 && slot < minSizeIds.Length && SemanticModel.FindEffective(m.Style, c, part, stateId, minSizeIds[slot])?.GetValue() is Size s) return s;
+                var img = Decoded(m, "IMAGE", e.ResourceId);
+                if (img == null) return null;
+                int n = SemanticModel.FindEffective(m.Style, c, part, stateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int cnt && cnt > 0 ? cnt : 1;
+                bool horizontal = SemanticModel.FindEffective(m.Style, c, part, stateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int lo && lo == 1;
+                return horizontal ? new Size(img.Width / n, img.Height) : new Size(img.Width, img.Height / n);
+            }
             foreach (var state in m_source.Entries.Where(e => e.ResourceType == "IMAGE" && e.NameId == (int)IDENTIFIER.IMAGEFILE1)
                 .Select(e => (e.ClassName, e.PartName, e.StateId, e.StateKey)).Distinct().ToList())
             {
@@ -783,17 +829,16 @@ namespace libmsstyle.Import
                 if (sp == null || !m_source.Style.Classes.TryGetValue(sp.Header.classID, out var scls)) continue;
                 if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int sg && sg == 1)) continue;
                 if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ss && ss == 1)) continue;
-                // the source's glyph files in slot order with the min size xp gave each (default: the glyph's own size).
+                // the source's glyph files in slot order with the min size xp gave each.
                 var glyphs = new List<(SemanticEntry Entry, int W, int H)>();
                 for (int i = 0; i < slotIds.Length; ++i)
                 {
                     var e = src.FirstOrDefault(x => x.NameId == (int)slotIds[i] && x.ResourceType == "IMAGE");
                     if (e == null) break;
-                    var ms = SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, minSizeIds[i])?.GetValue();
-                    if (!(ms is Size sz)) { glyphs.Clear(); break; } // no MINSIZE: xp used the frame size, which the porter doesn't model here.
+                    if (!(MinSize(m_source, scls, sp.Header.partID, state.StateId, i, e) is Size sz)) { glyphs.Clear(); break; }
                     glyphs.Add((e, sz.Width, sz.Height));
                 }
-                if (glyphs.Count < 2) continue;
+                if (glyphs.Count < 1) continue;
                 // glyphs the source kept at stock xp's stay the template's (Luna10 redrew them for its larger slots).
                 if (glyphs.All(g => m_base.ByKey.TryGetValue(g.Entry.Key, out var b) && Same(m_base, b, m_source, g.Entry))) continue;
 
@@ -803,18 +848,24 @@ namespace libmsstyle.Import
                 var tcls = m_target.Style.Classes[slots[0].Property.Header.classID];
                 if (!(SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int tg && tg == 1)) continue;
                 if (!(SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ts && ts == 1)) continue;
+                // min sizes of the template's own pictures, read before any slot is rewritten.
+                var targetMin = slots.ToDictionary(t => t, t => MinSize(m_target, tcls, t.PartId, state.StateId, Array.IndexOf(slotIds, (IDENTIFIER)t.NameId), t));
+                // a source without MINSIZE (min size from the frame) only fills slots the merge left at the template's
+                // pictures: XPMC sets IMAGEFILE1 alone and Luna10's own glyphs stayed in 2-7. Slots the merge already gave
+                // the source's pictures (TangoLux's caption buttons, one per size) are kept as they are.
+                bool explicitMin = Enumerable.Range(0, glyphs.Count).All(i =>
+                    SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, minSizeIds[i])?.GetValue() is Size);
                 foreach (var t in slots)
                 {
-                    // IMAGEFILE6/7 (or a slot without MINSIZE) are only reached past the last sized slot: the largest glyph.
-                    int i = Array.IndexOf(slotIds, (IDENTIFIER)t.NameId);
-                    var tms = i < 0 ? null : SemanticModel.FindEffective(m_target.Style, tcls, t.PartId, state.StateId, minSizeIds[i])?.GetValue();
+                    if (!explicitMin && m_touched.Contains(t.Property)) continue;
+                    var tms = targetMin[t];
                     var pick = tms is Size tsz
                         ? glyphs.LastOrDefault(g => g.W <= tsz.Width && g.H <= tsz.Height)
                         : glyphs[glyphs.Count - 1];
                     if (pick.Entry == null) pick = glyphs[0]; // smaller than every source glyph: xp drew the first.
                     if (Same(m_source, pick.Entry, m_target, t)) continue;
                     ApplyExtra(t, pick.Entry, null, "applied-glyph-size-slot",
-                        $"xp picks the image glyph by size; at this slot's min size ({(tms is Size z ? $"{z.Width}x{z.Height}" : "largest")}) it drew the source's {pick.Entry.PropertyName} (MINSIZE {pick.W}x{pick.H})");
+                        $"xp picks the image glyph by size; at this slot's min size ({(tms is Size z ? $"{z.Width}x{z.Height}" : "unknown")}) it drew the source's {pick.Entry.PropertyName} ({pick.W}x{pick.H})");
                 }
             }
         }
