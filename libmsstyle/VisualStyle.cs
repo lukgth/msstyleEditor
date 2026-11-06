@@ -776,11 +776,17 @@ namespace libmsstyle
         void LoadXp(byte[] themesIniData)
         {
             m_platform = Platform.WinXP;
-            m_xpColorSchemes = XpStyleIniParser.ParseThemesIni(themesIniData);
+            var colorNames = XpNameList("COLORNAMES");
+            var sizeNames = XpNameList("SIZENAMES");
+            // what XP loads (packthem's tables); THEMES_INI only for styles that lack them.
+            m_xpColorSchemes = XpStyleIniParser.SchemesFromCombo(ResourceAccess.GetResource(m_moduleHandle, "COMBODATA", "COMBO"),
+                colorNames, sizeNames, XpNameList("FILERESNAMES"), themesIniData);
+            if (m_xpColorSchemes.Count == 0)
+                m_xpColorSchemes = XpStyleIniParser.ParseThemesIni(themesIniData);
 
             if (m_xpColorSchemes.Count == 0)
             {
-                throw new Exception("No color schemes found in THEMES_INI!");
+                throw new Exception("No color schemes found in COMBODATA or THEMES_INI!");
             }
 
             // What XP shows comes from the string table packthem wrote, not from THEMES_INI's DisplayName lines
@@ -792,8 +798,6 @@ namespace libmsstyle
                 Win32Api.EnumResourceFlags.RESOURCE_ENUM_LN).Take(1))
                 ResourceAccess.StringTable.Load(m_moduleHandle, lang, packed);
             string Packed(int id) => packed.TryGetValue(id, out var s) && !string.IsNullOrWhiteSpace(s) ? s.Trim() : null;
-            var colorNames = XpNameList("COLORNAMES");
-            var sizeNames = XpNameList("SIZENAMES");
             foreach (var scheme in m_xpColorSchemes)
             {
                 int ci = colorNames.FindIndex(n => n.Equals(scheme.InternalName, StringComparison.OrdinalIgnoreCase));

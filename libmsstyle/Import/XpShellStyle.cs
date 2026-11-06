@@ -83,6 +83,22 @@ namespace libmsstyle.Import
             return v;
         }
 
+        /// <summary>
+        /// the first of <paramref name="selectors"/> that sets <paramref name="property"/>, the way DirectUI resolves
+        /// it for the element drawn: a child's own rule over its parent's (the header title inside its button), then
+        /// the plain class rule, then <c>element</c>, which every DUI class derives from. Lion OS X puts its header
+        /// text color on the title and its backgrounds on <c>element</c> only.
+        /// </summary>
+        public string GetFirst(string resid, string property, params string[] selectors)
+        {
+            foreach (var sel in selectors)
+            {
+                var v = Get(resid, sel, property);
+                if (v != null) return v;
+            }
+            return null;
+        }
+
         public byte[] GetBitmap(int id) => ResourceAccess.GetResource(m_module, "#2", (uint)id);
 
         public IEnumerable<int> BitmapIds()

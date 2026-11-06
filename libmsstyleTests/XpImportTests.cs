@@ -43,6 +43,35 @@ namespace libmsstyleTests
         }
 
         [TestMethod]
+        public void SchemesComeFromThePackedTablesNotTheFileSections()
+        {
+            // Lion OS X: [ColorScheme.NormalColor], but every [File.X] says "ColorSchemes = Lion". packthem still
+            // built COMBODATA (1 color, 3 sizes -> files 0, 1, 2) and XP loads that.
+            var ini = System.Text.Encoding.Unicode.GetBytes(
+                "[ColorScheme.NormalColor]\r\nDisplayName = Lion3\r\n[Size.NormalSize]\r\nDisplayName = Normal\r\n" +
+                "[Size.LargeFonts]\r\nDisplayName = Large Fonts\r\n[File.NormalLion]\r\nColorSchemes = Lion\r\nSizes = NormalSize\r\n");
+            Assert.AreEqual(0, XpStyleIniParser.ParseThemesIni(ini).Count);
+
+            var combo = new byte[] { 1, 0, 3, 0, 0, 0, 1, 0, 2, 0 };
+            var schemes = XpStyleIniParser.SchemesFromCombo(combo, new System.Collections.Generic.List<string> { "NormalColor" },
+                new System.Collections.Generic.List<string> { "NormalSize", "LargeFonts", "ExtraLargeFonts" },
+                new System.Collections.Generic.List<string> { "NORMALLION_INI", "LARGEFONTSLION_INI", "EXTRALARGELION_INI" }, ini);
+            Assert.AreEqual(1, schemes.Count);
+            Assert.AreEqual("NormalColor", schemes[0].InternalName);
+            Assert.AreEqual("Lion3", schemes[0].DisplayName);
+            Assert.AreEqual("NORMALLION_INI", schemes[0].IniResourceName);
+            CollectionAssert.AreEqual(new[] { "LargeFonts", "ExtraLargeFonts" }, schemes[0].Sizes.Select(x => x.InternalName).ToArray());
+            Assert.AreEqual("Large Fonts", schemes[0].Sizes[0].DisplayName);
+            Assert.AreEqual("EXTRALARGELION_INI", schemes[0].Sizes[1].IniResourceName);
+
+            // a size the color has no file for (-1) isn't offered.
+            var sparse = new byte[] { 1, 0, 2, 0, 0, 0, 0xFF, 0xFF };
+            Assert.AreEqual(0, XpStyleIniParser.SchemesFromCombo(sparse, new System.Collections.Generic.List<string> { "NormalColor" },
+                new System.Collections.Generic.List<string> { "NormalSize", "LargeFonts" },
+                new System.Collections.Generic.List<string> { "NORMALLION_INI" }, ini)[0].Sizes.Count);
+        }
+
+        [TestMethod]
         public void MissingImageLayoutMeansHorizontalLikeXp()
         {
             using (var s = new VisualStyle())

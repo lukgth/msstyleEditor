@@ -92,6 +92,49 @@ namespace libmsstyle
             return schemes.Values.Where(s => !string.IsNullOrEmpty(s.IniResourceName)).ToList();
         }
 
+        /// <summary>
+        /// The schemes XP itself loads: packthem's COMBODATA (cColors, cSizes, then sFileNums[size * cColors + color],
+        /// -1 = none; themeldr tmutils.cpp COMBOENTRY) indexes FILERESNAMES, COLORNAMES/SIZENAMES give the names.
+        /// THEMES_INI only supplies display names. Its [File.X] ColorSchemes lines can name schemes that don't exist
+        /// (Lion OS X: "Lion" where the scheme is NormalColor), which packthem resolved when it built the tables.
+        /// NormalSize is the scheme's main file (the first size the scheme has when no size is called that).
+        /// </summary>
+        public static List<XpColorScheme> SchemesFromCombo(byte[] combo, List<string> colorNames, List<string> sizeNames,
+            List<string> fileResNames, byte[] themesIni)
+        {
+            var result = new List<XpColorScheme>();
+            if (combo == null || combo.Length < 4) return result;
+            int cColors = BitConverter.ToInt16(combo, 0), cSizes = BitConverter.ToInt16(combo, 2);
+            if (cColors <= 0 || cSizes <= 0 || combo.Length < 4 + 2 * cColors * cSizes) return result;
+            var sections = themesIni == null ? new List<IniSection>() : ParseIniSections(DecodeUtf16LE(themesIni));
+            string Display(string prefix, string name)
+                => sections.FirstOrDefault(s => s.Name.Equals(prefix + name, StringComparison.OrdinalIgnoreCase))?.Get("displayname") ?? name;
+
+            for (int c = 0; c < cColors && c < colorNames.Count; ++c)
+            {
+                var files = new List<(string Size, string Ini)>();
+                for (int s = 0; s < cSizes && s < sizeNames.Count; ++s)
+                {
+                    int file = BitConverter.ToInt16(combo, 4 + 2 * (s * cColors + c));
+                    if (file >= 0 && file < fileResNames.Count) files.Add((sizeNames[s], fileResNames[file]));
+                }
+                if (files.Count == 0) continue;
+                int main = files.FindIndex(f => f.Size.Equals("NormalSize", StringComparison.OrdinalIgnoreCase));
+                if (main < 0) main = 0;
+                var scheme = new XpColorScheme
+                {
+                    InternalName = colorNames[c],
+                    DisplayName = Display("ColorScheme.", colorNames[c]),
+                    IniResourceName = files[main].Ini,
+                };
+                for (int i = 0; i < files.Count; ++i)
+                    if (i != main)
+                        scheme.Sizes.Add(new XpSize { InternalName = files[i].Size, DisplayName = Display("Size.", files[i].Size), IniResourceName = files[i].Ini });
+                result.Add(scheme);
+            }
+            return result;
+        }
+
         /// <summary>[Documentation] DisplayName of THEMES_INI, null when it has none.</summary>
         public static string ThemeDisplayName(byte[] themesIni)
             => ParseIniSections(DecodeUtf16LE(themesIni)).FirstOrDefault(s => s.Name.Equals("Documentation", StringComparison.OrdinalIgnoreCase))?.Get("displayname");

@@ -1247,10 +1247,15 @@ namespace libmsstyle.Import
                 // Combobox is a plain border fill), so uxtheme's default (BORDERFILL) would ignore the source's
                 // IMAGEFILE that does come over: TangoLux's address box lost its frame picture. it's added.
                 // the same goes for colors: Luna10 dropped Combobox's FILLCOLOR, and GSM's address box came out white.
-                if (src.Platform == Platform.WinXP && (s.NameId == (int)IDENTIFIER.BGTYPE || s.TypeId == (int)IDENTIFIER.COLOR) && TryAddRecord(s, src, out string bgWhy))
+                // and for the strip cut: a missing IMAGELAYOUT is horizontal on xp but vertical on win10, so without the
+                // source's layout the source's strip is sliced the wrong way (Lion's 3 side-by-side tray frames, where
+                // Luna10 dropped TrayNotifyVert's layout record). Its IMAGECOUNT goes along for the same reason.
+                bool cut = s.NameId == (int)IDENTIFIER.IMAGELAYOUT || s.NameId == (int)IDENTIFIER.IMAGECOUNT;
+                if (src.Platform == Platform.WinXP && (s.NameId == (int)IDENTIFIER.BGTYPE || s.TypeId == (int)IDENTIFIER.COLOR || cut) && TryAddRecord(s, src, out string bgWhy))
                 {
                     Decide(s, "added", s.TypeId == (int)IDENTIFIER.COLOR
                         ? "template dropped this color; xp still draws with it, so the source's color was added"
+                        : cut ? "template has no frame layout/count here; win10's default would cut the source's strip differently than xp, so the source's was added"
                         : "template has no BGTYPE here; without it uxtheme ignores the source's image, so the source's BGTYPE was added", b, s, null, null);
                     r.Count("added");
                     return true;
@@ -1560,6 +1565,10 @@ namespace libmsstyle.Import
             if (!m_target.Style.Classes.TryGetValue(target.Header.classID, out var cls)) return true;
             var countProp = SemanticModel.FindEffective(m_target.Style, cls, target.Header.partID, target.Header.stateID, IDENTIFIER.IMAGECOUNT);
             var layoutProp = SemanticModel.FindEffective(m_target.Style, cls, target.Header.partID, target.Header.stateID, IDENTIFIER.IMAGELAYOUT);
+            // the template has no layout record: the source's comes along (see the a == null branch of the merge),
+            // so the strip is cut the source's way. Lion's TrayNotifyVert tray: 3 frames side by side.
+            if (layoutProp == null && s != null && src.Style.Classes.TryGetValue(s.Property.Header.classID, out var lsc))
+                layoutProp = SemanticModel.FindEffective(src.Style, lsc, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT);
             int count = countProp?.GetValue() is int c && c > 0 ? c : 1;
             bool horizontal = layoutProp?.GetValue() is int l && l == 1;
             int len = horizontal ? info.Width : info.Height;

@@ -61,17 +61,20 @@ namespace libmsstyle.Import
         private const int Background = 0, NormalBg = 5, NormalCollapse = 6, NormalExpand = 7, NormalHead = 8,
             SpecialBg = 9, SpecialCollapse = 10, SpecialExpand = 11, SpecialHead = 12;
 
-        // win10 ExplorerBar text color <- xp stylesheet / selector (the win10 UIFILE reads part/state 3803).
-        private static readonly (int Part, int State, string Resid, string Selector)[] TextColors =
+        // win10 ExplorerBar text color <- xp stylesheet / selectors (the win10 UIFILE reads part/state 3803). A header's
+        // text is its title element: the title's own foreground wins over the button's it sits in (DirectUI cascades
+        // to the child); stock luna sets it on the button only, Lion OS X on the title.
+        private const string Title = "element [id=atom(title)]", TitleHot = "element [id=atom(title)][mousefocused]";
+        private static readonly (int Part, int State, string Resid, string[] Selectors)[] TextColors =
         {
-            (NormalCollapse, 0, "sectionss", "button"),
-            (NormalCollapse, 2, "sectionss", "element [id=atom(title)][mousefocused]"),
-            (NormalExpand, 0, "sectiontaskss", "button"),
-            (NormalExpand, 2, "sectiontaskss", "element [id=atom(title)][mousefocused]"),
-            (SpecialCollapse, 0, "mainsectionss", "button [id=atom(header)]"),
-            (SpecialCollapse, 2, "mainsectionss", "element [id=atom(title)][mousefocused]"),
-            (SpecialExpand, 0, "mainsectiontaskss", "button"),
-            (SpecialExpand, 2, "mainsectiontaskss", "element [id=atom(title)][mousefocused]"),
+            (NormalCollapse, 0, "sectionss", new[] { Title, "button" }),
+            (NormalCollapse, 2, "sectionss", new[] { TitleHot }),
+            (NormalExpand, 0, "sectiontaskss", new[] { "button" }),
+            (NormalExpand, 2, "sectiontaskss", new[] { TitleHot }),
+            (SpecialCollapse, 0, "mainsectionss", new[] { Title, "button [id=atom(header)]" }),
+            (SpecialCollapse, 2, "mainsectionss", new[] { TitleHot }),
+            (SpecialExpand, 0, "mainsectiontaskss", new[] { "button" }),
+            (SpecialExpand, 2, "mainsectiontaskss", new[] { TitleHot }),
         };
 
         // arrow strips: 3 frames normal/hot/pressed; collapse is shown while the group is open (xp [selected]).
@@ -110,18 +113,18 @@ namespace libmsstyle.Import
 
             foreach (var t in TextColors)
             {
-                var s = XpShellStyle.ParseColor(m_src.Get(t.Resid, t.Selector, "foreground"));
-                var b = XpShellStyle.ParseColor(m_base.Get(t.Resid, t.Selector, "foreground"));
+                var s = XpShellStyle.ParseColor(m_src.GetFirst(t.Resid, "foreground", t.Selectors));
+                var b = XpShellStyle.ParseColor(m_base.GetFirst(t.Resid, "foreground", t.Selectors));
                 // no hover rule (xp's classic shellstyle): the title keeps its normal color on hover, so the
                 // hover state takes the normal state's source color instead of keeping the template's blue.
                 if (s == null && t.State == 2)
                 {
                     var normal = TextColors.First(n => n.Part == t.Part && n.State == 0);
-                    s = XpShellStyle.ParseColor(m_src.Get(normal.Resid, normal.Selector, "foreground"));
+                    s = XpShellStyle.ParseColor(m_src.GetFirst(normal.Resid, "foreground", normal.Selectors));
                     b = null;
                 }
                 if (s == null) continue;
-                SetColor(t.Part, t.State, IDENTIFIER.TEXTCOLOR, SameColor(s, b) ? (Color?)null : s.Value, $"{t.Resid} {t.Selector} foreground");
+                SetColor(t.Part, t.State, IDENTIFIER.TEXTCOLOR, SameColor(s, b) ? (Color?)null : s.Value, $"{t.Resid} {t.Selectors[0]} foreground");
             }
 
             GroupTile(NormalBg, "sectionss");
@@ -211,12 +214,15 @@ namespace libmsstyle.Import
 
         /// <summary>
         /// The group background is a 10x10 nine-grid tile: fill inside, the tasklist border on the
-        /// sides xp drew it (borderthickness rect(l,t,r,b), luna rect(1,0,1,1)).
+        /// sides xp drew it (borderthickness rect(l,t,r,b), luna rect(1,0,1,1)). The fill is the first rule that sets
+        /// one: the given selector, the tasklist, then <c>element</c>, which every DUI class derives from (Lion OS X
+        /// colors its groups through <c>element</c> only; reading just the tasklist kept Luna10's white groups).
         /// </summary>
         private void GroupTile(int part, string resid, string fillSelector = "tasklist [id=atom(tasklist)]")
         {
             const string list = "tasklist [id=atom(tasklist)]";
-            string sBg = m_src.Get(resid, fillSelector, "background"), bBg = m_base.Get(resid, fillSelector, "background");
+            string[] fillChain = { fillSelector, list, "element" };
+            string sBg = m_src.GetFirst(resid, "background", fillChain), bBg = m_base.GetFirst(resid, "background", fillChain);
             string sBc = m_src.Get(resid, list, "bordercolor"), bBc = m_base.Get(resid, list, "bordercolor");
             string sBt = m_src.Get(resid, list, "borderthickness"), bBt = m_base.Get(resid, list, "borderthickness");
             var img = Find(part, 0, IDENTIFIER.IMAGEFILE);
@@ -258,39 +264,55 @@ namespace libmsstyle.Import
             return (a << 24) | ((uint)c.R * a / 255 << 16) | ((uint)c.G * a / 255 << 8) | ((uint)c.B * a / 255);
         }
 
+        /// <summary>
+        /// The header is drawn by the title element inside the header button: the title's background covers the
+        /// button's, the button's covers what <c>element</c> gives every DUI element. Stock luna sets the button's;
+        /// Lion OS X the title's (a flat bitmap) and <c>element</c>'s.
+        /// </summary>
         private void HeaderImage(int part, string resid, string selector)
         {
             var img = Find(part, 0, IDENTIFIER.IMAGEFILE);
             if (img == null) return;
-            string sBack = m_src.Get(resid, selector, "background");
-            if (!XpShellStyle.ParseRcBmp(sBack, out int id, out var key))
+            string[] chain = { Title, selector, "element" };
+            string sBack = m_src.GetFirst(resid, "background", chain);
+            Color? flat = null;
+            if (XpShellStyle.ParseRcBmp(sBack, out int id, out var key))
             {
-                // a color header (xp's classic shellstyle: background activecaption / buttonface): the header
-                // becomes a flat tile of that color, cut like the port's header picture.
-                var c = XpShellStyle.ParseColor(sBack);
-                if (c == null) return;
-                var tile = new ArgbImage(10, 10);
-                for (int i = 0; i < tile.Pixels.Length; ++i) tile.Pixels[i] = Premultiplied(Color.FromArgb(255, c.Value));
-                PlaceImage(img, part, ImageIdentity.EncodePngVerified(tile), $"{resid} header color {sBack}");
-                foreach (var gid in new[] { IDENTIFIER.SIZINGMARGINS, IDENTIFIER.IMAGECOUNT })
+                XpShellStyle.ParseRcBmp(m_base.GetFirst(resid, "background", chain), out int bid, out _);
+                var dib = m_src.GetBitmap(id);
+                if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {resid} header bitmap {id} is missing; template kept."); return; }
+                if (bid > 0 && SameBytes(dib, m_base.GetBitmap(bid))) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, resid + " header"); RestoreHeaderGeometry(part); HeaderInset(part, resid, selector); return; }
+                // mode 6 color keyed; otherwise DirectUI's per-pixel alpha rule.
+                var png = ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null);
+                // a one-color bitmap (Lion's 18x18 title tile) is a flat header: cut to the template's header margins
+                // it would be narrower than them.
+                var pic = ImageIdentity.Decode(png);
+                if (pic.Pixels.All(p => p == pic.Pixels[0]) && (pic.Pixels[0] >> 24) == 0xFF)
+                    flat = Color.FromArgb((int)((pic.Pixels[0] >> 16) & 0xFF), (int)((pic.Pixels[0] >> 8) & 0xFF), (int)(pic.Pixels[0] & 0xFF));
+                else
                 {
-                    var gp = Find(part, 0, gid);
-                    if (gp == null) continue;
-                    object v = gid == IDENTIFIER.IMAGECOUNT ? (object)1 : new Margins(1, 1, 1, 1);
-                    if (SemanticModel.FormatValue(gp) == (gid == IDENTIFIER.IMAGECOUNT ? "1" : "(l1,t1,r1,b1)")) continue;
-                    gp.SetValue(v);
-                    Changed(gp, part, 0, "applied-shellstyle", $"{resid} header is a flat color, a 10x10 tile");
+                    PlaceImage(img, part, png, $"{resid} header bitmap {id}");
+                    RestoreHeaderGeometry(part);
+                    HeaderInset(part, resid, selector);
+                    return;
                 }
-                HeaderInset(part, resid, selector);
-                return;
             }
-            XpShellStyle.ParseRcBmp(m_base.Get(resid, selector, "background"), out int bid, out _);
-            var dib = m_src.GetBitmap(id);
-            if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {resid} header bitmap {id} is missing; template kept."); return; }
-            if (bid > 0 && SameBytes(dib, m_base.GetBitmap(bid))) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, resid + " header"); RestoreHeaderGeometry(part); HeaderInset(part, resid, selector); return; }
-            // mode 6 color keyed; otherwise DirectUI's per-pixel alpha rule.
-            PlaceImage(img, part, ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null), $"{resid} header bitmap {id}");
-            RestoreHeaderGeometry(part);
+            // a color header (xp's classic shellstyle: background activecaption / buttonface): the header
+            // becomes a flat tile of that color, cut like the port's header picture.
+            var c = flat ?? XpShellStyle.ParseColor(sBack);
+            if (c == null || c.Value.A == 0) return;
+            var tile = new ArgbImage(10, 10);
+            for (int i = 0; i < tile.Pixels.Length; ++i) tile.Pixels[i] = Premultiplied(Color.FromArgb(255, c.Value));
+            PlaceImage(img, part, ImageIdentity.EncodePngVerified(tile), $"{resid} header color {sBack}");
+            foreach (var gid in new[] { IDENTIFIER.SIZINGMARGINS, IDENTIFIER.IMAGECOUNT })
+            {
+                var gp = Find(part, 0, gid);
+                if (gp == null) continue;
+                object v = gid == IDENTIFIER.IMAGECOUNT ? (object)1 : new Margins(1, 1, 1, 1);
+                if (SemanticModel.FormatValue(gp) == (gid == IDENTIFIER.IMAGECOUNT ? "1" : "(l1,t1,r1,b1)")) continue;
+                gp.SetValue(v);
+                Changed(gp, part, 0, "applied-shellstyle", $"{resid} header is a flat color, a 10x10 tile");
+            }
             HeaderInset(part, resid, selector);
         }
 
