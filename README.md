@@ -100,6 +100,8 @@ It's the Windows 7 importer with stock XP Luna (`libmsstyleTests\styles\xp_luna\
 * Bitmaps become premultiplied PNGs on load: 32bpp ones keep their alpha (when it isn't all 0/255, as XP decides), others get the `Transparent`/`TransparentColor` color key (magenta by default). A missing `ImageLayout` is written as horizontal, XP's default.
 * Where the template re-cut an XP strip into more frames using stock XP frames (Toolbar buttons 6 -> 8, scroll arrows 16 -> 20), the source strip is re-cut the same way. A source picture that doesn't divide into the template's frame count keeps the template's picture.
 * DWMWindow keeps the template's frames: XP has no DWM atlas. The window frames you see come from `Window` when DWM frames are off (Basic mode).
+* The task pane comes from the source's `Shell\<scheme>\shellstyle.dll` (XP's classic System32 one when a style has none). The porter resolves each value the way XP's DirectUI cascaded it, then fills the ExplorerBar records from it: colors, header and group pictures, arrows, insets and fonts. It also edits the port's copy of the Windows 10 shellstyle for things only its markup controls: the gap between sections, centered or right-aligned header titles, and the task hover background, which spans the whole row as on XP. Details and the limits are in [docs/win7-importer.md](docs/win7-importer.md).
+* A part whose pictures the source fully replaced uses the source's frame count and margins, even where the template retuned them for its own redrawn art.
 
 ## Contributors
 * [Shomnipotence](https://github.com/Shomnipotence) - New application icon design

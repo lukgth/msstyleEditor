@@ -99,6 +99,8 @@ namespace libmsstyle.Import
                     shell?.Snapshot();
                     MergeGenericClasses();
                     shell?.Run();
+                    m_headerMargins = shell?.HeaderContentMargins();
+                    m_hoverRecords = shell?.HoverRecords;
                     ReportTemplateOnlyImages();
                     CollectFrameWaivers();
 
@@ -140,6 +142,10 @@ namespace libmsstyle.Import
         private string m_validationDir;
 
         private XpShellStyle m_srcShell, m_baseShell;
+        // the port's ExplorerBar header CONTENTMARGINS (true = main section), for the shellstyle layout patch.
+        private Dictionary<bool, Margins> m_headerMargins;
+        // ExplorerBar records holding the source's task hover picture (true = main section), for the same patch.
+        private Dictionary<bool, (int Part, int State)> m_hoverRecords;
 
         /// <summary>
         /// source and stock shellstyle for this scheme. A source without Shell\&lt;scheme&gt;\shellstyle.dll is drawn
@@ -204,6 +210,9 @@ namespace libmsstyle.Import
                     ? $"shellstyle: replaced bitmaps {string.Join(", ", ids)} in Shell\\NormalColor\\shellstyle.dll with the source shellstyle's."
                     : "shellstyle: the source shellstyle's bitmaps are stock; the win10 shellstyle's stay.");
                 m_report.Count("shellstyle-bitmaps-replaced", ids.Count);
+                var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, false);
+                m_report.Notes.AddRange(notes);
+                m_report.Warnings.AddRange(warnings);
             }
             catch (IOException ex)
             {
@@ -1002,7 +1011,7 @@ namespace libmsstyle.Import
                 // xp: the template retuned a number but still draws stock pictures in this part
                 // (Luna10 TrayNotifyHoriz::TrayNotify SIZINGMARGINS l34 -> l20 on the stock strip). that
                 // number was fitted to stock art; with the source's own pictures, the source's numbers fit.
-                if (conflict && StockArtReplacedBySource(b.ClassName, b.PartName))
+                if (conflict && (StockArtReplacedBySource(b.ClassName, b.PartName) || SourceReplacedEveryPicture(b.ClassName, b.PartName)))
                 {
                     conflict = false;
                     m_stockArtParts.Add(b.PartKey);
@@ -1039,6 +1048,19 @@ namespace libmsstyle.Import
                 if (m_source.ByKey.TryGetValue(t.Key, out var s) && !Same(m_base, b, m_source, s)) replaced = true;
             }
             return replaced;
+        }
+
+        /// <summary>
+        /// xp only: the source drew its own picture for every picture stock xp has in this part. The template's
+        /// retuned numbers were fitted to its own redrawn art, which won't be shown, so the part is cut with the
+        /// source's numbers around the source's pictures. Lion OS X's TrackBar THUMBBOTTOM: Luna10 redrew the thumb
+        /// and moved its SIZINGMARGINS, so the part stayed locked and showed Luna's slider thumb under Lion.
+        /// </summary>
+        private bool SourceReplacedEveryPicture(string cls, string part)
+        {
+            if (m_source.Platform != Platform.WinXP || string.Equals(cls, "ExplorerBar", StringComparison.OrdinalIgnoreCase)) return false;
+            var imgs = m_base.Entries.Where(b => b.ResourceType == "IMAGE" && b.ClassName == cls && b.PartName == part).ToList();
+            return imgs.Count > 0 && imgs.All(b => m_source.ByKey.TryGetValue(b.Key, out var s) && s.ResourceType == "IMAGE" && !Same(m_base, b, m_source, s));
         }
 
         /// <summary>

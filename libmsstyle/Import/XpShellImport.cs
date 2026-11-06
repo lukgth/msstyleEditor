@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 namespace libmsstyle.Import
 {
@@ -125,6 +126,79 @@ namespace libmsstyle.Import
             // moves it the same way. Opus OS: rect(3,7,3,7), its tasks sit 9px further left and 3px tighter than luna.
             TaskListInset();
             PaneFonts();
+            TaskHover(false);
+            TaskHover(specialMain);
+        }
+
+        /// <summary>
+        /// state of the group background part (normal 5, special 9) that carries the task hover picture, per section
+        /// (true = main/special). Only set where the source draws one; <see cref="PatchShellStyleLayout"/> points the
+        /// task buttons' hover rules at it.
+        /// </summary>
+        public Dictionary<bool, (int Part, int State)> HoverRecords { get; } = new Dictionary<bool, (int Part, int State)>();
+
+        // a state of the group background part nothing in the shell draws (the UIFILEs only read state 0).
+        private const int HoverState = 1;
+
+        /// <summary>
+        /// xp's task hover background: the task button's background under the mouse (Lion OS X: rcbmp(110, 6, magenta)
+        /// in sectiontaskss/mainsectiontaskss <c>button [mousefocused]</c>). Windows 10 gives task links no hover
+        /// background of its own, and its DirectUI doesn't draw a shellstyle's rcbmp/resbmp (tried live: nothing
+        /// shows), only theme records through dtb(). So the picture goes into the port as a record on a spare state of
+        /// the group background part; mode 6 is a nine-grid stretched with the button's borderthickness as margins
+        /// (render.cpp GRAPHIC_NineGridTransColor), the key color see-through. Stock luna has no hover background, so
+        /// sources without one change nothing.
+        /// </summary>
+        private void TaskHover(bool main)
+        {
+            var hot = DuiCascade.Build(main, hot: true); var cold = DuiCascade.Build(main);
+            string sHot = m_srcDui.Resolve(hot.TaskButton, "background"), sCold = m_srcDui.Resolve(cold.TaskButton, "background");
+            if (sHot == null || sHot == sCold) return;
+            string what = main ? "special group" : "normal group";
+            int part = main ? SpecialBg : NormalBg;
+            var thick = XpShellStyle.ParseRect(m_srcDui.Resolve(hot.TaskButton, "borderthickness")) ?? new Margins(0, 0, 0, 0);
+            byte[] png; Margins sizing;
+            if (XpShellStyle.ParseRcBmp(sHot, out int id, out var key))
+            {
+                var dib = m_src.GetBitmap(id);
+                if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} task hover bitmap {id} is missing; no hover background."); return; }
+                png = ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null);
+                sizing = thick;
+            }
+            else if (DuiFill.Parse(sHot) is DuiFill f && f.Opaque)
+            {
+                var border = XpShellStyle.ParseColor(m_srcDui.Resolve(hot.TaskButton, "bordercolor")) ?? Color.Black;
+                png = ImageIdentity.EncodePngVerified(Paint(f, border, thick, out var gs));
+                sizing = gs ?? new Margins(Math.Min(thick.Left, 4), Math.Min(thick.Top, 4), Math.Min(thick.Right, 4), Math.Min(thick.Bottom, 4));
+            }
+            else { m_imp.Report.Warnings.Add($"shellstyle: {what} task hover background \"{sHot}\" isn't a bitmap, color or gradient the porter reads; no hover background."); return; }
+
+            if (!m_cls.Parts.TryGetValue(part, out var p)) return;
+            if (!p.States.TryGetValue(HoverState, out var st))
+            {
+                st = new StyleState { StateId = HoverState, StateName = "State " + HoverState };
+                p.States.Add(HoverState, st);
+            }
+            int img = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            Put(st, part, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, what);              // IMAGEFILE
+            Put(st, part, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, what);
+            Put(st, part, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, what);
+            Put(st, part, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, 1, what);          // STRETCH
+            Put(st, part, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, sizing, what);
+            HoverRecords[main] = (part, HoverState);
+        }
+
+        private void Put(StyleState st, int part, IDENTIFIER name, IDENTIFIER type, object value, string what)
+        {
+            var prop = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
+            if (prop == null)
+            {
+                prop = new StyleProperty(new PropertyHeader((int)name, (int)type) { classID = m_cls.ClassId, partID = part, stateID = st.StateId });
+                st.Properties.Add(prop);
+                m_imp.AddedRecords.Add($"{m_cls.ClassId}/{part}/{st.StateId}/{(int)name}/{(int)type}");
+            }
+            if (value is Margins mg) prop.SetValue(new Margins(mg.Left, mg.Top, mg.Right, mg.Bottom)); else prop.SetValue((int)value);
+            Changed(prop, part, st.StateId, "applied-shellstyle", $"{what} task hover background of the source shellstyle (win10 draws it from this record, see the shellstyle layout notes)");
         }
 
         /// <summary>
@@ -237,6 +311,16 @@ namespace libmsstyle.Import
         {
             return m_cls.Parts.TryGetValue(part, out var p) && p.States.TryGetValue(state, out var s)
                 ? s.Properties.FirstOrDefault(x => x.Header.nameID == (int)id) : null;
+        }
+
+        /// <summary>the port's header CONTENTMARGINS after <see cref="Run"/>: main (special) and normal group. Null where the template has none.</summary>
+        public Dictionary<bool, Margins> HeaderContentMargins()
+        {
+            var d = new Dictionary<bool, Margins>();
+            if (m_cls == null) return d;
+            if (Find(SpecialHead, 0, IDENTIFIER.CONTENTMARGINS)?.GetValue() is Margins m) d[true] = m;
+            if (Find(NormalHead, 0, IDENTIFIER.CONTENTMARGINS)?.GetValue() is Margins n) d[false] = n;
+            return d;
         }
 
         /// <summary>value null: the source shellstyle is stock here, so the template's original value.</summary>
@@ -622,6 +706,274 @@ namespace libmsstyle.Import
                 ok &= Win32Api.UpdateResource(h, 2u, (uint)kv.Key, 1033, kv.Value, (uint)kv.Value.Length);
             if (!Win32Api.EndUpdateResource(h, !ok) || !ok) throw new IOException($"updating bitmaps in \"{win10ShellStyle}\" failed");
             return replace.Keys.ToList();
+        }
+
+        /// <summary>
+        /// Two task pane placements no theme record reaches, because Windows 10 sets them in the shellstyle's own
+        /// markup. This rewrites them in the port's copy of the template shellstyle:
+        /// <list type="bullet">
+        /// <item>the gap between sections. XP stacks expandos in a vertical flow layout and uses the larger of one
+        /// expando's bottom margin and the next one's top margin (verticalflowlayout.cpp). Windows 10 instead pads
+        /// every Expando at the bottom (UIFILE 1, ExplorerBarStyle). That padding moves by however much the source's
+        /// gap differs from stock luna's (15rp). Opus OS: 5rp on xp, so 15 - 10 = 5rp.</item>
+        /// <item>header title alignment. Windows 10 places the title button <c>layoutpos="left"</c> in a fill layout
+        /// (SHELL32_UIFILE markup), so it sizes to its text. A source title that's centered or right-aligned
+        /// (SHADED's <c>middlecenter</c>) gets the button stretched over the header (fill layout, LP_Auto) and
+        /// aligned the same way. The box it's aligned in differs: on xp the title is the header's border layout
+        /// client, inside the header's borderthickness + padding and its own padding, with the arrow (layoutpos
+        /// right) taken off on the right. On Windows 10 it's the header's CONTENTMARGINS
+        /// (<paramref name="headerMargins"/>, true = main section) with the arrow overlapping, then the name
+        /// button's padding. That padding is set so both boxes have the same center (SHADED: margins 12/3 put the
+        /// title 5px right of xp's, where the -10rp right title padding and the 21px arrow shift it left).</item>
+        /// <item>task hover background (<paramref name="hoverRecords"/>, from <see cref="TaskHover"/>). Windows 10 builds
+        /// "Other Places" links as NavigateButtons, which never get MouseFocused (only MouseWithin), and System
+        /// Tasks as ActionButtons drawn with dtb(CommandModule, 3, 2) on hover. Both get dtb() of the hover record.</item>
+        /// </list>
+        /// A template whose markup doesn't have these attributes is left as it is, and that's reported.
+        /// Returns notes for the report, and the warnings.
+        /// </summary>
+        public static (List<string> notes, List<string> warnings) PatchShellStyleLayout(string win10ShellStyle, XpShellStyle source, XpShellStyle stock,
+            IReadOnlyDictionary<bool, Margins> headerMargins, IReadOnlyDictionary<bool, (int Part, int State)> hoverRecords, bool dryRun)
+        {
+            var notes = new List<string>(); var warnings = new List<string>();
+            DuiCascade src = new DuiCascade(source), bas = new DuiCascade(stock);
+
+            int Gap(DuiCascade d)
+            {
+                var m = XpShellStyle.ParseRect(d.Resolve(DuiCascade.Build(false).Expando, "margin")) ?? new Margins(0, 0, 0, 0);
+                return Math.Max(m.Top, m.Bottom);
+            }
+            int gapDelta = Gap(src) - Gap(bas);
+
+            // the title's contentalign as win10 takes it ("middlecenter"), or null when it's left (win10's placement
+            // already). The vertical part is the source's too: "topcenter" put SHADED's middlecenter titles against
+            // the top edge of the header.
+            string Align(bool main)
+            {
+                var s = DuiCascade.Build(main);
+                string v = src.Resolve(s.Title, "contentalign");
+                if (v == null) return null;
+                // a title padded out past the header (Lion OS X's special group, 200rp in a 200rp section) is hidden
+                // on purpose; its alignment isn't meant to be seen.
+                var pd = XpShellStyle.ParseRect(src.Resolve(s.Title, "padding"));
+                if (pd != null && pd.Left + pd.Right > 64) return null;
+                v = v.ToLowerInvariant();
+                string horz = v.Contains("center") ? "center" : v.Contains("right") ? "right" : null;
+                if (horz == null) return null;
+                string vert = v.Contains("middle") ? "middle" : v.Contains("bottom") ? "bottom" : "top";
+                return vert + horz;
+            }
+            var align = new Dictionary<string, string> { ["name_special"] = Align(true), ["name_normal"] = Align(false) };
+
+            // left/right padding of the name button that puts its box's center where xp's title box had it.
+            // xp: [header border + padding + title padding, width - (same on the right) - arrow]. win10: [margin +
+            // padding, width - margin - padding]. Widths cancel; the rest goes on whichever side keeps it >= 0.
+            (int left, int right)? TitlePad(bool main)
+            {
+                if (headerMargins == null || !headerMargins.TryGetValue(main, out var cm) || cm == null) return null;
+                var s = DuiCascade.Build(main);
+                Margins R(Func<DuiCascade.Section, DuiCascade.Node> pick, string prop) => XpShellStyle.ParseRect(src.Resolve(pick(s), prop)) ?? new Margins(0, 0, 0, 0);
+                Margins b = R(x => x.Header, "borderthickness"), pd = R(x => x.Header, "padding"), tp = R(x => x.Title, "padding");
+                Margins ab = R(x => x.Arrow, "borderthickness"), ap = R(x => x.Arrow, "padding");
+                int arrow = 0;
+                if (XpShellStyle.ParseRcBmp(src.Resolve(s.Arrow, "content"), out int aid, out _) && source.GetBitmap(aid) is byte[] dib && dib.Length >= 8)
+                    arrow = BitConverter.ToInt32(dib, 4) + ab.Left + ab.Right + ap.Left + ap.Right;
+                int xpLeft = b.Left + pd.Left + tp.Left, xpRight = b.Right + pd.Right + tp.Right + arrow;
+                int d = (xpLeft - xpRight) - (cm.Left - cm.Right);
+                return d >= 0 ? (d, 0) : (0, -d);
+            }
+            var pads = new Dictionary<string, (int left, int right)?> { ["name_special"] = TitlePad(true), ["name_normal"] = TitlePad(false) };
+            (int Part, int State)? Hover(bool prefer) => hoverRecords == null ? null
+                : hoverRecords.TryGetValue(prefer, out var r) ? r : hoverRecords.TryGetValue(!prefer, out var o) ? o : ((int, int)?)null;
+            var navHover = Hover(false); var taskHover = Hover(true);
+            if (gapDelta == 0 && align.Values.All(a => a == null) && navHover == null) return (notes, warnings);
+
+            var updates = new List<(string type, uint id, ushort lang, byte[] data)>();
+            var mod = Win32Api.LoadLibraryEx(win10ShellStyle, IntPtr.Zero, Win32Api.LoadLibraryFlags.LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE);
+            if (mod == IntPtr.Zero) throw new IOException($"can't open \"{win10ShellStyle}\"");
+            try
+            {
+                // UIFILE 1: the stylesheets. Expando padding, and the alignment of the name buttons.
+                foreach (var (lang, text, utf16) in TextResources(mod, "UIFILE", 1))
+                {
+                    string t = text;
+                    int sb = t.IndexOf("<style resid=\"ExplorerBarStyle\">", StringComparison.Ordinal);
+                    int se = sb < 0 ? -1 : t.IndexOf("</style>", sb, StringComparison.Ordinal);
+                    if (se < 0) { warnings.Add("shellstyle layout: the template's UIFILE 1 has no ExplorerBarStyle sheet; section spacing and title alignment stay."); break; }
+                    string sheet = t.Substring(sb, se - sb);
+                    if (gapDelta != 0)
+                    {
+                        var m = System.Text.RegularExpressions.Regex.Match(sheet, @"(<Expando\b[^>]*?\bpadding="")rect\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*(\d+)rp\s*\)""");
+                        if (!m.Success) warnings.Add("shellstyle layout: the template's Expando has no rect(...rp) padding; section spacing stays.");
+                        else
+                        {
+                            int bottom = Math.Max(0, int.Parse(m.Groups[5].Value) + gapDelta);
+                            sheet = sheet.Substring(0, m.Index) + m.Groups[1].Value + $"rect({m.Groups[2].Value},{m.Groups[3].Value},{m.Groups[4].Value},{bottom}rp)\"" + sheet.Substring(m.Index + m.Length);
+                            notes.Add($"shellstyle layout: sections {Gap(src)}rp apart as on xp (stock luna {Gap(bas)}rp): Expando bottom padding {m.Groups[5].Value}rp -> {bottom}rp.");
+                        }
+                    }
+                    foreach (var kv in align.Where(a => a.Value != null))
+                    {
+                        string open = $"<if class=\"{kv.Key}\">";
+                        int ib = sheet.IndexOf(open, StringComparison.Ordinal);
+                        int bb = ib < 0 ? -1 : sheet.IndexOf("<button ", ib, StringComparison.OrdinalIgnoreCase);
+                        if (bb < 0 || sheet.IndexOf("</if>", ib, StringComparison.Ordinal) < bb) { warnings.Add($"shellstyle layout: no {kv.Key} button rule in the template's ExplorerBarStyle; that header title stays left."); align[kv.Key] = null; continue; }
+                        int be = sheet.IndexOf("/>", bb, StringComparison.Ordinal);
+                        string tag = sheet.Substring(bb, be - bb);
+                        string newTag = tag.Insert("<button ".Length, $"contentalign=\"{kv.Value}\" ");
+                        if (pads[kv.Key].HasValue)
+                        {
+                            int pl = pads[kv.Key].Value.left, pr = pads[kv.Key].Value.right;
+                            // keep the template's top/bottom padding (Luna10: 1rp top).
+                            var pm = System.Text.RegularExpressions.Regex.Match(newTag, @"\bpadding=""rect\(\s*[^,]+,\s*([^,]+),\s*[^,]+,\s*([^)]+)\)""");
+                            string tb = pm.Success ? $"{pm.Groups[1].Value.Trim()}, {{0}}rp, {pm.Groups[2].Value.Trim()}" : "0, {0}rp, 0";
+                            string pad = $"padding=\"rect({pl}rp, {string.Format(tb, pr)})\"";
+                            newTag = pm.Success ? newTag.Substring(0, pm.Index) + pad + newTag.Substring(pm.Index + pm.Length) : newTag + " " + pad;
+                            notes.Add($"shellstyle layout: {(kv.Key == "name_special" ? "main" : "normal")} header title box padded {pl}rp left, {pr}rp right, centered where xp centers it (xp: header border, padding, title padding and arrow; win10: CONTENTMARGINS).");
+                        }
+                        sheet = sheet.Substring(0, bb) + newTag + sheet.Substring(be);
+                    }
+                    if (navHover.HasValue)
+                    {
+                        int np = navHover.Value.Part, ns = navHover.Value.State;
+                        const string nav = "<NavigateButton background=\"argb(0,0,0,0)\"/>";
+                        // the place-link row (task_item element) pads its NavigateButton by 5rp/2rp, so a hover drawn on
+                        // the button was 10px narrower and 4px shorter than the System Tasks button, which carries the
+                        // same padding itself (ActionButton rect(5rp, 2rp, 5rp, 2rp)). The row loses its padding and the
+                        // link's icon and label take it over (a NavigateButton's own padding isn't applied: tried live,
+                        // the icons moved to the edge), so the bar covers the same box the System Tasks one does.
+                        const string row = "<if class=\"task_item\">\r\n\t\t\t\t<viewer padding=\"rect(5rp,2rp,5rp,2rp)\"/>\r\n\t\t\t\t<element padding=\"rect(5rp,2rp,5rp,2rp)\"/>";
+                        const string icon = "<if class=\"icon\">\r\n\t\t\t\t<Button Background=\"argb(0,0,0,0)\" cursor=\"hand\" padding=\"rect(0,0,6rp,0)\"/>";
+                        const string label = "<if class=\"label_normal\">\r\n\t\t\t\t<Button font=\"gtf(TextStyle, 6, 0)\"";
+                        int ni = sheet.IndexOf(nav, StringComparison.Ordinal);
+                        int ri = sheet.IndexOf(row, StringComparison.Ordinal);
+                        if (ni < 0 || ri < 0 || sheet.IndexOf(icon, StringComparison.Ordinal) < 0 || sheet.IndexOf(label, StringComparison.Ordinal) < 0)
+                            warnings.Add("shellstyle layout: no NavigateButton / task_item / icon / label_normal rule in the template's ExplorerBarStyle; place links get no hover background.");
+                        else
+                        {
+                            sheet = sheet.Replace(row, row.Replace("<element padding=\"rect(5rp,2rp,5rp,2rp)\"/>", "<element padding=\"rect(0,0,0,0)\"/>"))
+                                         .Replace(icon, icon.Replace("padding=\"rect(0,0,6rp,0)\"", "padding=\"rect(5rp,2rp,6rp,2rp)\""))
+                                         .Replace(label, label.Replace("<Button ", "<Button padding=\"rect(0,2rp,5rp,2rp)\" "));
+                            ni = sheet.IndexOf(nav, StringComparison.Ordinal);
+                            sheet = sheet.Insert(ni + nav.Length, $"\r\n\t\t\t<if mousewithin=\"true\">\r\n\t\t\t\t<NavigateButton background=\"dtb(ExplorerBar, {np}, {ns})\"/>\r\n\t\t\t</if>");
+                            notes.Add($"shellstyle layout: place links (NavigateButton) hover with dtb(ExplorerBar, {np}, {ns}), the source's task hover background; the row's 5rp/2rp padding moved onto the link's icon and label so the bar covers it.");
+                        }
+                    }
+                    t = t.Substring(0, sb) + sheet + t.Substring(se);
+                    if (taskHover.HasValue)
+                    {
+                        int tp = taskHover.Value.Part, ts = taskHover.Value.State;
+                        // System Tasks (shell32 UIFILE 44): an AJOSplitButton row (BorderLayout, layoutpos top, so as wide
+                        // as the task list) holding the ActionButton at layoutpos left (only as wide as its text). xp's
+                        // hover covered the whole task row, so the picture goes on the row while the mouse is in it,
+                        // and the ActionButton's own hover picture (dtb(CommandModule, 3, 2)) is cleared there.
+                        const string tbs = "<style resid=\"TaskButtonStyle\">";
+                        int ti = t.IndexOf(tbs, StringComparison.Ordinal);
+                        int te = ti < 0 ? -1 : t.IndexOf("</style>", ti, StringComparison.Ordinal);
+                        var hm = new System.Text.RegularExpressions.Regex(@"(<if mousefocused=""true"">\s*<Button3d background="")dtb\(CommandModule, 3, 2\)("" font=""gtf\(TextStyle, 6, 2\)"")");
+                        string tb = te < 0 ? null : t.Substring(ti, te - ti);
+                        if (tb == null || !hm.IsMatch(tb)) warnings.Add("shellstyle layout: no ActionButton hover rule (dtb(CommandModule, 3, 2)) in the template's TaskButtonStyle; task buttons get no hover background.");
+                        else
+                        {
+                            tb = hm.Replace(tb, "${1}argb(0,0,0,0)$2");
+                            tb = tb.Insert(tbs.Length, $"\r\n\t\t\t<if mousewithin=\"true\">\r\n\t\t\t\t<AJOSplitButton background=\"dtb(ExplorerBar, {tp}, {ts})\"/>\r\n\t\t\t</if>");
+                            t = t.Substring(0, ti) + tb + t.Substring(te);
+                            notes.Add($"shellstyle layout: task rows (AJOSplitButton) hover with dtb(ExplorerBar, {tp}, {ts}), the source's task hover background, across the row.");
+                        }
+                    }
+                    if (t != text) updates.Add(("UIFILE", 1u, lang, Encode(t, utf16)));
+                }
+
+                // SHELL32_UIFILE: the pane markup. A centered title's button fills its header; with a task hover
+                // picture, task rows fill the task list's width as xp's tasks did (xp tasklists are vertical flows
+                // whose items stretch to the line; Windows 10's tasklist verticalflowlayout(0,0,0) and the place
+                // links' flowlayout() size each row to its text, so the hover would only cover the text).
+                var stretch = align.Where(a => a.Value != null).Select(a => a.Key).ToList();
+                bool fullRows = navHover.HasValue || taskHover.HasValue;
+                if (stretch.Count > 0 || fullRows)
+                {
+                    var pattern = stretch.Count == 0 ? null : new System.Text.RegularExpressions.Regex($@"(<button class=""(?:{string.Join("|", stretch)})"")\s+layoutpos=""left""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    const string list = "<element id=\"atom(tasklist)\" layoutpos=\"top\" layout=\"verticalflowlayout(0,0,0)\">";
+                    const string item = "<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\">";
+                    int files = 0, rowFiles = 0;
+                    foreach (uint id in ResourceIds(mod, "SHELL32_UIFILE"))
+                        foreach (var (lang, text, utf16) in TextResources(mod, "SHELL32_UIFILE", id))
+                        {
+                            string t = pattern == null ? text : pattern.Replace(text, "$1");
+                            if (t != text) files++;
+                            if (fullRows)
+                            {
+                                // verticalflowlayout(wrap, xalign, xlinealign): ALIGN_JUSTIFY (3) stretches the column to the
+                                // list's width and every row to the column (verticalflowlayout.cpp); a fill layout row
+                                // gives its NavigateButton the whole width.
+                                string r = t.Replace(list, list.Replace("verticalflowlayout(0,0,0)", "verticalflowlayout(0,3,3)"))
+                                            .Replace(item, item.Replace("flowlayout()", "filllayout()"));
+                                if (r != t) rowFiles++;
+                                t = r;
+                            }
+                            if (t != text) updates.Add(("SHELL32_UIFILE", id, lang, Encode(t, utf16)));
+                        }
+                    if (stretch.Count > 0)
+                    {
+                        if (files == 0) warnings.Add("shellstyle layout: the template's SHELL32_UIFILE markup has no left-placed header title buttons; titles stay left.");
+                        else notes.Add($"shellstyle layout: header titles aligned as on xp ({string.Join(", ", stretch.Select(k => $"{(k == "name_special" ? "main" : "normal")} {align[k]}"))}), in {files} pane layouts.");
+                    }
+                    if (fullRows)
+                    {
+                        if (rowFiles == 0) warnings.Add("shellstyle layout: the template's task lists aren't verticalflowlayout(0,0,0) / flowlayout() rows; the hover background covers only the text.");
+                        else notes.Add($"shellstyle layout: task rows stretched to the task list's width (hover covers the row as on xp), in {rowFiles} pane layouts.");
+                    }
+                }
+            }
+            finally { Win32Api.FreeLibrary(mod); }
+
+            if (dryRun || updates.Count == 0) return (notes, warnings);
+            IntPtr h = Win32Api.BeginUpdateResource(win10ShellStyle, false);
+            if (h == IntPtr.Zero) throw new IOException($"can't open \"{win10ShellStyle}\" for resource updates");
+            bool ok = true;
+            foreach (var u in updates) ok &= Win32Api.UpdateResource(h, u.type, u.id, u.lang, u.data, (uint)u.data.Length);
+            if (!Win32Api.EndUpdateResource(h, !ok) || !ok) throw new IOException($"updating the layout in \"{win10ShellStyle}\" failed");
+            return (notes, warnings);
+        }
+
+        private static byte[] Encode(string t, bool utf16)
+            => utf16 ? System.Text.Encoding.Unicode.GetPreamble().Concat(System.Text.Encoding.Unicode.GetBytes(t)).ToArray() : System.Text.Encoding.UTF8.GetBytes(t);
+
+        private static List<uint> ResourceIds(IntPtr mod, string type)
+        {
+            var ids = new List<uint>();
+            var typePtr = Marshal.StringToHGlobalUni(type);
+            try
+            {
+                Win32Api.EnumResourceNamesEx(mod, typePtr, (m, t, name, l) =>
+                {
+                    long v = name.ToInt64();
+                    if (v > 0 && v <= 0xFFFF) ids.Add((uint)v);
+                    return true;
+                }, IntPtr.Zero, Win32Api.EnumResourceFlags.RESOURCE_ENUM_LN, 0);
+            }
+            finally { Marshal.FreeHGlobal(typePtr); }
+            return ids;
+        }
+
+        /// <summary>every language of one text resource: UTF-16 with a BOM, otherwise UTF-8/ANSI markup (Luna10's).</summary>
+        private static List<(ushort lang, string text, bool utf16)> TextResources(IntPtr mod, string type, uint id)
+        {
+            var langs = new List<ushort>();
+            Win32Api.EnumResourceLanguagesEx(mod, type, "#" + id, (m, t, n, lang, l) => { langs.Add(lang); return true; },
+                IntPtr.Zero, Win32Api.EnumResourceFlags.RESOURCE_ENUM_LN, 0);
+            var list = new List<(ushort, string, bool)>();
+            foreach (var lang in langs)
+            {
+                IntPtr r = Win32Api.FindResourceEx(mod, type, id, lang);
+                if (r == IntPtr.Zero) continue;
+                uint size = Win32Api.SizeofResource(mod, r);
+                var buf = new byte[size];
+                Marshal.Copy(Win32Api.LockResource(Win32Api.LoadResource(mod, r)), buf, 0, (int)size);
+                bool utf16 = size >= 2 && buf[0] == 0xFF && buf[1] == 0xFE;
+                list.Add((lang, utf16 ? System.Text.Encoding.Unicode.GetString(buf, 2, buf.Length - 2) : System.Text.Encoding.UTF8.GetString(buf), utf16));
+            }
+            return list;
         }
 
         /// <summary>RT_BITMAP ids of a vista+ shellstyle (it has no UIFILE 1 in xp syntax, so no XpShellStyle).</summary>
