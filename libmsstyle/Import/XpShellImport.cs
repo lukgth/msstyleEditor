@@ -129,6 +129,176 @@ namespace libmsstyle.Import
             PaneFonts();
             TaskHover(false);
             TaskHover(specialMain);
+            SectionIcons();
+            ControlPanelPage();
+        }
+
+        // xp's category view (cpview.uix CategoryView, CategoryViewSS) and the win10 record that draws the same thing
+        // (SHELL32_UIFILE 24, CategoryPanelStyle: MainContentPanel dtb(CPLHomePage::ControlPanel, 2, 0), MainContentBackground
+        // dtb(.., 2, 1) whose glyph is the bottom-right watermark, HomePageTitle gtc(.., 5, 0), category links gtc(.., 11, 0/1/2)).
+        private const string CplClass = "CPLHomePage::ControlPanel";
+        private const int CplContent = 2, CplTitle = 5, CplLink = 11;
+        // shstyle.h IDB_CPANEL_WATERMARK; cpview.cpp _CreateWatermark draws it GRAPHIC_TransColor with blend value 255,
+        // RGB(255,0,0): red is see-through, bottom-right aligned.
+        private const int CplWatermarkId = 26;
+
+        /// <summary>
+        /// The Control Panel's "Pick a category" page. xp drew it from the shellstyle (CategoryViewSS view background,
+        /// DirectiveSS "Pick a category" title, CategoryListItemSS links, IDB_CPANEL_WATERMARK); Windows 10 draws it from
+        /// CPLHomePage::ControlPanel. Each value the source changed from stock xp goes into that record. The content
+        /// background is a picture in Luna10 (a 2px wide blue strip under the watermark glyph), so a changed fill becomes
+        /// a flat strip of the source's color, and a changed watermark replaces the glyph.
+        /// </summary>
+        private void ControlPanelPage()
+        {
+            if (!m_imp.Target.ClassesByName.TryGetValue(CplClass, out var cls) || m_imp.Target.DuplicateClassNames.Contains(CplClass)) return;
+            string S(XpShellStyle st, string sheet, string sel, string prop) => st.Get(sheet, sel, prop);
+            Color? Src(string sheet, string sel, string prop, out bool stock)
+            {
+                var s = XpShellStyle.ParseColor(S(m_src, sheet, sel, prop));
+                var b = XpShellStyle.ParseColor(S(m_base, sheet, sel, prop));
+                stock = s == null || SameColor(s, b);
+                return s;
+            }
+
+            var bg = Src("CategoryViewSS", "element [id=atom(view)]", "background", out bool bgStock);
+            if (!bgStock && bg is Color fill)
+            {
+                CplColor(cls, CplContent, 0, IDENTIFIER.FILLCOLOR, fill, "category view background");
+                CplContentStrip(cls, fill);
+            }
+            var title = Src("DirectiveSS", "element", "foreground", out bool titleStock);
+            if (!titleStock && title is Color tc) CplColor(cls, CplTitle, 0, IDENTIFIER.TEXTCOLOR, tc, "\"Pick a category\" title color");
+            var link = Src("CategoryListItemSS", "linkelement", "foreground", out bool linkStock);
+            if (!linkStock && link is Color lc)
+                foreach (int state in new[] { 0, 1, 2 }) CplColor(cls, CplLink, state, IDENTIFIER.TEXTCOLOR, lc, "category link color");
+            CplWatermark(cls);
+        }
+
+        private StyleState CplState(StyleClass cls, int part, int state)
+        {
+            if (!cls.Parts.TryGetValue(part, out var p)) return null;
+            if (!p.States.TryGetValue(state, out var st))
+            {
+                st = new StyleState { StateId = state, StateName = "State " + state };
+                p.States.Add(state, st);
+            }
+            return st;
+        }
+
+        private StyleProperty CplProp(StyleClass cls, int part, StyleState st, IDENTIFIER name, IDENTIFIER type)
+        {
+            var prop = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
+            if (prop != null) return prop;
+            prop = new StyleProperty(new PropertyHeader((int)name, (int)type) { classID = cls.ClassId, partID = part, stateID = st.StateId });
+            st.Properties.Add(prop);
+            m_imp.AddedRecords.Add($"{cls.ClassId}/{part}/{st.StateId}/{(int)name}/{(int)type}");
+            return prop;
+        }
+
+        private void CplChanged(StyleClass cls, StyleProperty p, int part, int state, string reason)
+        {
+            string partName = SemanticModel.PartNames(CplClass, Platform.Win10).TryGetValue(part, out var n) ? n : "Part " + part;
+            string prop = SemanticModel.PropertyName(p.Header.nameID);
+            m_imp.MarkTouched(p, $"{CplClass}|{partName}|S{state}|{prop}");
+            m_imp.Report.Decisions.Add(new MergeDecision
+            {
+                Class = CplClass, Part = partName, State = state, Property = prop, Action = "applied-shellstyle",
+                Reason = $"the Control Panel category view's {reason} from the source shellstyle", Result = SemanticModel.FormatValue(p),
+            });
+            m_imp.Report.Count("applied-shellstyle");
+        }
+
+        private void CplColor(StyleClass cls, int part, int state, IDENTIFIER name, Color c, string reason)
+        {
+            var st = CplState(cls, part, state);
+            if (st == null) return;
+            var p = CplProp(cls, part, st, name, IDENTIFIER.COLOR);
+            var v = Color.FromArgb(255, c);
+            if (p.GetValue() is Color cur && cur.ToArgb() == v.ToArgb()) return;
+            p.SetValue(v);
+            CplChanged(cls, p, part, state, reason);
+        }
+
+        /// <summary>the content background picture (state 1): Luna10's blue strip, redrawn flat in the source's color, template size.</summary>
+        private void CplContentStrip(StyleClass cls, Color fill)
+        {
+            var st = CplState(cls, CplContent, 1);
+            var img = st?.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
+            if (img == null || !(img.GetValue() is int id)) return;
+            var t = m_imp.Decoded(m_imp.Target, "IMAGE", id);
+            int w = t?.Width ?? 2, h = t?.Height ?? 300;
+            var strip = new ArgbImage(w, h);
+            uint px = 0xFF000000u | ((uint)fill.R << 16) | ((uint)fill.G << 8) | fill.B;
+            for (int i = 0; i < strip.Pixels.Length; ++i) strip.Pixels[i] = px;
+            byte[] png = ImageIdentity.EncodePngVerified(strip);
+            int nid = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            if (nid == id) return;
+            img.SetValue(nid);
+            CplChanged(cls, img, CplContent, 1, "background (flat strip)");
+        }
+
+        /// <summary>the watermark: glyph of the content background (state 1), bottom-right like xp's.</summary>
+        private void CplWatermark(StyleClass cls)
+        {
+            var src = m_src.GetBitmap(CplWatermarkId);
+            if (src == null || SameBytes(src, m_base.GetBitmap(CplWatermarkId))) return;
+            var st = CplState(cls, CplContent, 1);
+            var glyph = st?.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.GLYPHIMAGEFILE);
+            if (glyph == null) { m_imp.Report.Warnings.Add($"shellstyle: the template's {CplClass} content background has no glyph; the Control Panel watermark stays."); return; }
+            byte[] png = ImageConverter.ConvertXpDibToPremultipliedPng(src, Color.FromArgb(255, 0, 0));
+            int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            if ((glyph.Header.shortFlag & 0xFFFF) == id) return;
+            glyph.SetValue(id);
+            CplChanged(cls, glyph, CplContent, 1, "watermark (bitmap 26)");
+        }
+
+        // xp's special section icons (shstyle.h IDB_MUSIC_ICON_BMP 10, IDB_PICTURES_ICON_BMP 13, IDB_CPANEL_ICON_BMP 22) in
+        // the order of the frames of the win10 picture that replaced them: CommandModule part 12, drawn by the Music Tasks,
+        // Picture Tasks and Control Panel headers as dtb(CommandModule, 12, 1/2/3) (SHELL32_UIFILE 4, 5, 18).
+        private static readonly int[] SectionIconIds = { 10, 13, 22 };
+        private const string IconClass = "CommandModule";
+        private const int IconPart = 12;
+
+        /// <summary>
+        /// The special section icons (the music note on Music Tasks). xp drew the shellstyle's bitmap
+        /// (duiview.cpp _BuildSection: DUILoadBitmap, GRAPHIC_AlphaConstPerPix, a 32bpp alpha picture); Windows 10
+        /// draws CommandModule part 12 instead, one frame per section, and never reads the shellstyle bitmap. Where
+        /// the source changed any of them, the strip is rebuilt from the source's icons (stock xp's where it kept one)
+        /// in the template strip's frame order and layout. Luna10's frames are stock xp's pictures, so a source that
+        /// keeps all three leaves the template's strip.
+        /// </summary>
+        private void SectionIcons()
+        {
+            if (!m_imp.Target.ClassesByName.TryGetValue(IconClass, out var cls) || !cls.Parts.TryGetValue(IconPart, out var part)
+                || !part.States.TryGetValue(0, out var st)) return;
+            var src = SectionIconIds.Select(b => m_src.GetBitmap(b)).ToArray();
+            var stock = SectionIconIds.Select(b => m_base.GetBitmap(b)).ToArray();
+            if (src.All(b => b == null) || src.Zip(stock, (s, b) => s == null || SameBytes(s, b)).All(x => x)) return;
+            var img = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
+            var count = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGECOUNT);
+            var layout = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGELAYOUT);
+            if (img == null || !(count?.GetValue() is int n) || n != SectionIconIds.Length) { m_imp.Report.Warnings.Add($"shellstyle: the template's {IconClass} part {IconPart} isn't a {SectionIconIds.Length}-frame picture; section icons stay."); return; }
+            var pics = src.Select((b, i) => b ?? stock[i]).Select(b => b == null ? null
+                : ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(b, null, anyAlpha: true))).ToList();
+            if (pics.Any(p => p == null)) { m_imp.Report.Warnings.Add("shellstyle: a section icon is missing from both the source and stock shellstyle; section icons stay."); return; }
+            int w = pics[0].Width, h = pics[0].Height;
+            if (pics.Any(p => p.Width != w || p.Height != h)) { m_imp.Report.Warnings.Add("shellstyle: the source's section icons differ in size; section icons stay."); return; }
+            bool vertical = layout?.GetValue() is int lo && lo == 0;
+            var strip = vertical ? new ArgbImage(w, h * pics.Count) : new ArgbImage(w * pics.Count, h);
+            for (int i = 0; i < pics.Count; ++i) strip.Blit(pics[i], vertical ? 0 : i * w, vertical ? i * h : 0);
+            byte[] png = ImageIdentity.EncodePngVerified(strip);
+            int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            if ((img.Header.shortFlag & 0xFFFF) == id) return;
+            img.SetValue(id);
+            m_imp.MarkTouched(img, $"{IconClass}|Part {IconPart}|S0|IMAGEFILE");
+            m_imp.Report.Decisions.Add(new MergeDecision
+            {
+                Class = IconClass, Part = "Part " + IconPart, State = 0, Property = "IMAGEFILE", Action = "applied-shellstyle",
+                Reason = "the music, picture and control panel section icons of the source shellstyle (bitmaps 10, 13, 22; win10 draws them from this strip)",
+                Result = "IMAGE " + id,
+            });
+            m_imp.Report.Count("applied-shellstyle");
         }
 
         /// <summary>
