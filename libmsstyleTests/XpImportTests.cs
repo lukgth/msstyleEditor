@@ -237,6 +237,11 @@ namespace libmsstyleTests
             Assert.IsTrue(r.Decisions.Any(d => d.Class == "Combobox" && d.Part == "Common Properties" && d.State == 0 && d.Property == "BGTYPE" && d.Action == "added"));
             Assert.AreEqual("(l7,t7,r7,b7)", r.Decisions.Single(d => d.Class == "ExplorerBar" && d.Part == "Common Properties" && d.Property == "CONTENTMARGINS" && d.Action == "applied-shellstyle").Result);
             Assert.AreEqual("(l10,t0,r3,b0)", r.Decisions.Single(d => d.Class == "ExplorerBar" && d.Part == "SPECIALGROUPHEAD" && d.Property == "CONTENTMARGINS" && d.Action == "applied-shellstyle").Result);
+            // xp tiled the progress chunk art; Luna10 set STRETCH for its own pill. Now that the source's picture and
+            // margins are in the part, xp's TILE goes with them or the 18x18 hatch smears across the whole bar.
+            var chunk = r.Decisions.Single(d => d.Class == "Progress" && d.Part == "CHUNK" && d.State == 0 && d.Property == "SIZINGTYPE");
+            Assert.AreEqual("applied-xp-sizingtype", chunk.Action);
+            Assert.AreEqual("TILE", chunk.Result);
         }
 
         [TestMethod]

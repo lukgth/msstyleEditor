@@ -500,6 +500,118 @@ namespace libmsstyle.Import
             if (m_source.Platform == Platform.WinXP) OpaqueSpinBackgrounds();
             if (m_source.Platform == Platform.WinXP) MenuColorsFromXp();
             if (m_source.Platform == Platform.WinXP) TransparentForTrueAlpha();
+            if (m_source.Platform == Platform.WinXP) SizingTypeFromXp();
+        }
+
+        /// <summary>
+        /// xp only. The template's SIZINGTYPE belongs to the template's own picture: Luna10 redrew
+        /// Progress|CHUNK as a stretched pill, while xp tiled the source's 18x18 hatch art (TangoLux's
+        /// progress fill smeared into a few wide diagonal bands). A part that ends up drawing the
+        /// source's picture with the source's SIZINGMARGINS draws the source art the way xp did, so it
+        /// keeps xp's TILE/STRETCH. Parts still on a template picture or template margins are left alone.
+        /// </summary>
+        private void SizingTypeFromXp()
+        {
+            var imageCache = new Dictionary<int, ImageInfo>();
+            foreach (var tc in m_target.Style.Classes.Values)
+            {
+                if (string.Equals(tc.ClassName, DwmClass, StringComparison.OrdinalIgnoreCase)) continue;
+                if (m_target.DuplicateClassNames.Contains(tc.ClassName)) continue;
+                if (!m_source.ClassesByName.TryGetValue(tc.ClassName, out var sc)) continue;
+
+                var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+                var snames = SemanticModel.PartNames(sc.ClassName, Platform.WinXP);
+                foreach (var tp in tc.Parts.Values)
+                {
+                    if (!tnames.TryGetValue(tp.PartId, out string partName)) continue;
+                    int? spid = null;
+                    foreach (var kv in snames)
+                        if (string.Equals(kv.Value, partName, StringComparison.OrdinalIgnoreCase)) { spid = kv.Key; break; }
+                    if (spid == null) continue;
+
+                    if (!sc.Parts.TryGetValue(spid.Value, out var spart)) continue;
+                    foreach (var st in tp.States.Values)
+                    {
+                        if (!spart.States.TryGetValue(st.StateId, out var sstate)) continue;
+                        var tSizing = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.SIZINGTYPE
+                            && p.Header.typeID == (int)IDENTIFIER.ENUM);
+                        if (tSizing == null) continue;
+                        bool sourceImage = sstate.Properties.Any(p => ImageNames.Contains((IDENTIFIER)p.Header.nameID)
+                            && VisualStyle.XpImageIds.Contains(p.Header.nameID));
+                        if (!sourceImage) continue;
+                        var sSizing = SemanticModel.FindEffective(m_source.Style, sc, spid.Value, st.StateId, IDENTIFIER.SIZINGTYPE);
+                        if (sSizing == null) continue;
+                        if (!(tSizing.GetValue() is int tv) || !(sSizing.GetValue() is int sv) || tv == sv) continue;
+                        if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, "SIZINGTYPE")) continue;
+                        if (!PicturesFromSource(sc, tc, spid.Value, tp.PartId, st.StateId, imageCache)) continue;
+                        if (!MarginsFromSource(sc, tc, spid.Value, tp.PartId, st.StateId)) continue;
+
+                        tSizing.SetValue(sv);
+                        MarkTouched(tSizing, $"{tc.ClassName}|{partName}|S{st.StateId}|SIZINGTYPE");
+                        m_report.Decisions.Add(new MergeDecision
+                        {
+                            Class = tc.ClassName,
+                            Part = partName,
+                            State = st.StateId,
+                            Property = "SIZINGTYPE",
+                            Action = "applied-xp-sizingtype",
+                            Reason = "the part draws the source's picture with the source's sizing margins, so xp's TILE/STRETCH goes with it; the template's value was fitted to the template's own art",
+                            Result = SizingTypeName(sv),
+                        });
+                        m_report.Count("applied-xp-sizingtype");
+                    }
+                }
+            }
+        }
+
+        private static string SizingTypeName(int value) =>
+            value == 0 ? "TRUESIZE" : value == 1 ? "STRETCH" : value == 2 ? "TILE" : value.ToString();
+
+        private static readonly IDENTIFIER[] ImageNames =
+        {
+            IDENTIFIER.IMAGEFILE, IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3, IDENTIFIER.IMAGEFILE4,
+            IDENTIFIER.IMAGEFILE5, IDENTIFIER.IMAGEFILE6, IDENTIFIER.IMAGEFILE7,
+        };
+
+        /// <summary>
+        /// true when every picture the source uses in this part/state is also the picture the output draws
+        /// there. Added pictures are read from the allocator (GetRawResource ignores queued data).
+        /// </summary>
+        private bool PicturesFromSource(StyleClass sc, StyleClass tc, int spid, int tpid, int stateId, Dictionary<int, ImageInfo> cache)
+        {
+            bool any = false, applied = false;
+            foreach (var name in ImageNames)
+            {
+                if (!VisualStyle.XpImageIds.Contains((int)name)) continue; // xp has no IMAGEFILE6/7
+                var sp = SemanticModel.FindEffective(m_source.Style, sc, spid, stateId, name);
+                if (sp == null) continue;
+                var tp = SemanticModel.FindEffective(m_target.Style, tc, tpid, stateId, name);
+                if (tp == null) return false;
+                if (m_touched.Contains(tp)) applied = true;
+                var si = m_source.GetImageInfo("IMAGE", sp.Header.shortFlag & 0xFFFF);
+                if (si == null || !si.Decodable) return false;
+                int tid = tp.Header.shortFlag & 0xFFFF;
+                if (!cache.TryGetValue(tid, out var ti))
+                {
+                    byte[] bytes = m_alloc.Added.TryGetValue("IMAGE/" + tid, out var added) ? added : m_target.GetResourceBytes("IMAGE", tid);
+                    ti = bytes == null ? null : ImageIdentity.Analyze(bytes);
+                    cache[tid] = ti;
+                }
+                if (ti == null || !ti.Decodable || si.PixelSha1 != ti.PixelSha1) return false;
+                any = true;
+            }
+            // only a picture the import actually replaced: the template's own picture (stock Luna onto the Luna
+            // port) was left with the SIZINGTYPE its author chose, so its deliberate adaptation stays.
+            return any && applied;
+        }
+
+        /// <summary>true when the part/state's effective sizing margins are the source's, not the template's.</summary>
+        private bool MarginsFromSource(StyleClass sc, StyleClass tc, int spid, int tpid, int stateId)
+        {
+            var sm = SemanticModel.FindEffective(m_source.Style, sc, spid, stateId, IDENTIFIER.SIZINGMARGINS);
+            if (sm == null) return true;
+            var tm = SemanticModel.FindEffective(m_target.Style, tc, tpid, stateId, IDENTIFIER.SIZINGMARGINS);
+            return tm != null && sm.GetValue() is Margins a && tm.GetValue() is Margins b && a.Equals(b);
         }
 
         /// <summary>
