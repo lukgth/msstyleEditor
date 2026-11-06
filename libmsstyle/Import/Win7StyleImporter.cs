@@ -101,6 +101,7 @@ namespace libmsstyle.Import
                     shell?.Run();
                     m_headerMargins = shell?.HeaderContentMargins();
                     m_hoverRecords = shell?.HoverRecords;
+                    m_paneRecord = shell?.PaneRecord;
                     ReportTemplateOnlyImages();
                     CollectFrameWaivers();
 
@@ -146,6 +147,8 @@ namespace libmsstyle.Import
         private Dictionary<bool, Margins> m_headerMargins;
         // ExplorerBar records holding the source's task hover picture (true = main section), for the same patch.
         private Dictionary<bool, (int Part, int State)> m_hoverRecords;
+        // ExplorerBar record holding the source's task pane background picture, for the same patch.
+        private (int Part, int State)? m_paneRecord;
 
         /// <summary>
         /// source and stock shellstyle for this scheme. A source without Shell\&lt;scheme&gt;\shellstyle.dll is drawn
@@ -210,7 +213,7 @@ namespace libmsstyle.Import
                     ? $"shellstyle: replaced bitmaps {string.Join(", ", ids)} in Shell\\NormalColor\\shellstyle.dll with the source shellstyle's."
                     : "shellstyle: the source shellstyle's bitmaps are stock; the win10 shellstyle's stay.");
                 m_report.Count("shellstyle-bitmaps-replaced", ids.Count);
-                var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, false);
+                var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, m_paneRecord, false);
                 m_report.Notes.AddRange(notes);
                 m_report.Warnings.AddRange(warnings);
             }
@@ -492,8 +495,10 @@ namespace libmsstyle.Import
             MirrorIntoWin10Classes();
             if (m_source.Platform == Platform.WinXP) FillFlatFromXp();
             if (m_source.Platform == Platform.WinXP) SingleImageIntoDpiSlots();
+            if (m_source.Platform == Platform.WinXP) GlyphSizeSlotsFromXp();
             if (m_source.Platform == Platform.WinXP) ThemeWholeClientEdge();
             if (m_source.Platform == Platform.WinXP) OpaqueSpinBackgrounds();
+            if (m_source.Platform == Platform.WinXP) MenuColorsFromXp();
         }
 
         /// <summary>
@@ -540,6 +545,144 @@ namespace libmsstyle.Import
                     MarkTouched(img, $"Spin|{p.PartName}|S{st.StateId}|IMAGEFILE");
                 }
             }
+        }
+
+        // win10 menu records Luna10 filled with stock xp's system colors, and the xp color each stands for. XP drew
+        // menus unthemed (flat menus: user32 mndraw.c MENU fill, MENUHILIGHT hot fill with a HIGHLIGHT frame and
+        // HIGHLIGHTTEXT text, BTNSHADOW border; shell32 menuband mnbase.cpp the same for menu bands such as the
+        // Quick Launch chevron menu). Windows 10 draws them themed from these records, so they kept Luna's blue
+        // highlight and white popups under every other theme.
+        private static readonly (string Class, int Part, int State, IDENTIFIER Prop, IDENTIFIER From)[] XpMenuColors =
+        {
+            ("Menu", 7, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUBAR), ("Menu", 7, 0, IDENTIFIER.BORDERCOLOR, IDENTIFIER.MENUBAR),
+            ("Menu", 8, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUBAR), ("Menu", 8, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+            ("Menu", 8, 2, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 8, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
+            ("Menu", 8, 3, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 8, 3, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
+            ("Menu", 8, 4, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT), ("Menu", 8, 5, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
+            ("Menu", 8, 6, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
+            ("Menu", 14, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU), ("Menu", 14, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+            ("Menu", 14, 1, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU), ("Menu", 14, 1, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+            ("Menu", 14, 2, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 14, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
+            ("Menu", 14, 3, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU), ("Menu", 14, 3, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
+            ("Menu", 14, 4, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 14, 4, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
+            // explorer's menu bands (the toolbar chevron menu, Favorites): a menu drawn as a toolbar.
+            ("ExplorerMenu::Toolbar", 0, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+            ("ExplorerMenu::Toolbar", 0, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
+            ("ExplorerMenu::Toolbar", 0, 3, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
+            ("ExplorerMenu::Toolbar", 0, 4, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
+            ("ExplorerMenu::Toolbar", 1, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU),
+            ("ExplorerMenu::Toolbar", 1, 2, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT),
+            ("ExplorerMenu::Toolbar", 1, 3, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT),
+            ("StartMenu::Toolbar", 0, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+            ("StartMenu::Toolbar", 0, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
+            ("StartMenu::MenuBand", 0, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+            ("StartMenu::MenuBand", 1, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+        };
+
+        // the plain Luna10 menu pictures: every pixel is one of stock xp's menu colors (or see-through), so each is
+        // repainted pixel by pixel in the source's colors. Pictures with other art (check marks, arrows) stay.
+        private static readonly (string Class, int Part, IDENTIFIER Prop)[] XpMenuPictures =
+        {
+            ("Menu", 9, IDENTIFIER.IMAGEFILE),   // POPUPBACKGROUND: MENU
+            ("Menu", 10, IDENTIFIER.IMAGEFILE),  // POPUPBORDERS: BTNSHADOW frame around MENU
+            ("Menu", 13, IDENTIFIER.IMAGEFILE),  // POPUPGUTTER: MENU
+            ("Menu", 14, IDENTIFIER.IMAGEFILE),  // POPUPITEM: see-through / MENUHILIGHT frames
+            ("Menu", 15, IDENTIFIER.IMAGEFILE),  // POPUPSEPARATOR: BTNSHADOW line over MENU
+            ("ExplorerMenu::Toolbar", 0, IDENTIFIER.IMAGEFILE), // menu band background: MENU
+        };
+
+        /// <summary>
+        /// xp only: the menu records and plain menu pictures follow the source's SysMetrics menu colors
+        /// (<see cref="XpMenuColors"/>, <see cref="XpMenuPictures"/>). Untouched when the source keeps stock xp's
+        /// colors. A stock color a picture uses for two roles (stock MENU and HIGHLIGHTTEXT are both white) is
+        /// mapped by the picture's role, so a white popup background becomes the source's MENU, not its text color.
+        /// </summary>
+        private void MenuColorsFromXp()
+        {
+            if (!m_source.ClassesByName.TryGetValue("sysmetrics", out var sm) || !m_base.ClassesByName.TryGetValue("sysmetrics", out var bm)) return;
+            Color? Src(IDENTIFIER id) => SemanticModel.FindEffective(m_source.Style, sm, 0, 0, id)?.GetValue() as Color?;
+            Color? Stock(IDENTIFIER id) => SemanticModel.FindEffective(m_base.Style, bm, 0, 0, id)?.GetValue() as Color?;
+            // XP's user32 fills a missing MENUHILIGHT/MENUBAR from HIGHLIGHT/BTNFACE (flat menu defaults).
+            Color? Role(IDENTIFIER id) => Src(id) ?? (id == IDENTIFIER.MENUHILIGHT ? Src(IDENTIFIER.HIGHLIGHT) : id == IDENTIFIER.MENUBAR ? Src(IDENTIFIER.BTNFACE) : null);
+            var roles = new[] { IDENTIFIER.MENU, IDENTIFIER.MENUTEXT, IDENTIFIER.MENUBAR, IDENTIFIER.MENUHILIGHT, IDENTIFIER.HIGHLIGHT,
+                IDENTIFIER.HIGHLIGHTTEXT, IDENTIFIER.GRAYTEXT, IDENTIFIER.BTNSHADOW };
+            if (roles.All(r => Role(r) is Color s && Stock(r) is Color b && s.ToArgb() == b.ToArgb())) return;
+
+            int changed = 0;
+            foreach (var m in XpMenuColors)
+            {
+                if (!m_target.ClassesByName.TryGetValue(m.Class, out var tc) || m_target.DuplicateClassNames.Contains(m.Class)
+                    || KeyPattern.Matches(m_opt.Exclude, m.Class, "*", m.Prop.ToString())) continue;
+                if (!(Role(m.From) is Color want)) continue;
+                // a role the source keeps at stock xp's color leaves the template's value, adaptations included
+                // (Luna10 draws disabled bar text 109,109,109 where xp's GRAYTEXT is 172,168,153).
+                if (Stock(m.From) is Color stockRole && stockRole.ToArgb() == want.ToArgb()) continue;
+                if (!tc.Parts.TryGetValue(m.Part, out var part) || !part.States.TryGetValue(m.State, out var st)) continue;
+                var p = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)m.Prop && x.Header.typeID == (int)IDENTIFIER.COLOR);
+                if (p == null || m_touched.Contains(p) || !(p.GetValue() is Color have) || have.ToArgb() == want.ToArgb()) continue;
+                p.SetValue(want);
+                string label = $"{m.Class}|{part.PartName}|S{m.State}|{SemanticModel.PropertyName((int)m.Prop)}";
+                MarkTouched(p, label);
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = m.Class, Part = part.PartName, State = m.State, Property = SemanticModel.PropertyName((int)m.Prop),
+                    Action = "applied-menu-color", Reason = $"xp drew this menu part in the {m.From} system color",
+                    Result = SemanticModel.FormatValue(p),
+                });
+                ++changed;
+            }
+
+            // stock color -> source color, per picture role. Unknown pixels leave the picture alone.
+            Color Op(IDENTIFIER id) => Role(id) ?? Stock(id).Value;
+            var byRole = new Dictionary<int, Dictionary<int, Color>>
+            {
+                [9] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU) },
+                [10] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU), [Stock(IDENTIFIER.BTNSHADOW).Value.ToArgb()] = Op(IDENTIFIER.BTNSHADOW) },
+                [13] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU) },
+                [14] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENUHILIGHT).Value.ToArgb()] = Op(IDENTIFIER.MENUHILIGHT) },
+                [15] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU), [Stock(IDENTIFIER.BTNSHADOW).Value.ToArgb()] = Op(IDENTIFIER.BTNSHADOW) },
+                [0] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU) },
+            };
+            var redone = new Dictionary<(int, int), int>();
+            foreach (var pic in XpMenuPictures)
+            {
+                if (!m_target.ClassesByName.TryGetValue(pic.Class, out var tc) || m_target.DuplicateClassNames.Contains(pic.Class)
+                    || KeyPattern.Matches(m_opt.Exclude, pic.Class, "*", "IMAGEFILE")) continue;
+                if (!tc.Parts.TryGetValue(pic.Part, out var part) || !part.States.TryGetValue(0, out var st)) continue;
+                var img = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)pic.Prop);
+                if (img == null || m_touched.Contains(img) || !(img.GetValue() is int id)) continue;
+                var map = byRole[pic.Part];
+                if (!redone.TryGetValue((pic.Part, id), out int newId))
+                {
+                    var bytes = m_target.Style.GetRawResource("IMAGE", id);
+                    if (bytes == null) continue;
+                    ArgbImage src;
+                    try { src = ImageIdentity.Decode(bytes); } catch (ArgumentException) { continue; }
+                    var outImg = new ArgbImage(src.Width, src.Height);
+                    bool known = true, any = false;
+                    for (int i = 0; i < src.Pixels.Length && known; ++i)
+                    {
+                        uint px = src.Pixels[i];
+                        if ((px >> 24) == 0) { outImg.Pixels[i] = px; continue; }
+                        if ((px >> 24) != 0xFF || !map.TryGetValue((int)(px | 0xFF000000), out var to)) { known = false; break; }
+                        outImg.Pixels[i] = 0xFF000000 | ((uint)to.R << 16) | ((uint)to.G << 8) | to.B;
+                        any |= outImg.Pixels[i] != px;
+                    }
+                    if (!known || !any) continue;
+                    var png = ImageIdentity.EncodePngVerified(outImg);
+                    newId = PlaceResource("IMAGE", id, png, ImageIdentity.Analyze(png));
+                    redone[(pic.Part, id)] = newId;
+                }
+                img.SetValue(newId);
+                MarkTouched(img, $"{pic.Class}|{part.PartName}|S0|IMAGEFILE");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = pic.Class, Part = part.PartName, State = 0, Property = "IMAGEFILE", Action = "applied-menu-color",
+                    Reason = "the template's plain menu picture repainted in the source's menu system colors", Result = newId.ToString(),
+                });
+                ++changed;
+            }
+            if (changed > 0) m_report.Count("applied-menu-color", changed);
         }
 
         // controls whose WS_EX_CLIENTEDGE comctl32 paints from the theme (CCDrawNonClientTheme callers).
@@ -610,6 +753,64 @@ namespace libmsstyle.Import
                         ApplyExtra(t, s, b, "applied-single-image-slot",
                             $"xp sets one IMAGEFILE; the template picks {t.PropertyName} by dpi, so it gets the source's picture"
                             + (cls == s.ClassName && partName == s.PartName ? "" : $" ({cls} {partName} draws what xp's {s.ClassName} {s.PartName} drew)"));
+                }
+            }
+        }
+
+        /// <summary>
+        /// xp only. An image glyph picked by size (GLYPHTYPE IMAGEGLYPH, IMAGESELECTTYPE SIZE) is IMAGEFILE1-7 with
+        /// MINSIZE1-7: uxtheme draws the largest one whose MINSIZE fits the part (imagefile.cpp SelectCorrectImageFile).
+        /// The template's slots have their own min sizes (Luna10 ScrollBar ARROWBTN: 17/21/26 where xp's were 7/9),
+        /// so a slot copied one to one shows a different source glyph than xp did at that size. Ana Muslims Vista's 7px
+        /// glyph file is empty and xp never showed it: at 17px it drew IMAGEFILE2 (MINSIZE2 9). Each template slot gets
+        /// the source glyph xp picks at the slot's MINSIZE, so a 17px scrollbar shows what it showed on xp.
+        /// </summary>
+        private void GlyphSizeSlotsFromXp()
+        {
+            // MINSIZE1-5 go with IMAGEFILE1-5; win10's IMAGEFILE6/7 have no min size and are only reached past MINSIZE5.
+            var minSizeIds = new[] { IDENTIFIER.MINSIZE1, IDENTIFIER.MINSIZE2, IDENTIFIER.MINSIZE3, IDENTIFIER.MINSIZE4, IDENTIFIER.MINSIZE5 };
+            var slotIds = new[] { IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3, IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5 };
+            foreach (var state in m_source.Entries.Where(e => e.ResourceType == "IMAGE" && e.NameId == (int)IDENTIFIER.IMAGEFILE1)
+                .Select(e => (e.ClassName, e.PartName, e.StateId, e.StateKey)).Distinct().ToList())
+            {
+                if (m_target.DuplicateClassNames.Contains(state.ClassName) || KeyPattern.Matches(m_opt.Exclude, state.ClassName, state.PartName, "IMAGEFILE*")) continue;
+                var src = m_source.Entries.Where(e => e.StateKey == state.StateKey).ToList();
+                var sp = src.FirstOrDefault()?.Property;
+                if (sp == null || !m_source.Style.Classes.TryGetValue(sp.Header.classID, out var scls)) continue;
+                if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int sg && sg == 1)) continue;
+                if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ss && ss == 1)) continue;
+                // the source's glyph files in slot order with the min size xp gave each (default: the glyph's own size).
+                var glyphs = new List<(SemanticEntry Entry, int W, int H)>();
+                for (int i = 0; i < slotIds.Length; ++i)
+                {
+                    var e = src.FirstOrDefault(x => x.NameId == (int)slotIds[i] && x.ResourceType == "IMAGE");
+                    if (e == null) break;
+                    var ms = SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, minSizeIds[i])?.GetValue();
+                    if (!(ms is Size sz)) { glyphs.Clear(); break; } // no MINSIZE: xp used the frame size, which the porter doesn't model here.
+                    glyphs.Add((e, sz.Width, sz.Height));
+                }
+                if (glyphs.Count < 2) continue;
+                // glyphs the source kept at stock xp's stay the template's (Luna10 redrew them for its larger slots).
+                if (glyphs.All(g => m_base.ByKey.TryGetValue(g.Entry.Key, out var b) && Same(m_base, b, m_source, g.Entry))) continue;
+
+                var slots = m_target.Entries.Where(t => t.ClassName == state.ClassName && t.PartName == state.PartName && t.StateId == state.StateId
+                    && t.ResourceType == "IMAGE" && DpiSlotIds.Contains(t.NameId)).ToList();
+                if (slots.Count == 0) continue;
+                var tcls = m_target.Style.Classes[slots[0].Property.Header.classID];
+                if (!(SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int tg && tg == 1)) continue;
+                if (!(SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ts && ts == 1)) continue;
+                foreach (var t in slots)
+                {
+                    // IMAGEFILE6/7 (or a slot without MINSIZE) are only reached past the last sized slot: the largest glyph.
+                    int i = Array.IndexOf(slotIds, (IDENTIFIER)t.NameId);
+                    var tms = i < 0 ? null : SemanticModel.FindEffective(m_target.Style, tcls, t.PartId, state.StateId, minSizeIds[i])?.GetValue();
+                    var pick = tms is Size tsz
+                        ? glyphs.LastOrDefault(g => g.W <= tsz.Width && g.H <= tsz.Height)
+                        : glyphs[glyphs.Count - 1];
+                    if (pick.Entry == null) pick = glyphs[0]; // smaller than every source glyph: xp drew the first.
+                    if (Same(m_source, pick.Entry, m_target, t)) continue;
+                    ApplyExtra(t, pick.Entry, null, "applied-glyph-size-slot",
+                        $"xp picks the image glyph by size; at this slot's min size ({(tms is Size z ? $"{z.Width}x{z.Height}" : "largest")}) it drew the source's {pick.Entry.PropertyName} (MINSIZE {pick.W}x{pick.H})");
                 }
             }
         }

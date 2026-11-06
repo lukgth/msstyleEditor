@@ -64,7 +64,8 @@ namespace libmsstyle.Import
             }
         }
 
-        /// <param name="progress">called before each scheme starts; may be null.</param>
+        /// <param name="progress">called as each scheme/size port starts; the ports run in parallel, so calls come from
+        /// worker threads (one at a time) and in no fixed order. May be null.</param>
         public static List<XpSchemeResult> Run(XpThemeImportOptions o, Action<XpColorScheme, string> progress = null)
         {
             var all = ReadSchemes(o.SourcePath);
@@ -83,36 +84,56 @@ namespace libmsstyle.Import
             // .msstyles per color scheme ("Color scheme") holding every xp size ("Font size"), Shell\<scheme> next to
             // them. Each scheme's color variant is named after the scheme, so windows loads Shell\<scheme>\shellstyle.dll.
             string styleDir = Path.Combine(outDir, name);
+            Win7ImportOptions Options(XpColorScheme scheme, string size, string output) => new Win7ImportOptions
+            {
+                SourcePath = o.SourcePath,
+                SourcePlatform = Platform.WinXP,
+                SourceScheme = scheme.InternalName,
+                SourceSize = size,
+                BasePath = o.BasePath,
+                BaseScheme = o.BaseScheme ?? "NormalColor",
+                TemplatePath = o.TemplatePath,
+                CompanionSourcePath = o.CompanionSourcePath,
+                DryRun = !o.Write,
+                OutputPath = output,
+                SourceShellStylePath = o.ShellStylePath,
+                PreferSource = o.PreferSource ?? new List<string>(),
+                Exclude = o.Exclude ?? new List<string>(),
+                ImageTolerance = o.ImageTolerance ?? 2,
+            };
+            string FileOf(XpColorScheme scheme) => (all.Count == 1 ? name : XpThemeFiles.SafeName(scheme.InternalName)) + ".msstyles";
+            string LabelOf(XpColorScheme scheme) => all.Count == 1 ? name : $"{name} {XpThemeFiles.SafeName(scheme.InternalName)}";
+            string WorkOf(XpColorScheme scheme) => Path.Combine(outDir, ".work", XpThemeFiles.SafeName(scheme.InternalName));
+
+            // every scheme and size is ported in a folder of its own (.work\<scheme>\<size>), so the ports run in
+            // parallel; the shared theme folder is assembled after, one scheme at a time in the source's order.
+            var jobs = schemes.SelectMany(s => new[] { (Scheme: s, Size: (XpSize)null) }
+                .Concat(s.Sizes.Select(z => (Scheme: s, Size: z)))).ToList();
+            foreach (var s in schemes)
+            {
+                string work = WorkOf(s);
+                if (Directory.Exists(work)) Directory.Delete(work, true);
+            }
+            var ports = new (Win7ImportOptions Opt, ImportReport Report)[jobs.Count];
+            var progressLock = new object();
+            System.Threading.Tasks.Parallel.For(0, jobs.Count, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, i =>
+            {
+                var (scheme, size) = jobs[i];
+                string file = FileOf(scheme);
+                lock (progressLock) progress?.Invoke(scheme, size == null ? file : $"{file} ({size.DisplayName})");
+                var opt = Options(scheme, size?.InternalName, Path.Combine(WorkOf(scheme), size?.InternalName ?? "normal", file));
+                ports[i] = (opt, Win7StyleImporter.Run(opt));
+            });
+
             var results = new List<XpSchemeResult>();
+            int at = 0;
             foreach (var scheme in schemes)
             {
-                string label = all.Count == 1 ? name : $"{name} {XpThemeFiles.SafeName(scheme.InternalName)}";
-                string file = (all.Count == 1 ? name : XpThemeFiles.SafeName(scheme.InternalName)) + ".msstyles";
+                string label = LabelOf(scheme);
+                string file = FileOf(scheme);
                 string display = all.Count == 1 ? themeName : $"{themeName} {scheme.DisplayName.Trim()}";
-                Win7ImportOptions Options(string size, string output) => new Win7ImportOptions
-                {
-                    SourcePath = o.SourcePath,
-                    SourcePlatform = Platform.WinXP,
-                    SourceScheme = scheme.InternalName,
-                    SourceSize = size,
-                    BasePath = o.BasePath,
-                    BaseScheme = o.BaseScheme ?? "NormalColor",
-                    TemplatePath = o.TemplatePath,
-                    CompanionSourcePath = o.CompanionSourcePath,
-                    DryRun = !o.Write,
-                    OutputPath = output,
-                    SourceShellStylePath = o.ShellStylePath,
-                    PreferSource = o.PreferSource ?? new List<string>(),
-                    Exclude = o.Exclude ?? new List<string>(),
-                    ImageTolerance = o.ImageTolerance ?? 2,
-                };
-
-                // every scheme is ported in a folder of its own first; the shared theme folder is assembled after.
-                string work = Path.Combine(outDir, ".work", XpThemeFiles.SafeName(scheme.InternalName));
-                if (Directory.Exists(work)) Directory.Delete(work, true);
-                progress?.Invoke(scheme, file);
-                var opt = Options(null, Path.Combine(work, "normal", file));
-                var report = Win7StyleImporter.Run(opt);
+                string work = WorkOf(scheme);
+                var (opt, report) = ports[at++];
                 var res = new XpSchemeResult
                 {
                     Scheme = scheme,
@@ -125,9 +146,7 @@ namespace libmsstyle.Import
                 var sizes = new List<VariantWriter.Size>();
                 foreach (var size in scheme.Sizes)
                 {
-                    progress?.Invoke(scheme, $"{file} ({size.DisplayName})");
-                    var sopt = Options(size.InternalName, Path.Combine(work, size.InternalName, file));
-                    var sreport = Win7StyleImporter.Run(sopt);
+                    var (sopt, sreport) = ports[at++];
                     ImportReportWriter.Write(sreport, Path.Combine(reportDir, $"{label} {XpThemeFiles.SafeName(size.InternalName)}"));
                     if (sreport.Status != ImportStatus.ReadyForVmTest)
                     {

@@ -209,10 +209,11 @@ namespace libmsstyle.Import
             int cursor = 0, n = 0;
             var sizeByType = ExternalRecordSizes(tInv.GetData(tInv.Entries.First(e => e.Type == "VARIANT")));
             var badSize = new List<string>();
+            int lastData = LastNonZero(data);
             while (cursor < data.Length - 4)
             {
                 int start = cursor;
-                if (data.Skip(cursor).All(x => x == 0)) break;
+                if (cursor > lastData) break;
                 StyleProperty p;
                 try { p = PropertyStream.ReadNextProperty(data, ref cursor); }
                 catch (Exception ex)
@@ -280,15 +281,24 @@ namespace libmsstyle.Import
             var order = new List<int>();
             var seen = new HashSet<int>();
             int cursor = 0;
+            int lastData = LastNonZero(data);
             while (cursor < data.Length - 4)
             {
-                if (data.Skip(cursor).All(x => x == 0)) break;
+                if (cursor > lastData) break;
                 int start = cursor;
                 var p = PropertyStream.ReadNextProperty(data, ref cursor);
                 if (cursor <= start) break;
                 if (seen.Add(p.Header.classID)) order.Add(p.Header.classID);
             }
             return order;
+        }
+
+        /// <summary>index of the last nonzero byte, -1 for none: the zero padding after the last record starts after it.</summary>
+        private static int LastNonZero(byte[] data)
+        {
+            int i = data.Length - 1;
+            while (i >= 0 && data[i] == 0) i--;
+            return i;
         }
 
         private void CheckReferences(SemanticModel tm, SemanticModel cm)

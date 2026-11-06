@@ -89,7 +89,8 @@ namespace libmsstyle.Import
             var pane = Both(x => x.Pane, false, "background");
             var sFill = XpShellStyle.ParseFill(pane.Src);
             var bFill = XpShellStyle.ParseFill(pane.Stock);
-            if (Usable(sFill, "task pane background"))
+            if (sFill == null && XpShellStyle.ParseRcBmp(pane.Src, out _, out _)) PaneBitmap(pane.Src);
+            else if (Usable(sFill, "task pane background"))
             {
                 bool stock = SameFill(sFill, bFill);
                 SetColor(Background, 0, IDENTIFIER.GRADIENTCOLOR1, stock ? (Color?)null : sFill[0], "task pane background (start)");
@@ -137,6 +138,65 @@ namespace libmsstyle.Import
         /// </summary>
         public Dictionary<bool, (int Part, int State)> HoverRecords { get; } = new Dictionary<bool, (int Part, int State)>();
 
+        /// <summary>
+        /// ExplorerBar record holding the source's task pane background picture; null where the source's pane is a
+        /// color or gradient. <see cref="PatchShellStyleLayout"/> points the pane's background at it.
+        /// </summary>
+        public (int Part, int State)? PaneRecord { get; private set; }
+
+        /// <summary>
+        /// xp's task pane background as a bitmap (Ana Muslims Vista: rcbmp(120, 5, ...), a 200x604 grey-to-white
+        /// picture on the sectionlist). Windows 10 fills the pane from gradient(gtc(ExplorerBar, 0, 0, 3810/3811)) and its
+        /// DirectUI doesn't draw a shellstyle's rcbmp (see <see cref="TaskHover"/>), so the picture goes into a spare
+        /// state of the background part and the pane draws it with dtb(). On xp it lay over the sectionlist, which is only
+        /// as tall as the sections in it (folder.uix: a verticalflowlayout in a ScrollViewer). Windows 10's
+        /// ExplorerBarBackground fills the pane's whole height instead, and any stretch or nine-grid there scales the
+        /// picture with the window (a nine-grid squeezes once the pane is shorter than its margins). So the picture is
+        /// drawn unscaled from the top-left: SIZINGTYPE TILE, which clips rather than scales, on a copy padded with its
+        /// own last column and row out to <see cref="PaneTileWidth"/> x <see cref="PaneTileHeight"/>, so a wider or
+        /// taller pane continues the picture's edge colors instead of repeating it.
+        /// </summary>
+        private void PaneBitmap(string v)
+        {
+            XpShellStyle.ParseRcBmp(v, out int id, out var key, out bool autoKey);
+            var dib = m_src.GetBitmap(id);
+            if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: task pane background bitmap {id} is missing; template kept."); return; }
+            if (autoKey)
+            {
+                uint p0 = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null)).Pixels[0];
+                key = Color.FromArgb((int)((p0 >> 16) & 0xFF), (int)((p0 >> 8) & 0xFF), (int)(p0 & 0xFF));
+            }
+            var pic = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null));
+            int w = Math.Max(pic.Width, PaneTileWidth), h = Math.Max(pic.Height, PaneTileHeight);
+            var padded = new ArgbImage(w, h);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    padded.Pixels[y * w + x] = pic.Pixels[Math.Min(y, pic.Height - 1) * pic.Width + Math.Min(x, pic.Width - 1)];
+            byte[] png = ImageIdentity.EncodePngVerified(padded);
+            if (!m_cls.Parts.TryGetValue(Background, out var p)) return;
+            if (!p.States.TryGetValue(PaneState, out var st))
+            {
+                st = new StyleState { StateId = PaneState, StateName = "State " + PaneState };
+                p.States.Add(PaneState, st);
+            }
+            const string what = "task pane background";
+            int img = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            Put(st, Background, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, what, PaneReason);              // IMAGEFILE
+            Put(st, Background, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, what, PaneReason);
+            Put(st, Background, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, what, PaneReason);
+            Put(st, Background, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, 2, what, PaneReason);          // TILE
+            Put(st, Background, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, new Margins(0, 0, 0, 0), what, PaneReason);
+            PaneRecord = (Background, PaneState);
+        }
+
+        // a state of the background part nothing in the shell draws (the UIFILEs read it through gtc state 0 only).
+        private const int PaneState = 1;
+        // the padded pane picture: the 210rp pane at 100%, 1200px tall. Applying a style with a 420x2160 one failed
+        // (SetSystemVisualStyle 0x8007000E, out of memory); a taller pane past this repeats the picture.
+        private const int PaneTileWidth = 210, PaneTileHeight = 1200;
+        private const string PaneReason = "bitmap of the source shellstyle (win10 draws it from this record, see the shellstyle layout notes)";
+        private const string HoverReason = "task hover background of the source shellstyle (win10 draws it from this record, see the shellstyle layout notes)";
+
         // a state of the group background part nothing in the shell draws (the UIFILEs only read state 0).
         private const int HoverState = 1;
 
@@ -180,15 +240,15 @@ namespace libmsstyle.Import
                 p.States.Add(HoverState, st);
             }
             int img = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
-            Put(st, part, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, what);              // IMAGEFILE
-            Put(st, part, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, what);
-            Put(st, part, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, what);
-            Put(st, part, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, 1, what);          // STRETCH
-            Put(st, part, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, sizing, what);
+            Put(st, part, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, what, HoverReason);              // IMAGEFILE
+            Put(st, part, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, what, HoverReason);
+            Put(st, part, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, what, HoverReason);
+            Put(st, part, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, 1, what, HoverReason);          // STRETCH
+            Put(st, part, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, sizing, what, HoverReason);
             HoverRecords[main] = (part, HoverState);
         }
 
-        private void Put(StyleState st, int part, IDENTIFIER name, IDENTIFIER type, object value, string what)
+        private void Put(StyleState st, int part, IDENTIFIER name, IDENTIFIER type, object value, string what, string reason)
         {
             var prop = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
             if (prop == null)
@@ -198,7 +258,7 @@ namespace libmsstyle.Import
                 m_imp.AddedRecords.Add($"{m_cls.ClassId}/{part}/{st.StateId}/{(int)name}/{(int)type}");
             }
             if (value is Margins mg) prop.SetValue(new Margins(mg.Left, mg.Top, mg.Right, mg.Bottom)); else prop.SetValue((int)value);
-            Changed(prop, part, st.StateId, "applied-shellstyle", $"{what} task hover background of the source shellstyle (win10 draws it from this record, see the shellstyle layout notes)");
+            Changed(prop, part, st.StateId, "applied-shellstyle", $"{what} {reason}");
         }
 
         /// <summary>
@@ -728,12 +788,15 @@ namespace libmsstyle.Import
         /// <item>task hover background (<paramref name="hoverRecords"/>, from <see cref="TaskHover"/>). Windows 10 builds
         /// "Other Places" links as NavigateButtons, which never get MouseFocused (only MouseWithin), and System
         /// Tasks as ActionButtons drawn with dtb(CommandModule, 3, 2) on hover. Both get dtb() of the hover record.</item>
+        /// <item>task pane background picture (<paramref name="paneRecord"/>, from <see cref="PaneBitmap"/>): the
+        /// ExplorerBarBackground element's gradient(gtc(ExplorerBar, 0, 0, 3810/3811)) becomes dtb() of that record.</item>
         /// </list>
         /// A template whose markup doesn't have these attributes is left as it is, and that's reported.
         /// Returns notes for the report, and the warnings.
         /// </summary>
         public static (List<string> notes, List<string> warnings) PatchShellStyleLayout(string win10ShellStyle, XpShellStyle source, XpShellStyle stock,
-            IReadOnlyDictionary<bool, Margins> headerMargins, IReadOnlyDictionary<bool, (int Part, int State)> hoverRecords, bool dryRun)
+            IReadOnlyDictionary<bool, Margins> headerMargins, IReadOnlyDictionary<bool, (int Part, int State)> hoverRecords,
+            (int Part, int State)? paneRecord, bool dryRun)
         {
             var notes = new List<string>(); var warnings = new List<string>();
             DuiCascade src = new DuiCascade(source), bas = new DuiCascade(stock);
@@ -786,7 +849,7 @@ namespace libmsstyle.Import
             (int Part, int State)? Hover(bool prefer) => hoverRecords == null ? null
                 : hoverRecords.TryGetValue(prefer, out var r) ? r : hoverRecords.TryGetValue(!prefer, out var o) ? o : ((int, int)?)null;
             var navHover = Hover(false); var taskHover = Hover(true);
-            if (gapDelta == 0 && align.Values.All(a => a == null) && navHover == null) return (notes, warnings);
+            if (gapDelta == 0 && align.Values.All(a => a == null) && navHover == null && paneRecord == null) return (notes, warnings);
 
             var updates = new List<(string type, uint id, ushort lang, byte[] data)>();
             var mod = Win32Api.LoadLibraryEx(win10ShellStyle, IntPtr.Zero, Win32Api.LoadLibraryFlags.LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE);
@@ -801,6 +864,19 @@ namespace libmsstyle.Import
                     int se = sb < 0 ? -1 : t.IndexOf("</style>", sb, StringComparison.Ordinal);
                     if (se < 0) { warnings.Add("shellstyle layout: the template's UIFILE 1 has no ExplorerBarStyle sheet; section spacing and title alignment stay."); break; }
                     string sheet = t.Substring(sb, se - sb);
+                    if (paneRecord.HasValue)
+                    {
+                        const string paneFill = "background=\"gradient(gtc(ExplorerBar,0,0,3810), gtc(ExplorerBar,0,0,3811), 1)\"";
+                        int pb = sheet.IndexOf("<if class=\"ExplorerBarBackground\">", StringComparison.Ordinal);
+                        int pe = pb < 0 ? -1 : sheet.IndexOf("</if>", pb, StringComparison.Ordinal);
+                        int pf = pe < 0 ? -1 : sheet.IndexOf(paneFill, pb, pe - pb, StringComparison.Ordinal);
+                        if (pf < 0) warnings.Add("shellstyle layout: no ExplorerBarBackground gradient(gtc(ExplorerBar, 0, 0, 3810/3811)) in the template's ExplorerBarStyle; the task pane keeps its gradient instead of the source's picture.");
+                        else
+                        {
+                            sheet = sheet.Substring(0, pf) + $"background=\"dtb(ExplorerBar, {paneRecord.Value.Part}, {paneRecord.Value.State})\"" + sheet.Substring(pf + paneFill.Length);
+                            notes.Add($"shellstyle layout: task pane background drawn with dtb(ExplorerBar, {paneRecord.Value.Part}, {paneRecord.Value.State}), the source's background picture.");
+                        }
+                    }
                     if (gapDelta != 0)
                     {
                         var m = System.Text.RegularExpressions.Regex.Match(sheet, @"(<Expando\b[^>]*?\bpadding="")rect\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*(\d+)rp\s*\)""");
