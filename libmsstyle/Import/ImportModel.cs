@@ -164,6 +164,15 @@ namespace libmsstyle.Import
             Counts.TryGetValue(what, out int c);
             Counts[what] = c + n;
         }
+
+        /// <summary>adds <paramref name="format"/> (a {0} placeholder for the count) when any decision carries
+        /// <paramref name="action"/>, and counts those decisions.</summary>
+        public void AddNoteIfAny(string format, string action)
+        {
+            int n = Decisions.Count(d => string.Equals(d.Action, action, StringComparison.Ordinal));
+            if (n == 0) return;
+            Notes.Add(string.Format(format, n));
+        }
     }
 
     public class DiffEntry

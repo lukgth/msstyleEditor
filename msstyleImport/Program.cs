@@ -23,6 +23,7 @@ namespace msstyleImport
                     case "schemes": return args.Length == 2 ? Schemes(args[1]) : Usage();
                     case "noop": return NoOp(args.Skip(1).ToArray());
                     case "inventory": return args.Length == 3 ? Inventory(args[1], args[2]) : Usage();
+                    case "apply-theme": return args.Length == 2 ? ApplyTheme(args[1]) : Usage();
                     default: return Usage();
                 }
             }
@@ -62,9 +63,21 @@ namespace msstyleImport
       saves the template through libmsstyle without changes and validates the copy against it.
   msstyleImport inventory <style> <out.tsv>
       flat dump: classes, resources, string tables, every property by name.
-
-nothing here applies or installs a theme.");
+  msstyleImport apply-theme <installed .theme>
+      applies an installed theme without any UI: the visual style through uxtheme's SetSystemVisualStyle, then the
+      .theme's colors, desktop picture, metrics, cursors, sounds and default icons. prints one line per section.
+      exit 0 when the style was accepted, 1 when it was rejected (the lines say why).
+      this does write the machine's current theme/colors: that is the point, and it's what deskn.cpl does.");
             return 2;
+        }
+
+        static int ApplyTheme(string themePath)
+        {
+            var r = XpThemeApply.Apply(themePath);
+            foreach (var n in r.Notes) Console.WriteLine("ok   " + n);
+            foreach (var w in r.Warnings) Console.WriteLine("warn " + w);
+            foreach (var w in r.Warnings) Console.Error.WriteLine("warning: " + w);
+            return r.Ok ? 0 : 1;
         }
 
         static Dictionary<string, List<string>> ParseArgs(string[] args)

@@ -111,15 +111,12 @@ namespace msstyleEditor
         }
 
         /// <summary>
-        /// Installs the scheme's folder and .theme under %WINDIR%\Resources\Themes and applies that .theme, the way
-        /// deskn.cpl does: the shell's own handler (<c>rundll32 themecpl.dll,OpenThemeAction</c>), which is what the
-        /// .theme's "open" verb runs, so colors, desktop, cursors, sounds and metrics come with the style instead of
-        /// only the msstyles. The copy is elevated, but the apply runs from this process on purpose: the previous
-        /// implementation launched the theme through ShellExecute, which raced (it returned before themeui was done,
-        /// and an elevated launch can leave explorer half-themed), and robocopy over a folder whose files are locked
-        /// by the applied style left a half-copied install. So: rename the old folder out of the way first (that works
-        /// even while its files are mapped), copy, then verify <c>Themes\CurrentTheme</c> and <c>ThemeManager\DllName</c>
-        /// actually point at the installed pair before reporting success.
+        /// Installs the scheme's folder and .theme under %WINDIR%\Resources\Themes and applies that .theme.
+        /// The copy is elevated; the apply is done in-process by <see cref="XpThemeApply"/>, which calls uxtheme's
+        /// <c>SetSystemVisualStyle</c> for the style and then writes/announces the .theme's other sections itself. The
+        /// shell handler (<c>themecpl.dll,OpenThemeAction</c>) applies the same things but opens Settings while it does,
+        /// and from an elevated process it often does nothing at all (a rundll32 started that way just exits), so it is
+        /// not used. Renaming the old folder aside keeps robocopy from failing on the applied style's mapped files.
         /// </summary>
         private void Install(XpSchemeResult r)
         {
@@ -172,64 +169,39 @@ namespace msstyleEditor
 
             string preTheme = RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Themes", "CurrentTheme");
             string preStyle = RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "DllName");
-            string preColor = RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "ColorName");
 
-            // the .theme handler. same command the shell runs for the "open" verb, so it applies everything the theme
-            // names (colors, desktop picture, cursors, sounds, metrics) and not just the visual style.
+            // the .theme itself: style through uxtheme, then the sections Windows would apply (colors, desktop, metrics,
+            // cursors, sounds, icons). no UI, no Settings window, no cross-process race.
+            ThemeApplyResult result;
             try
             {
-                using (var p = Process.Start(new ProcessStartInfo("rundll32.exe",
-                    $"\"{Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "themecpl.dll")}\",OpenThemeAction \"{destTheme}\"")
-                    { UseShellExecute = false, CreateNoWindow = true }))
-                    p.WaitForExit(30000);
+                result = XpThemeApply.Apply(destTheme);
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, "Could not start the theme handler: " + ex.Message, "Install", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, "Could not apply " + Path.GetFileName(destTheme) + ": " + ex.Message, "Install", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
-            // themeui applies on its own thread; report only once the registry shows the installed pair. Windows keeps
-            // its own copy of an applied .theme under %LocalAppData%\Microsoft\Windows\Themes, so CurrentTheme names
-            // that copy rather than the file in %WINDIR%; the style path is the reliable half.
-            string wantColor = r.Scheme?.InternalName;
-            string gotTheme = null, gotStyle = null, gotColor = null;
-            var deadline = DateTime.Now.AddSeconds(25);
-            while (DateTime.Now < deadline)
-            {
-                gotTheme = RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\Themes", "CurrentTheme");
-                gotStyle = ExpandPath(RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "DllName"));
-                gotColor = RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "ColorName");
-                if (SameTheme(gotTheme, destTheme) && string.Equals(gotStyle, destStyle, StringComparison.OrdinalIgnoreCase)) break;
-                System.Threading.Thread.Sleep(500);
-            }
-            bool applied = SameTheme(gotTheme, destTheme) && string.Equals(gotStyle, destStyle, StringComparison.OrdinalIgnoreCase);
+            string gotStyle = ExpandPath(RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "DllName"));
+            string gotColor = RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "ColorName");
+            bool applied = result.Ok && string.Equals(gotStyle, destStyle, StringComparison.OrdinalIgnoreCase);
+            string detail = string.Join("\r\n", result.Notes.Concat(result.Warnings.Select(w => "! " + w)));
             if (applied)
             {
-                string schemeInfo = string.IsNullOrEmpty(wantColor) || string.Equals(gotColor, wantColor, StringComparison.OrdinalIgnoreCase)
-                    ? "" : $"\r\nColor is \"{gotColor}\", the selected scheme is \"{wantColor}\" (the .theme decides the color).";
+                string schemeInfo = string.IsNullOrEmpty(r.Scheme?.InternalName) || string.Equals(gotColor, r.Scheme.InternalName, StringComparison.OrdinalIgnoreCase)
+                    ? "" : $"\r\nColor is \"{gotColor}\", the selected scheme is \"{r.Scheme.InternalName}\" (the .theme decides the color).";
                 MessageBox.Show(this,
-                    $"Installed to {destDir} and applied {Path.GetFileName(destTheme)}.{schemeInfo}\r\n" +
-                    $"Windows applied its own copy: {gotTheme}",
+                    $"Installed to {destDir} and applied {Path.GetFileName(destTheme)}.{schemeInfo}\r\n\r\n{detail}",
                     "Install & apply", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else
             {
                 MessageBox.Show(this,
-                    $"Installed to {destDir}, but applying it didn't take.\r\n" +
-                    $"CurrentTheme: {gotTheme ?? "(none)"}\r\nDllName:      {gotStyle ?? "(none)"}\r\n" +
-                    (string.Equals(preTheme, gotTheme, StringComparison.OrdinalIgnoreCase) && string.Equals(preStyle, gotStyle, StringComparison.OrdinalIgnoreCase)
-                        ? "Nothing changed at all: the .theme handler didn't apply. If this editor runs elevated, apply the .theme from a normal session."
-                        : $"Before:       {preTheme}\r\n              {preStyle}"),
+                    $"Installed to {destDir}, but the style did not take.\r\n" +
+                    $"DllName: {gotStyle ?? "(none)"}\r\nBefore:  {preStyle ?? "(none)"}\r\nTheme:   {preTheme ?? "(none)"}\r\n\r\n{detail}",
                     "Install & apply", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
-        }
-
-        /// <summary>the applied .theme is Windows' own copy of the file, so the name is what's compared.</summary>
-        private static bool SameTheme(string applied, string installed)
-        {
-            return applied != null && installed != null
-                && string.Equals(Path.GetFileName(applied), Path.GetFileName(installed), StringComparison.OrdinalIgnoreCase);
         }
 
         private static string RegistryValue(string subKey, string name)

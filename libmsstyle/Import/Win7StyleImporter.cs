@@ -211,10 +211,13 @@ namespace libmsstyle.Import
             try
             {
                 var ids = XpShellImport.PatchShellStyleBitmaps(target, m_srcShell, m_baseShell, false);
-                m_report.Notes.Add(ids.Count > 0
-                    ? $"shellstyle: replaced bitmaps {string.Join(", ", ids)} in Shell\\NormalColor\\shellstyle.dll with the source shellstyle's."
-                    : "shellstyle: the source shellstyle's bitmaps are stock; the win10 shellstyle's stay.");
+                if (ids.Count > 0)
+                    m_report.Notes.Add($"shellstyle: replaced bitmaps {string.Join(", ", ids)} in Shell\\NormalColor\\shellstyle.dll with the source shellstyle's.");
+                else
+                    m_report.Notes.Add("shellstyle: " + ShellIdentity(m_srcShell, m_baseShell)
+                        + "; nothing to replace, so Shell\\NormalColor keeps the port's own bitmaps, which are that same stock art transcribed for win10.");
                 m_report.Count("shellstyle-bitmaps-replaced", ids.Count);
+                m_report.AddNoteIfAny("shellstyle: {0} ExplorerBar records follow the source shellstyle. The win10 task pane is drawn from msstyles ExplorerBar records, and the port transcribed stock xp's shellstyle into them; where the source shellstyle resolves to that stock art the template's transcription stays.", "restored-shellstyle");
                 var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, m_paneRecord, false);
                 m_report.Notes.AddRange(notes);
                 m_report.Warnings.AddRange(warnings);
@@ -224,6 +227,26 @@ namespace libmsstyle.Import
                 m_report.Warnings.Add("shellstyle bitmaps not replaced: " + ex.Message);
             }
         }
+        /// <summary>what the source shellstyle actually is, for the report: a pack can ship stock luna's file verbatim
+        /// and the "0 bitmaps replaced" line then looks like a failure when it is the whole story.</summary>
+        private static string ShellIdentity(XpShellStyle source, XpShellStyle stock)
+        {
+            try
+            {
+                if (source.Path != null && stock.Path != null && File.Exists(source.Path) && File.Exists(stock.Path))
+                {
+                    var a = File.ReadAllBytes(source.Path);
+                    var b = File.ReadAllBytes(stock.Path);
+                    string sha = ResourceInventory.Sha1Hex(a);
+                    if (a.SequenceEqual(b))
+                        return $"the source shellstyle is byte-identical to stock xp luna's (sha1 {sha})";
+                    return $"the source shellstyle has none of the bitmaps stock xp luna lacks (sha1 {sha})";
+                }
+            }
+            catch (IOException) { }
+            return "the source shellstyle's bitmaps are all stock xp's";
+        }
+
         private string CompanionSource => string.IsNullOrEmpty(m_opt.CompanionSourcePath) ? m_opt.TemplatePath : m_opt.CompanionSourcePath;
 
         private ImportReport Finish(string candidate)
@@ -1346,6 +1369,9 @@ namespace libmsstyle.Import
         private HashSet<string> m_sourceGeometryParts = new HashSet<string>(StringComparer.Ordinal);
         // xp: parts whose template geometry was retuned around stock art the source replaced; the source's numbers win there.
         private HashSet<string> m_stockArtParts = new HashSet<string>(StringComparer.Ordinal);
+        // xp: parts where prefer-source takes the source's *stock* picture over the template's redraw; their strip
+        // geometry follows that picture too (see ThreeWay), or the stock picture would be cut with the template's numbers.
+        private HashSet<string> m_preferStockArtParts = new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>
         /// Parts (class|part) where taking the source's strip geometry piecemeal would mix it with
@@ -1364,6 +1390,21 @@ namespace libmsstyle.Import
             var scalarChange = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var e in m_target.Entries.Where(e => e.ResourceType == "IMAGE" && !DpiSlotIds.Contains(e.NameId) && !m_base.ByKey.ContainsKey(e.Key)))
                 keptImage[e.PartKey] = e.PropertyName + " (template only)";
+
+            // prefer-source art: the source kept xp's own picture, the template redrew that slot, and the source's
+            // picture still cuts into the template's frame count. Those parts take the source picture and, with it,
+            // the source's own strip geometry (ExplorerBar's single-picture group headers and backgrounds).
+            if (m_source.Platform == Platform.WinXP && m_opt.PreferSource.Count > 0)
+            {
+                foreach (var e in m_target.Entries.Where(e => e.ResourceType == "IMAGE" && !m_touched.Contains(e.Property)))
+                {
+                    if (!m_base.ByKey.TryGetValue(e.Key, out var b) || !m_source.ByKey.TryGetValue(e.Key, out var se)) continue;
+                    if (se.ResourceType != "IMAGE" || Same(m_base, b, m_source, se) || Same(m_base, b, m_target, e)) continue;
+                    if (!KeyPattern.Matches(m_opt.PreferSource, e.ClassName, e.PartName, e.PropertyName)) continue;
+                    if (!SameFrameCut(se, e)) continue;
+                    m_preferStockArtParts.Add(e.PartKey);
+                }
+            }
 
             foreach (var key in keys)
             {
@@ -1386,6 +1427,8 @@ namespace libmsstyle.Import
                     conflict = false;
                     m_stockArtParts.Add(b.PartKey);
                 }
+                if (conflict && m_preferStockArtParts.Contains(b.PartKey))
+                    conflict = false;
                 if (conflict)
                     locked[b.PartKey] = $"{b.PropertyName} in this part is a template adaptation, so the part's strip geometry stays with the template";
                 else
@@ -1621,7 +1664,33 @@ namespace libmsstyle.Import
                 r.Count("skipped-source-added");
                 return false;
             }
-            if (Same(m_base, b, src, s))
+            bool sourceUnchanged = Same(m_base, b, src, s);
+            // prefer-source: also take the source's *stock* value where the template rewrote it. Without this the
+            // three-way rule above wins for a source that kept xp's own picture (a theme built on luna's art, e.g.
+            // Pure's ExplorerBar headers) and the port template's redrawn picture stays, so the port keeps the
+            // template's look instead of the theme's. Only pictures and their strip geometry qualify: a number the
+            // template retuned for its own Win10-only records is not something a stock xp value describes.
+            bool preferStockHere = m_preferStockArtParts.Contains(s.PartKey) && GeometryIds.Contains(s.NameId);
+            if (sourceUnchanged && a != null && !m_touched.Contains(a.Property)
+                && src.Platform == Platform.WinXP && GeometryIds.Contains(s.NameId)
+                && !Same(m_base, b, m_target, a)
+                && (preferStockHere || KeyPattern.Matches(m_opt.PreferSource, cls, part, prop)))
+            {
+                if (!ApplySourceValue(src, s, a.Property, out string stockErr))
+                {
+                    Decide(s, "kept-target", $"prefer-source wants the source's stock {prop} here, but it doesn't fit the template: {stockErr}", b, s, a, null);
+                    r.Count("kept-target-conflict");
+                    return false;
+                }
+                m_touched.Add(a.Property);
+                RecordImageReplacement(a);
+                ChangedProperties[a.Property] = $"{a.ClassName}|{a.PartName}|S{a.StateId}|{a.PropertyName}";
+                Decide(a, "applied-stock-over-template", "prefer-source: the source kept stock xp's value and the template adapted it, so the source's is used", b, s, a, SemanticModel.FormatValue(a.Property));
+                r.Count("applied-stock-over-template");
+                m_report.Notes.Add($"prefer-source: {cls}|{part}|{prop} took the source's stock xp value over the template's adaptation.");
+                return true;
+            }
+            if (sourceUnchanged)
             {
                 r.Count("unchanged");
                 return false;
@@ -1761,6 +1830,23 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
+        /// true when the source picture splits into the template's effective frame count the same way (used to decide
+        /// whether prefer-source may take a stock source picture at all).
+        /// </summary>
+        private bool SameFrameCut(SemanticEntry s, SemanticEntry t)
+        {
+            if (!m_source.ClassesByName.TryGetValue(s.ClassName, out var sc)) return false;
+            if (!m_target.Style.Classes.TryGetValue(t.ClassId, out var tc)) return false;
+            int sCount = SemanticModel.FindEffective(m_source.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int a && a > 0 ? a : 1;
+            int tCount = SemanticModel.FindEffective(m_target.Style, tc, t.PartId, t.StateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int bb && bb > 0 ? bb : 1;
+            if (sCount != tCount) return false;
+            if (sCount == 1) return true;
+            int sLayout = SemanticModel.FindEffective(m_source.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int l1 ? l1 : 1;
+            int tLayout = SemanticModel.FindEffective(m_target.Style, tc, t.PartId, t.StateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int l2 ? l2 : 0;
+            return sLayout == tLayout;
+        }
+
+        /// <summary>
         /// true when the template part ends up cut like the source's: the source's geometry was taken
         /// for the part, or the effective frame count, layout and margins already agree.
         /// </summary>
@@ -1769,13 +1855,24 @@ namespace libmsstyle.Import
             if (m_sourceGeometryParts.Contains(a.PartKey)) return true;
             if (!m_source.ClassesByName.TryGetValue(s.ClassName, out var sc)) return false;
             var tc = m_target.Style.Classes[a.ClassId];
-            foreach (var id in new[] { IDENTIFIER.IMAGECOUNT, IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGMARGINS })
-            {
-                var sv = SemanticModel.FindEffective(m_source.Style, sc, s.PartId, s.StateId, id);
-                var tv = SemanticModel.FindEffective(m_target.Style, tc, a.PartId, a.StateId, id);
-                if ((sv == null) != (tv == null)) return false;
-                if (sv != null && SemanticModel.FormatValue(sv) != SemanticModel.FormatValue(tv)) return false;
-            }
+            // effective values: a missing IMAGECOUNT is one frame, and a missing IMAGELAYOUT is the platform's
+            // default (xp cuts strips horizontally, win10 vertically). Comparing record presence marked parts with
+            // one picture as different geometry whenever the template dropped the layout record (Luna10 did on the
+            // single-picture ExplorerBar headers), and the merge then kept the template art over a source picture.
+            var svc = SemanticModel.FindEffective(m_source.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGECOUNT);
+            var tvc = SemanticModel.FindEffective(m_target.Style, tc, a.PartId, a.StateId, IDENTIFIER.IMAGECOUNT);
+            int sCount = svc?.GetValue() is int c1 && c1 > 0 ? c1 : 1;
+            int tCount = tvc?.GetValue() is int c2 && c2 > 0 ? c2 : 1;
+            if (sCount != tCount) return false;
+            var svl = SemanticModel.FindEffective(m_source.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT);
+            var tvl = SemanticModel.FindEffective(m_target.Style, tc, a.PartId, a.StateId, IDENTIFIER.IMAGELAYOUT);
+            int sLayout = svl?.GetValue() is int l1 ? l1 : 1;                       // xp default: horizontal
+            int tLayout = tvl?.GetValue() is int l2 ? l2 : 0;                       // win10 default: vertical
+            if (sCount > 1 && sLayout != tLayout) return false;                     // one frame: layout cuts nothing
+            var svm = SemanticModel.FindEffective(m_source.Style, sc, s.PartId, s.StateId, IDENTIFIER.SIZINGMARGINS);
+            var tvm = SemanticModel.FindEffective(m_target.Style, tc, a.PartId, a.StateId, IDENTIFIER.SIZINGMARGINS);
+            if ((svm == null) != (tvm == null)) return false;
+            if (svm != null && SemanticModel.FormatValue(svm) != SemanticModel.FormatValue(tvm)) return false;
             return true;
         }
 

@@ -103,6 +103,11 @@ namespace libmsstyle.Import
                         if (images.Count == 0) continue;
                         var bg = GeometryOf(m_base, bc, bp.PartId, bs.StateId);
                         var tg = GeometryOf(m_target, tc, bp.PartId, bs.StateId);
+                        // one frame either way: the picture is the whole image and the orientation flag cuts
+                        // nothing, so the template didn't re-cut anything here (Luna10 drops IMAGELAYOUT on the
+                        // single-picture ExplorerBar headers). Treating it as a re-cut refused those parts and
+                        // kept the template's own art over the source's (Pure's NORMALGROUPHEAD/SPECIALGROUPHEAD).
+                        if (bg.Count == 1 && tg.Count == 1) continue;
                         if (bg.Count == tg.Count && bg.Horizontal == tg.Horizontal) continue;
                         string label = $"{bc.ClassName} part {bp.PartId} state {bs.StateId}";
 
