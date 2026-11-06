@@ -12,10 +12,14 @@ namespace libmsstyle.Import
     /// The win10 shellstyle can't hold xp's stylesheet: its UIFILE draws the task pane from the
     /// msstyles ExplorerBar class (gtc/dtb lookups), and the xp ports transcribed stock xp's
     /// shellstyle into those records: every stock luna value below equals the Luna port's
-    /// ExplorerBar record, header bitmaps 110/112 pixel for pixel. So the source shellstyle's values
-    /// go into the same records. Three-way, against the stock luna shellstyle: where the source
-    /// shellstyle is stock, the template's original ExplorerBar value stays (or comes back, if the
-    /// msstyles merge replaced it, since on xp these parts were drawn from the shellstyle).
+    /// ExplorerBar record, header bitmaps 110/112 pixel for pixel.
+    ///
+    /// Each record takes what xp's DirectUI resolved for the element it stands for (<see cref="DuiCascade"/>:
+    /// shell32's element tree and DirectUI's own lookup rules), not a value read under one selector: themes put
+    /// the same look on different elements (the header on the button or on its title, the group fill on the
+    /// tasklist, the clipper or nowhere), and only the resolved value says what xp painted. Three-way against the
+    /// stock luna shellstyle, resolved the same way: where the source resolves to stock, the template's original
+    /// ExplorerBar value stays (or comes back, if the msstyles merge replaced it).
     ///
     /// Bitmaps the win10 shellstyle keeps under xp's ids (10-25, 100-112) are replaced with the
     /// source shellstyle's where those differ from stock, see <see cref="PatchShellStyleBitmaps"/>.
@@ -26,6 +30,7 @@ namespace libmsstyle.Import
 
         private readonly Win7StyleImporter m_imp;
         private readonly XpShellStyle m_src, m_base;
+        private readonly DuiCascade m_srcDui, m_baseDui;
         // (part, state, name id) -> template value before any merge.
         private readonly Dictionary<string, StyleProperty> m_snapshot = new Dictionary<string, StyleProperty>();
         private StyleClass m_cls;
@@ -38,6 +43,8 @@ namespace libmsstyle.Import
             m_imp = importer;
             m_src = source;
             m_base = baseStyle;
+            m_srcDui = new DuiCascade(source);
+            m_baseDui = new DuiCascade(baseStyle);
             m_classicFallback = classicFallback;
         }
 
@@ -61,30 +68,12 @@ namespace libmsstyle.Import
         private const int Background = 0, NormalBg = 5, NormalCollapse = 6, NormalExpand = 7, NormalHead = 8,
             SpecialBg = 9, SpecialCollapse = 10, SpecialExpand = 11, SpecialHead = 12;
 
-        // win10 ExplorerBar text color <- xp stylesheet / selectors (the win10 UIFILE reads part/state 3803). A header's
-        // text is its title element: the title's own foreground wins over the button's it sits in (DirectUI cascades
-        // to the child); stock luna sets it on the button only, Lion OS X on the title.
-        private const string Title = "element [id=atom(title)]", TitleHot = "element [id=atom(title)][mousefocused]";
-        private static readonly (int Part, int State, string Resid, string[] Selectors)[] TextColors =
+        /// <summary>a property of one tree element, resolved in the source and in stock luna.</summary>
+        private (string Src, string Stock) Both(Func<DuiCascade.Section, DuiCascade.Node> pick, bool main, string property, bool hot = false, bool open = true)
         {
-            (NormalCollapse, 0, "sectionss", new[] { Title, "button" }),
-            (NormalCollapse, 2, "sectionss", new[] { TitleHot }),
-            (NormalExpand, 0, "sectiontaskss", new[] { "button" }),
-            (NormalExpand, 2, "sectiontaskss", new[] { TitleHot }),
-            (SpecialCollapse, 0, "mainsectionss", new[] { Title, "button [id=atom(header)]" }),
-            (SpecialCollapse, 2, "mainsectionss", new[] { TitleHot }),
-            (SpecialExpand, 0, "mainsectiontaskss", new[] { "button" }),
-            (SpecialExpand, 2, "mainsectiontaskss", new[] { TitleHot }),
-        };
-
-        // arrow strips: 3 frames normal/hot/pressed; collapse is shown while the group is open (xp [selected]).
-        private static readonly (int Part, string Resid, string[] Frames)[] Arrows =
-        {
-            (NormalCollapse, "sectionss", new[] { "element [id=atom(arrow)][selected]", "element [id=atom(arrow)][selected][mousefocused]", "element [id=atom(arrow)][selected][mousefocused]" }),
-            (NormalExpand, "sectionss", new[] { "element [id=atom(arrow)]", "element [id=atom(arrow)][mousefocused]", "element [id=atom(arrow)][mousefocused]" }),
-            (SpecialCollapse, "mainsectionss", new[] { "element [id=atom(arrow)][selected]", "element [id=atom(arrow)][selected][mousefocused]", "element [id=atom(arrow)][selected][mousefocused]" }),
-            (SpecialExpand, "mainsectionss", new[] { "element [id=atom(arrow)]", "element [id=atom(arrow)][mousefocused]", "element [id=atom(arrow)][mousefocused]" }),
-        };
+            var s = DuiCascade.Build(main, hot, open); var b = DuiCascade.Build(main, hot, open);
+            return (m_srcDui.Resolve(pick(s), property), m_baseDui.Resolve(pick(b), property));
+        }
 
         public void Run()
         {
@@ -95,9 +84,10 @@ namespace libmsstyle.Import
                 return;
             }
 
-            // task pane background gradient
-            var sFill = XpShellStyle.ParseFill(m_src.Get("taskpane", "element [id=atom(sectionlist)]", "background"));
-            var bFill = XpShellStyle.ParseFill(m_base.Get("taskpane", "element [id=atom(sectionlist)]", "background"));
+            // task pane background gradient: the sectionlist element.
+            var pane = Both(x => x.Pane, false, "background");
+            var sFill = XpShellStyle.ParseFill(pane.Src);
+            var bFill = XpShellStyle.ParseFill(pane.Stock);
             if (Usable(sFill, "task pane background"))
             {
                 bool stock = SameFill(sFill, bFill);
@@ -107,44 +97,130 @@ namespace libmsstyle.Import
 
             // task pane padding: xp's sectionlist padding is the win10 UIFILE's gtmar(ExplorerBar, 0, 0, 3602)
             // (ExplorerBarBackground padding); stock luna's 12rp on every side equals the Luna port's record.
-            SetMargins(Background, IDENTIFIER.CONTENTMARGINS,
-                XpShellStyle.ParseRect(m_src.Get("taskpane", "element [id=atom(sectionlist)]", "padding")),
-                XpShellStyle.ParseRect(m_base.Get("taskpane", "element [id=atom(sectionlist)]", "padding")), "task pane padding");
+            var pad = Both(x => x.Pane, false, "padding");
+            SetMargins(Background, IDENTIFIER.CONTENTMARGINS, XpShellStyle.ParseRect(pad.Src), XpShellStyle.ParseRect(pad.Stock), "task pane padding");
 
-            foreach (var t in TextColors)
+            // xp's classic shellstyle (no Shell folder): measured on xp x64 sp2 under Flarn, the special group is drawn
+            // exactly like the others (buttonface header, buttontext), though its stylesheet asks for activecaption.
+            bool specialMain = !m_classicFallback;
+            foreach (var (main, collapse, expand, bg, head) in new[]
             {
-                var s = XpShellStyle.ParseColor(m_src.GetFirst(t.Resid, "foreground", t.Selectors));
-                var b = XpShellStyle.ParseColor(m_base.GetFirst(t.Resid, "foreground", t.Selectors));
-                // no hover rule (xp's classic shellstyle): the title keeps its normal color on hover, so the
-                // hover state takes the normal state's source color instead of keeping the template's blue.
-                if (s == null && t.State == 2)
-                {
-                    var normal = TextColors.First(n => n.Part == t.Part && n.State == 0);
-                    s = XpShellStyle.ParseColor(m_src.GetFirst(normal.Resid, "foreground", normal.Selectors));
-                    b = null;
-                }
-                if (s == null) continue;
-                SetColor(t.Part, t.State, IDENTIFIER.TEXTCOLOR, SameColor(s, b) ? (Color?)null : s.Value, $"{t.Resid} {t.Selectors[0]} foreground");
+                (false, NormalCollapse, NormalExpand, NormalBg, NormalHead),
+                (specialMain, SpecialCollapse, SpecialExpand, SpecialBg, SpecialHead),
+            })
+            {
+                string what = main ? "special group" : "normal group";
+                // header title text (win10 collapse part, 3803) normal / hot; task links (expand part).
+                TextColor(collapse, 0, Both(x => x.Title, main, "foreground"), what + " header text");
+                TextColor(collapse, 2, Both(x => x.Title, main, "foreground", hot: true), what + " header text (hover)");
+                TextColor(expand, 0, Both(x => x.TaskTitle, main, "foreground"), what + " task text");
+                TextColor(expand, 2, Both(x => x.TaskTitle, main, "foreground", hot: true), what + " task text (hover)");
+                GroupTile(bg, main, what);
+                HeaderImage(head, main, what);
+                ArrowStrip(collapse, main, true, what);
+                ArrowStrip(expand, main, false, what);
             }
+            // the win10 UIFILE pads every tasklist with gtmar(ExplorerBar, 5, 0, 3602) (8px in Luna10, whose groups
+            // the port fitted to stock luna's tasklist padding rect(12,10,12,10)); the source's difference from stock
+            // moves it the same way. Opus OS: rect(3,7,3,7), its tasks sit 9px further left and 3px tighter than luna.
+            TaskListInset();
+            PaneFonts();
+        }
 
-            GroupTile(NormalBg, "sectionss");
-            HeaderImage(NormalHead, "sectionss", "button");
-            if (m_classicFallback)
+        /// <summary>
+        /// the task pane fonts. win10 draws every header title with gtf(TextStyle, 3, 0) and every task link with
+        /// gtf(TextStyle, 6, 0/2) (its ExplorerBarStyle sheet; nothing else in the shell's UIFILEs reads those two
+        /// parts for long text, the rest are labels in the same role). xp's are the resolved fontface / fontsize /
+        /// fontweight / fontstyle of the header title and the task title (rcstr/rcint read the shellstyle's own string
+        /// table: SHADED's headers are its rcstr(1) "Swis721 Cn BT D-Type" at rcint(15) 7pt, bold). Where both
+        /// resolve to stock luna's font, the template's stays.
+        /// </summary>
+        private void PaneFonts()
+        {
+            var ts = m_imp.Target.ClassesByName.TryGetValue("TextStyle", out var c) ? c : null;
+            if (ts == null) return;
+            PaneFont(ts, 3, 0, x => x.Title, false, "header title");
+            PaneFont(ts, 6, 0, x => x.TaskTitle, false, "task link");
+            PaneFont(ts, 6, 2, x => x.TaskTitle, true, "task link (hover)");
+        }
+
+        private void PaneFont(StyleClass ts, int part, int state, Func<DuiCascade.Section, DuiCascade.Node> pick, bool hot, string what)
+        {
+            var src = ResolvedFont(m_srcDui, m_src, pick, hot);
+            var stock = ResolvedFont(m_baseDui, m_base, pick, hot);
+            if (src == null || stock == null || src.Equals(stock)) return;
+            if (!ts.Parts.TryGetValue(part, out var p) || !p.States.TryGetValue(state, out var st)) return;
+            var prop = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.FONT);
+            if (prop == null) return;
+            if (!m_imp.PlaceFont(src.ToString(), out int id, out string error)) { m_imp.Report.Warnings.Add($"shellstyle: {what} font not ported: {error}"); return; }
+            if ((prop.Header.shortFlag & 0xFFFF) == id) return;
+            prop.SetValue(id);
+            string partName = SemanticModel.PartNames("TextStyle", Platform.Win10).TryGetValue(part, out var n) ? n : "Part " + part;
+            m_imp.MarkTouched(prop, $"TextStyle|{partName}|S{state}|FONT");
+            m_imp.Report.Decisions.Add(new MergeDecision
             {
-                // measured on xp x64 sp2 under Flarn (no Shell folder): the special group is drawn exactly like the
-                // others, buttonface header with buttontext, buttonface border, though the classic stylesheet asks
-                // for activecaption. so it takes the normal section's look.
-                GroupTile(SpecialBg, "sectionss");
-                HeaderImage(SpecialHead, "sectionss", "button");
-                var fg = XpShellStyle.ParseColor(m_src.Get("sectionss", "button", "foreground"));
-                if (fg != null) { SetColor(SpecialCollapse, 0, IDENTIFIER.TEXTCOLOR, fg, "sectionss button foreground"); SetColor(SpecialCollapse, 2, IDENTIFIER.TEXTCOLOR, fg, "sectionss button foreground"); }
-            }
-            else
-            {
-                GroupTile(SpecialBg, "mainsectionss", "element [id=atom(watermark)]");
-                HeaderImage(SpecialHead, "mainsectionss", "button [id=atom(header)]");
-            }
-            foreach (var a in Arrows) ArrowStrip(a.Part, a.Resid, a.Frames);
+                Class = "TextStyle", Part = partName, State = state, Property = "FONT", Action = "applied-shellstyle",
+                Reason = $"the task pane {what} font of the source shellstyle (win10 draws it with this TextStyle part)", Result = src.ToString(),
+            });
+            m_imp.Report.Count("applied-shellstyle");
+        }
+
+        /// <summary>DUI fontface/fontsize/fontweight/fontstyle resolved for one element, as a uxtheme font string.</summary>
+        private static FontSpec ResolvedFont(DuiCascade dui, XpShellStyle style, Func<DuiCascade.Section, DuiCascade.Node> pick, bool hot)
+        {
+            var node = pick(DuiCascade.Build(false, hot));
+            string face = ResText(style, dui.Resolve(node, "fontface"));
+            string size = dui.Resolve(node, "fontsize"), weight = dui.Resolve(node, "fontweight"), fstyle = dui.Resolve(node, "fontstyle");
+            if (face == null || size == null) return null;
+            // a face the author's tooling mangled into question marks (Lion OS X ships "????" in its string table):
+            // CreateFont falls back to the system font for it, which isn't a font choice to carry over.
+            if (face.Trim().Trim('?').Length == 0) return null;
+            // "rcint(15)pt" / "8pt": points (parse.y: magnitude YYPT -> PointToPixel(n, dpi)).
+            var sm = System.Text.RegularExpressions.Regex.Match(size.Trim(), @"^(?:rcint\((\d+)\)|(\d+))\s*pt$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!sm.Success) return null;
+            string pts = sm.Groups[1].Success ? style.ResString(int.Parse(sm.Groups[1].Value)) : sm.Groups[2].Value;
+            if (!int.TryParse(pts?.Trim(), out int points) || points <= 0) return null;
+            int w = 400;
+            var wm = weight == null ? null : System.Text.RegularExpressions.Regex.Match(weight.Trim(), @"^(?:rcint\((\d+)\)|(\d+))$");
+            if (wm != null && wm.Success) int.TryParse(wm.Groups[1].Success ? style.ResString(int.Parse(wm.Groups[1].Value)) : wm.Groups[2].Value, out w);
+            else if (weight != null && weight.Trim().Equals("bold", StringComparison.OrdinalIgnoreCase)) w = 700;
+            var parts = new List<string> { face.Trim(), points.ToString(System.Globalization.CultureInfo.InvariantCulture) };
+            if (w >= 600) parts.Add("Bold");
+            if (fstyle != null && fstyle.IndexOf("underline", StringComparison.OrdinalIgnoreCase) >= 0) parts.Add("Underline");
+            if (fstyle != null && fstyle.IndexOf("italic", StringComparison.OrdinalIgnoreCase) >= 0) parts.Add("Italic");
+            var f = FontSpec.Parse(string.Join(", ", parts));
+            return f.Error == null && f.IsSane ? f : null;
+        }
+
+        /// <summary>a DUI string value: rcstr(n) from the shellstyle's string table, a quoted or bare literal otherwise.</summary>
+        private static string ResText(XpShellStyle style, string v)
+        {
+            if (v == null) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(v.Trim(), @"^rcstr\((\d+)\)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (m.Success) return style.ResString(int.Parse(m.Groups[1].Value));
+            if (v.Trim().StartsWith("sysmetricstr", StringComparison.OrdinalIgnoreCase)) return null; // a system font: not the shellstyle's.
+            return v.Trim().Trim('"', '\'');
+        }
+
+        private void TaskListInset()
+        {
+            var p = Find(NormalBg, 0, IDENTIFIER.CONTENTMARGINS);
+            if (p == null || !m_snapshot.TryGetValue(K(NormalBg, 0, IDENTIFIER.CONTENTMARGINS), out var orig) || !(orig.GetValue() is Margins t)) return;
+            var s = XpShellStyle.ParseRect(m_srcDui.Resolve(DuiCascade.Build(false).TaskList, "padding")) ?? new Margins(0, 0, 0, 0);
+            var b = XpShellStyle.ParseRect(m_baseDui.Resolve(DuiCascade.Build(false).TaskList, "padding")) ?? new Margins(0, 0, 0, 0);
+            var m = new Margins(Math.Max(0, t.Left + s.Left - b.Left), Math.Max(0, t.Top + s.Top - b.Top), Math.Max(0, t.Right + s.Right - b.Right), Math.Max(0, t.Bottom + s.Bottom - b.Bottom));
+            if (p.GetValue() is Margins cur && cur.Left == m.Left && cur.Top == m.Top && cur.Right == m.Right && cur.Bottom == m.Bottom) return;
+            if (m.Left == t.Left && m.Top == t.Top && m.Right == t.Right && m.Bottom == t.Bottom) { Restore(p, NormalBg, 0, IDENTIFIER.CONTENTMARGINS, "task list padding"); return; }
+            p.SetValue(m);
+            Changed(p, NormalBg, 0, "applied-shellstyle", $"task list padding differs from stock luna by {s.Left - b.Left},{s.Top - b.Top},{s.Right - b.Right},{s.Bottom - b.Bottom}px (l,t,r,b)");
+        }
+
+        private void TextColor(int part, int state, (string Src, string Stock) v, string what)
+        {
+            var s = XpShellStyle.ParseColor(v.Src);
+            var b = XpShellStyle.ParseColor(v.Stock);
+            if (s == null) return;
+            SetColor(part, state, IDENTIFIER.TEXTCOLOR, SameColor(s, b) ? (Color?)null : s.Value, what);
         }
 
         private bool Usable(Color[] fill, string what)
@@ -213,40 +289,100 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// The group background is a 10x10 nine-grid tile: fill inside, the tasklist border on the
-        /// sides xp drew it (borderthickness rect(l,t,r,b), luna rect(1,0,1,1)). The fill is the first rule that sets
-        /// one: the given selector, the tasklist, then <c>element</c>, which every DUI class derives from (Lion OS X
-        /// colors its groups through <c>element</c> only; reading just the tasklist kept Luna10's white groups).
+        /// The group background (win10 dtb(ExplorerBar, 5/9) on the clipper): what xp showed behind the tasks (the first
+        /// opaque fill of tasklist, watermark, clipper, expando and pane, background inheriting through), framed by the
+        /// tasklist border where its borderthickness draws one (luna rect(1,0,1,1)). A solid fill is a 10x10 nine-grid
+        /// tile, a gradient (Opus OS paints its groups with the pane's gradient) a stretched strip.
         /// </summary>
-        private void GroupTile(int part, string resid, string fillSelector = "tasklist [id=atom(tasklist)]")
+        private void GroupTile(int part, bool main, string what)
         {
-            const string list = "tasklist [id=atom(tasklist)]";
-            string[] fillChain = { fillSelector, list, "element" };
-            string sBg = m_src.GetFirst(resid, "background", fillChain), bBg = m_base.GetFirst(resid, "background", fillChain);
-            string sBc = m_src.Get(resid, list, "bordercolor"), bBc = m_base.Get(resid, list, "bordercolor");
-            string sBt = m_src.Get(resid, list, "borderthickness"), bBt = m_base.Get(resid, list, "borderthickness");
             var img = Find(part, 0, IDENTIFIER.IMAGEFILE);
             if (img == null) return;
-            if (sBg == bBg && sBc == bBc && sBt == bBt) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, resid + " group background"); RestoreGeometry(part); return; }
+            var src = GroupLook(m_srcDui, main);
+            var stock = GroupLook(m_baseDui, main);
+            if (src.Key == stock.Key) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, what + " background"); RestoreGeometry(part); return; }
+            if (src.Fill == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} background \"{src.Key}\" isn't a color or gradient the porter reads; template tile kept."); return; }
 
-            var fill = XpShellStyle.ParseColor(sBg);
-            var border = XpShellStyle.ParseColor(sBc) ?? Color.White;
-            var thick = XpShellStyle.ParseRect(sBt) ?? new Margins(0, 0, 0, 0);
-            if (fill == null) { m_imp.Report.Warnings.Add($"shellstyle: {resid} group background \"{sBg}\" isn't a color; template tile kept."); return; }
+            PlaceImage(img, part, ImageIdentity.EncodePngVerified(Paint(src.Fill, src.Border, src.Thickness, out var sizing)), $"{what} background {src.Key}");
+            if (sizing == null) RestoreGeometry(part); // the tile's 1px frame stays a frame with the luna port's 1px margins.
+            else SetGeometry(part, sizing, "group background is a gradient, stretched");
+            // FILLCOLOR is what win10 fills the group with where the picture isn't used; a see-through group has none.
+            if (Find(part, 0, IDENTIFIER.FILLCOLOR) != null && src.Fill.Value.Opaque) SetColor(part, 0, IDENTIFIER.FILLCOLOR, src.Fill.Value.Stops[0], what + " background");
+        }
 
-            const int n = 10;
-            var tile = new ArgbImage(n, n);
-            for (int y = 0; y < n; ++y)
-                for (int x = 0; x < n; ++x)
+        /// <summary>
+        /// the fill xp painted behind a group's tasks: the first element from the tasklist out to the expando that sets
+        /// an opaque background itself (an inherited value is the ancestor's, checked in its own turn). None, or the
+        /// pane's own fill again (Opus OS paints its clippers with the pane gradient; measured on xp: the same pixels
+        /// at the same x in and between groups): the group is see-through, a transparent tile, and win10's clipper
+        /// shows its ExplorerBarBackground the same way. A re-drawn gradient would restart at each group's edge.
+        /// </summary>
+        private (DuiFill? Fill, Color Border, Margins Thickness, string Key) GroupLook(DuiCascade dui, bool main)
+        {
+            var s = DuiCascade.Build(main);
+            var pane = XpShellStyle.ParseFill(dui.Resolve(s.Pane, "background"));
+            DuiFill? fill = DuiFill.Clear; string fillText = "transparent";
+            foreach (var node in new[] { s.TaskList, s.Watermark, s.Clipper, s.Expando })
+            {
+                if (node == null) continue;
+                var v = dui.Resolve(node, "background", out var origin);
+                if (v == null || origin != node) continue;
+                var f = DuiFill.Parse(v);
+                if (f == null) { fill = null; fillText = v; break; } // a bitmap or something unparsable: reported, not guessed.
+                if (!f.Value.Opaque) continue;
+                if (f.Value.Stops.Length > 1 && SameFill(f.Value.Stops, pane)) break; // the pane's gradient again: see-through
+                fill = f; fillText = v; break;
+            }
+            var thick = XpShellStyle.ParseRect(dui.Resolve(s.TaskList, "borderthickness")) ?? new Margins(0, 0, 0, 0);
+            var border = XpShellStyle.ParseColor(dui.Resolve(s.TaskList, "bordercolor")) ?? Color.Black; // DUI default SC_Black
+            bool framed = thick.Left + thick.Top + thick.Right + thick.Bottom > 0;
+            string key = $"{fillText}|{(framed ? $"{border.ToArgb()}|{thick.Left},{thick.Top},{thick.Right},{thick.Bottom}" : "")}";
+            return (fill, border, thick, key);
+        }
+
+        /// <summary>a solid color or gradient(c1, c2, mode) fill as DirectUI paints it (render.cpp: GradientFill across the element).</summary>
+        private struct DuiFill
+        {
+            public Color[] Stops;
+            public bool Vertical;
+            public bool Opaque => Stops.Length > 1 || Stops[0].A == 255; // gradients are drawn opaque (stops' alpha ignored).
+            /// <summary>nothing painted: the element shows what's behind it.</summary>
+            public static DuiFill Clear => new DuiFill { Stops = new[] { Color.FromArgb(0, 0, 0, 0) } };
+            public static DuiFill? Parse(string v)
+            {
+                var f = XpShellStyle.ParseFill(v);
+                if (f == null) return null;
+                return new DuiFill { Stops = f, Vertical = XpShellStyle.GradientMode(v) == 1 };
+            }
+        }
+
+        /// <summary>
+        /// the picture for a fill with a border: solid -> 10x10 tile, <paramref name="sizing"/> null (caller's geometry);
+        /// gradient -> 200x20 strip drawn like GradientFill, sizing = the border so it stays a frame when stretched.
+        /// </summary>
+        private static ArgbImage Paint(DuiFill? fill, Color border, Margins thick, out Margins sizing)
+        {
+            var f = fill.Value;
+            bool grad = f.Stops.Length > 1;
+            int w = grad ? 200 : 10, h = grad ? 20 : 10, cap = grad ? 8 : 4;
+            int l = Math.Min(thick.Left, cap), t = Math.Min(thick.Top, cap), r = Math.Min(thick.Right, cap), b = Math.Min(thick.Bottom, cap);
+            var pic = new ArgbImage(w, h);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
                 {
-                    bool edge = (x < Math.Min(thick.Left, 4)) || (x >= n - Math.Min(thick.Right, 4)) || (y < Math.Min(thick.Top, 4)) || (y >= n - Math.Min(thick.Bottom, 4));
-                    tile.Pixels[y * n + x] = Premultiplied(edge ? border : fill.Value);
+                    Color c;
+                    if (x < l || x >= w - r || y < t || y >= h - b) c = border;
+                    else if (!grad) c = f.Stops[0];
+                    else
+                    {
+                        double k = f.Vertical ? y / (double)(h - 1) : x / (double)(w - 1);
+                        Color c0 = f.Stops[0], c1 = f.Stops[f.Stops.Length - 1];
+                        c = Color.FromArgb(255, (int)Math.Round(c0.R + (c1.R - c0.R) * k), (int)Math.Round(c0.G + (c1.G - c0.G) * k), (int)Math.Round(c0.B + (c1.B - c0.B) * k));
+                    }
+                    pic.Pixels[y * w + x] = Premultiplied(c);
                 }
-            PlaceImage(img, part, ImageIdentity.EncodePngVerified(tile), $"{resid} group background {sBg}, border {sBc} {sBt}");
-            // the tile's 1px frame only stays a frame with 1px sizing margins (the luna port's).
-            RestoreGeometry(part);
-            var fc = Find(part, 0, IDENTIFIER.FILLCOLOR);
-            if (fc != null && fill.Value.A == 255) SetColor(part, 0, IDENTIFIER.FILLCOLOR, fill.Value, resid + " group background");
+            sizing = grad ? new Margins(l, t, r, b) : null;
+            return pic;
         }
 
         private void RestoreGeometry(int part)
@@ -265,55 +401,96 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// The header is drawn by the title element inside the header button: the title's background covers the
-        /// button's, the button's covers what <c>element</c> gives every DUI element. Stock luna sets the button's;
-        /// Lion OS X the title's (a flat bitmap) and <c>element</c>'s.
+        /// The header (win10 dtb(ExplorerBar, 8/12) behind the title) is what xp showed there: the title's own
+        /// background over the header button's, over what's behind the button (the wrapper or the expando, where the
+        /// header is see-through). A bitmap becomes the header picture, a solid color a flat 10x10 tile; a gradient
+        /// (Opus OS) is drawn into a header-sized picture the way DirectUI fills it.
         /// </summary>
-        private void HeaderImage(int part, string resid, string selector)
+        private void HeaderImage(int part, bool main, string what)
         {
             var img = Find(part, 0, IDENTIFIER.IMAGEFILE);
             if (img == null) return;
-            string[] chain = { Title, selector, "element" };
-            string sBack = m_src.GetFirst(resid, "background", chain);
-            Color? flat = null;
+            string sBack = HeaderBackground(m_srcDui, main), bBack = HeaderBackground(m_baseDui, main);
             if (XpShellStyle.ParseRcBmp(sBack, out int id, out var key))
             {
-                XpShellStyle.ParseRcBmp(m_base.GetFirst(resid, "background", chain), out int bid, out _);
+                XpShellStyle.ParseRcBmp(bBack, out int bid, out _);
                 var dib = m_src.GetBitmap(id);
-                if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {resid} header bitmap {id} is missing; template kept."); return; }
-                if (bid > 0 && SameBytes(dib, m_base.GetBitmap(bid))) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, resid + " header"); RestoreHeaderGeometry(part); HeaderInset(part, resid, selector); return; }
+                if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} header bitmap {id} is missing; template kept."); return; }
+                if (bid > 0 && SameBytes(dib, m_base.GetBitmap(bid))) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, what + " header"); RestoreHeaderGeometry(part); HeaderInset(part, main, what); return; }
                 // mode 6 color keyed; otherwise DirectUI's per-pixel alpha rule.
                 var png = ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null);
+                var pic = ImageIdentity.Decode(png);
                 // a one-color bitmap (Lion's 18x18 title tile) is a flat header: cut to the template's header margins
                 // it would be narrower than them.
-                var pic = ImageIdentity.Decode(png);
                 if (pic.Pixels.All(p => p == pic.Pixels[0]) && (pic.Pixels[0] >> 24) == 0xFF)
-                    flat = Color.FromArgb((int)((pic.Pixels[0] >> 16) & 0xFF), (int)((pic.Pixels[0] >> 8) & 0xFF), (int)(pic.Pixels[0] & 0xFF));
-                else
                 {
-                    PlaceImage(img, part, png, $"{resid} header bitmap {id}");
-                    RestoreHeaderGeometry(part);
-                    HeaderInset(part, resid, selector);
+                    FlatHeader(part, img, Color.FromArgb((int)((pic.Pixels[0] >> 16) & 0xFF), (int)((pic.Pixels[0] >> 8) & 0xFF), (int)(pic.Pixels[0] & 0xFF)), $"{what} header bitmap {id}");
+                    HeaderInset(part, main, what);
                     return;
                 }
+                PlaceImage(img, part, png, $"{what} header bitmap {id}");
+                RestoreHeaderGeometry(part);
+                HeaderInset(part, main, what);
+                return;
             }
-            // a color header (xp's classic shellstyle: background activecaption / buttonface): the header
-            // becomes a flat tile of that color, cut like the port's header picture.
-            var c = flat ?? XpShellStyle.ParseColor(sBack);
-            if (c == null || c.Value.A == 0) return;
+            var fill = sBack == "transparent" ? DuiFill.Clear : DuiFill.Parse(sBack);
+            if (fill == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} header background \"{sBack}\" isn't a color, gradient or bitmap the porter reads; template kept."); return; }
+            // the header button's own border (Opus OS: a 1px line under each header, borderthickness rect(0,0,0,1)).
+            var sec = DuiCascade.Build(main);
+            var thick = XpShellStyle.ParseRect(m_srcDui.Resolve(sec.Header, "borderthickness")) ?? new Margins(0, 0, 0, 0);
+            var border = XpShellStyle.ParseColor(m_srcDui.Resolve(sec.Header, "bordercolor")) ?? Color.Black;
+            var bsec = DuiCascade.Build(main);
+            if (sBack == bBack && SameRect(thick, XpShellStyle.ParseRect(m_baseDui.Resolve(bsec.Header, "borderthickness"))))
+            { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, what + " header"); RestoreHeaderGeometry(part); HeaderInset(part, main, what); return; }
+            var painted = Paint(fill, border, thick, out var sizing);
+            PlaceImage(img, part, ImageIdentity.EncodePngVerified(painted), $"{what} header {sBack}");
+            // solid: a 10x10 tile stretched with 1px margins, its 1px border (if any) staying on its edge.
+            SetGeometry(part, sizing ?? new Margins(1, 1, 1, 1), sizing != null ? "header is a gradient, stretched" : "header is a flat color, a 10x10 tile");
+            HeaderInset(part, main, what);
+        }
+
+        private static bool SameRect(Margins a, Margins b) => (a ?? new Margins(0, 0, 0, 0)) is Margins x && (b ?? new Margins(0, 0, 0, 0)) is Margins y
+            && x.Left == y.Left && x.Top == y.Top && x.Right == y.Right && x.Bottom == y.Bottom;
+
+        /// <summary>
+        /// the background xp painted behind the header title: the first element from the title out to the expando that
+        /// sets one itself (an inherited value is the ancestor's, checked in its turn). None: the header is see-through
+        /// and shows the pane (Opus OS), "transparent".
+        /// </summary>
+        private static string HeaderBackground(DuiCascade dui, bool main)
+        {
+            var s = DuiCascade.Build(main);
+            foreach (var node in new[] { s.Title, s.Header, s.Wrapper, s.Expando })
+            {
+                if (node == null) continue;
+                var v = dui.Resolve(node, "background", out var origin);
+                if (v == null || origin != node) continue;
+                if (XpShellStyle.ParseRcBmp(v, out _, out _)) return v;
+                var f = DuiFill.Parse(v);
+                if (f == null || f.Value.Opaque) return v;
+            }
+            return "transparent";
+        }
+
+        private void FlatHeader(int part, StyleProperty img, Color c, string from)
+        {
             var tile = new ArgbImage(10, 10);
-            for (int i = 0; i < tile.Pixels.Length; ++i) tile.Pixels[i] = Premultiplied(Color.FromArgb(255, c.Value));
-            PlaceImage(img, part, ImageIdentity.EncodePngVerified(tile), $"{resid} header color {sBack}");
+            for (int i = 0; i < tile.Pixels.Length; ++i) tile.Pixels[i] = Premultiplied(Color.FromArgb(255, c));
+            PlaceImage(img, part, ImageIdentity.EncodePngVerified(tile), from);
+            SetGeometry(part, new Margins(1, 1, 1, 1), "header is a flat color, a 10x10 tile");
+        }
+
+        private void SetGeometry(int part, Margins sizing, string reason)
+        {
             foreach (var gid in new[] { IDENTIFIER.SIZINGMARGINS, IDENTIFIER.IMAGECOUNT })
             {
                 var gp = Find(part, 0, gid);
                 if (gp == null) continue;
-                object v = gid == IDENTIFIER.IMAGECOUNT ? (object)1 : new Margins(1, 1, 1, 1);
-                if (SemanticModel.FormatValue(gp) == (gid == IDENTIFIER.IMAGECOUNT ? "1" : "(l1,t1,r1,b1)")) continue;
-                gp.SetValue(v);
-                Changed(gp, part, 0, "applied-shellstyle", $"{resid} header is a flat color, a 10x10 tile");
+                string want = gid == IDENTIFIER.IMAGECOUNT ? "1" : $"(l{sizing.Left},t{sizing.Top},r{sizing.Right},b{sizing.Bottom})";
+                if (SemanticModel.FormatValue(gp) == want) continue;
+                if (gid == IDENTIFIER.IMAGECOUNT) gp.SetValue(1); else gp.SetValue(new Margins(sizing.Left, sizing.Top, sizing.Right, sizing.Bottom));
+                Changed(gp, part, 0, "applied-shellstyle", reason);
             }
-            HeaderInset(part, resid, selector);
         }
 
         // the header strip is one frame stretched with the margins the port gave the shellstyle bitmap.
@@ -330,47 +507,61 @@ namespace libmsstyle.Import
         /// xp sizes the header button by its borderthickness + padding around the title; win10's UIFILE pads it
         /// with gtmar(ExplorerBar, 8/12, 0, 3602). The port fitted that record to stock luna (borderthickness 2,
         /// padding 0 top/bottom), so the source's difference from stock is added to the template's margins:
-        /// TangoLux's borderthickness 0 makes its headers 2px shorter, as on xp.
+        /// TangoLux's borderthickness 0 makes its headers 2px shorter, as on xp. Both are resolved on the header
+        /// button (neither inherits).
         /// </summary>
-        private void HeaderInset(int part, string resid, string selector)
+        private void HeaderInset(int part, bool main, string what)
         {
             var p = Find(part, 0, IDENTIFIER.CONTENTMARGINS);
             if (p == null || !m_snapshot.TryGetValue(K(part, 0, IDENTIFIER.CONTENTMARGINS), out var orig) || !(orig.GetValue() is Margins t)) return;
-            Margins Inset(XpShellStyle s)
+            // where the title text starts inside the header: the button's border and padding, then the title's own
+            // padding (Lion OS X pads the title 10rp, not the button; Opus OS the button 1rp; luna the button 2 + 10).
+            Margins Inset(DuiCascade d)
             {
-                var b = XpShellStyle.ParseRect(s.Get(resid, selector, "borderthickness")) ?? new Margins(0, 0, 0, 0);
-                var pd = XpShellStyle.ParseRect(s.Get(resid, selector, "padding")) ?? new Margins(0, 0, 0, 0);
-                return new Margins(b.Left + pd.Left, b.Top + pd.Top, b.Right + pd.Right, b.Bottom + pd.Bottom);
+                var s = DuiCascade.Build(main);
+                var b = XpShellStyle.ParseRect(d.Resolve(s.Header, "borderthickness")) ?? new Margins(0, 0, 0, 0);
+                var pd = XpShellStyle.ParseRect(d.Resolve(s.Header, "padding")) ?? new Margins(0, 0, 0, 0);
+                var tp = XpShellStyle.ParseRect(d.Resolve(s.Title, "padding")) ?? new Margins(0, 0, 0, 0);
+                return new Margins(b.Left + pd.Left + tp.Left, b.Top + pd.Top + tp.Top, b.Right + pd.Right + tp.Right, b.Bottom + pd.Bottom + tp.Bottom);
             }
-            var si = Inset(m_src); var bi = Inset(m_base);
-            // only the vertical insets: the port's left margin also places win10's own header icon.
+            var si = Inset(m_srcDui); var bi = Inset(m_baseDui);
+            // the left inset moves the title like on xp (Opus OS: its titles sit 11px left of luna's, measured on the
+            // xp vm). The template's margin keeps its own share (room for win10's header icon), so this is a difference.
+            // A title pushed out past the header (Lion's special group: padding 200rp in a 200rp-wide section, its
+            // title hidden on purpose) isn't a placement win10 can show; the template's margin stays then.
+            int left = si.Left - bi.Left > 64 ? t.Left : Math.Max(0, t.Left + si.Left - bi.Left);
             int top = Math.Max(0, t.Top + si.Top - bi.Top), bottom = Math.Max(0, t.Bottom + si.Bottom - bi.Bottom);
-            if (top == t.Top && bottom == t.Bottom) return;
-            if (p.GetValue() is Margins cur && cur.Top == top && cur.Bottom == bottom && cur.Left == t.Left && cur.Right == t.Right) return;
-            p.SetValue(new Margins(t.Left, top, t.Right, bottom));
-            Changed(p, part, 0, "applied-shellstyle", $"{resid} header borderthickness/padding differ from stock luna by {si.Top - bi.Top}px top, {si.Bottom - bi.Bottom}px bottom");
+            if (left == t.Left && top == t.Top && bottom == t.Bottom) return;
+            if (p.GetValue() is Margins cur && cur.Top == top && cur.Bottom == bottom && cur.Left == left && cur.Right == t.Right) return;
+            p.SetValue(new Margins(left, top, t.Right, bottom));
+            Changed(p, part, 0, "applied-shellstyle", $"{what} header title inset differs from stock luna by {si.Left - bi.Left}px left, {si.Top - bi.Top}px top, {si.Bottom - bi.Bottom}px bottom");
         }
 
-        private void ArrowStrip(int part, string resid, string[] frames)
+        /// <summary>
+        /// the arrow strip, 3 frames normal/hot/pressed, from the arrow element's content; collapse is the part shown
+        /// while the group is open (xp: the expando is selected), expand while it's closed. pressed = hot, as on xp.
+        /// </summary>
+        private void ArrowStrip(int part, bool main, bool open, string what)
         {
             var img = Find(part, 0, IDENTIFIER.IMAGEFILE);
             if (img == null) return;
             var src = new List<(byte[] Dib, Color? Key, bool AutoKey)>();
             bool stock = true;
-            foreach (var sel in frames)
+            foreach (bool hot in new[] { false, true, true })
             {
-                if (!XpShellStyle.ParseRcBmp(m_src.Get(resid, sel, "content"), out int id, out var key, out bool autoKey)) return;
-                XpShellStyle.ParseRcBmp(m_base.Get(resid, sel, "content"), out int bid, out _);
+                var v = Both(x => x.Arrow, main, "content", hot, open);
+                if (!XpShellStyle.ParseRcBmp(v.Src, out int id, out var key, out bool autoKey)) return;
+                XpShellStyle.ParseRcBmp(v.Stock, out int bid, out _);
                 var dib = m_src.GetBitmap(id);
-                if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {resid} arrow bitmap {id} is missing; template kept."); return; }
+                if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} arrow bitmap {id} is missing; template kept."); return; }
                 stock &= bid > 0 && SameBytes(dib, m_base.GetBitmap(bid));
                 src.Add((dib, key, autoKey));
             }
             if (stock)
             {
-                Restore(img, part, 0, IDENTIFIER.IMAGEFILE, resid + " arrows");
+                Restore(img, part, 0, IDENTIFIER.IMAGEFILE, what + " arrows");
                 var ic = Find(part, 0, IDENTIFIER.IMAGECOUNT);
-                if (ic != null) Restore(ic, part, 0, IDENTIFIER.IMAGECOUNT, resid + " arrows");
+                if (ic != null) Restore(ic, part, 0, IDENTIFIER.IMAGECOUNT, what + " arrows");
                 return;
             }
             // rcbmp(id): color key = the bitmap's top-left pixel (xp's classic arrows, magenta).
@@ -385,12 +576,12 @@ namespace libmsstyle.Import
             int w = pics[0].Width, h = pics[0].Height;
             if (pics.Any(p => p.Width != w || p.Height != h))
             {
-                m_imp.Report.Warnings.Add($"shellstyle: {resid} arrow bitmaps differ in size; template kept.");
+                m_imp.Report.Warnings.Add($"shellstyle: {what} arrow bitmaps differ in size; template kept.");
                 return;
             }
             var strip = new ArgbImage(w, h * pics.Count);
             for (int i = 0; i < pics.Count; ++i) strip.Blit(pics[i], 0, i * h);
-            PlaceImage(img, part, ImageIdentity.EncodePngVerified(strip), $"{resid} arrow bitmaps (normal, hot, pressed)");
+            PlaceImage(img, part, ImageIdentity.EncodePngVerified(strip), $"{what} arrow bitmaps (normal, hot, pressed)");
             var count = Find(part, 0, IDENTIFIER.IMAGECOUNT);
             if (count != null && !(count.GetValue() is int c && c == pics.Count)) { count.SetValue(pics.Count); Changed(count, part, 0, "applied-shellstyle", "frame count of the arrow strip"); }
         }

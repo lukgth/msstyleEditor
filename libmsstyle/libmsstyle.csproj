@@ -82,6 +82,7 @@
     <Compile Include="Import\UxthemeLoader.cs" />
     <Compile Include="Import\VariantMaps.cs" />
     <Compile Include="Import\VariantWriter.cs" />
+    <Compile Include="Import\DuiCascade.cs" />
     <Compile Include="Import\StockStyles.cs" />
     <Compile Include="Import\XpShellImport.cs" />
     <Compile Include="Import\XpShellStyle.cs" />

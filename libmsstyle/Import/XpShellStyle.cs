@@ -60,18 +60,38 @@ namespace libmsstyle.Import
             {
                 if (!m_rules.TryGetValue(style.Groups[1].Value, out var rules))
                     m_rules[style.Groups[1].Value] = rules = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+                if (!m_ruleLists.TryGetValue(style.Groups[1].Value, out var list))
+                    m_ruleLists[style.Groups[1].Value] = list = new List<DuiRule>();
                 foreach (Match rule in Regex.Matches(style.Groups[2].Value, @"([^{}]+)\{([^}]*)\}"))
                 {
                     string sel = NormalizeSelector(rule.Groups[1].Value);
                     if (!rules.TryGetValue(sel, out var props)) rules[sel] = props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    var decls = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     foreach (var decl in rule.Groups[2].Value.Split(';'))
                     {
                         int colon = decl.IndexOf(':');
                         if (colon <= 0) continue;
                         props[decl.Substring(0, colon).Trim()] = decl.Substring(colon + 1).Trim();
+                        decls[decl.Substring(0, colon).Trim()] = decl.Substring(colon + 1).Trim();
                     }
+                    var parsed = DuiRule.Parse(sel, decls, list.Count);
+                    if (parsed != null) list.Add(parsed);
                 }
             }
+        }
+
+        // resid -> rules in file order, for DirectUI's own lookup (see DuiRule).
+        private readonly Dictionary<string, List<DuiRule>> m_ruleLists = new Dictionary<string, List<DuiRule>>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>the rules of one stylesheet in file order; empty when the sheet isn't there.</summary>
+        public IReadOnlyList<DuiRule> Rules(string resid)
+            => m_ruleLists.TryGetValue(resid, out var l) ? l : (IReadOnlyList<DuiRule>)new DuiRule[0];
+
+        /// <summary>a stylesheet value with xp's system color names resolved (see the constructor), or as written.</summary>
+        public string MapSysColor(string v)
+        {
+            if (v != null && m_sysColors != null && m_sysColors.TryGetValue(v.Trim().ToLowerInvariant(), out var c)) return $"rgb({c.R},{c.G},{c.B})";
+            return v;
         }
 
         /// <summary>raw value text, or null when the stylesheet/selector/property isn't there.</summary>
@@ -79,27 +99,31 @@ namespace libmsstyle.Import
         {
             if (!(m_rules.TryGetValue(resid, out var rules) && rules.TryGetValue(NormalizeSelector(selector), out var props)
                 && props.TryGetValue(property, out var v))) return null;
-            if (m_sysColors != null && m_sysColors.TryGetValue(v.Trim().ToLowerInvariant(), out var c)) return $"rgb({c.R},{c.G},{c.B})";
-            return v;
-        }
-
-        /// <summary>
-        /// the first of <paramref name="selectors"/> that sets <paramref name="property"/>, the way DirectUI resolves
-        /// it for the element drawn: a child's own rule over its parent's (the header title inside its button), then
-        /// the plain class rule, then <c>element</c>, which every DUI class derives from. Lion OS X puts its header
-        /// text color on the title and its backgrounds on <c>element</c> only.
-        /// </summary>
-        public string GetFirst(string resid, string property, params string[] selectors)
-        {
-            foreach (var sel in selectors)
-            {
-                var v = Get(resid, sel, property);
-                if (v != null) return v;
-            }
-            return null;
+            return MapSysColor(v);
         }
 
         public byte[] GetBitmap(int id) => ResourceAccess.GetResource(m_module, "#2", (uint)id);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "LoadStringW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern int LoadString(IntPtr hInstance, uint uID, StringBuilder lpBuffer, int cchBufferMax);
+
+        /// <summary>the shellstyle's string resource <paramref name="id"/> (what DUI's rcstr/rcint read); null when absent.</summary>
+        public string ResString(int id)
+        {
+            var sb = new StringBuilder(512);
+            int n = LoadString(m_module, (uint)id, sb, sb.Capacity);
+            return n > 0 ? sb.ToString(0, n) : null;
+        }
+
+        /// <summary>gradient(c1, c2[, c3], mode): the mode (directui value.w FILLTYPE_HGradient 0, VGradient 1); -1 when not a gradient.</summary>
+        public static int GradientMode(string v)
+        {
+            if (v == null) return -1;
+            var g = Regex.Match(v, @"^gradient\s*\((.*)\)$", RegexOptions.IgnoreCase);
+            if (!g.Success) return -1;
+            var args = SplitArgs(g.Groups[1].Value);
+            return args.Count >= 3 && int.TryParse(args[args.Count - 1], out int m) ? m : -1;
+        }
 
         public IEnumerable<int> BitmapIds()
         {

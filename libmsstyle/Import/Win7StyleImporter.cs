@@ -1700,7 +1700,7 @@ namespace libmsstyle.Import
         /// uxtheme would reject (it fails the whole theme load on an unknown style word) and fonts
         /// without a face or a positive size, which would wreck the system metrics fonts.
         /// </summary>
-        private bool PlaceFont(string text, out int id, out string error)
+        internal bool PlaceFont(string text, out int id, out string error)
         {
             id = -1;
             error = null;

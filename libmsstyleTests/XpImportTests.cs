@@ -232,10 +232,11 @@ namespace libmsstyleTests
             Assert.AreEqual(2, bg.Count);
             Assert.IsTrue(bg.All(d => d.Result != null), string.Join("\n", bg.Select(d => $"{d.Property}: {d.Action}")));
             // measured against TangoLux on xp: the address box draws its combo image (Luna10's Combobox had no BGTYPE),
-            // the task pane padding is the shellstyle's 7rp, and headers lose stock luna's 2px top border.
+            // the task pane padding is the shellstyle's 7rp, and headers lose stock luna's 2px border (top and left:
+            // xp places the title at borderthickness + padding, TangoLux 0 + 10 against luna's 2 + 10).
             Assert.IsTrue(r.Decisions.Any(d => d.Class == "Combobox" && d.Part == "Common Properties" && d.State == 0 && d.Property == "BGTYPE" && d.Action == "added"));
             Assert.AreEqual("(l7,t7,r7,b7)", r.Decisions.Single(d => d.Class == "ExplorerBar" && d.Part == "Common Properties" && d.Property == "CONTENTMARGINS" && d.Action == "applied-shellstyle").Result);
-            Assert.AreEqual("(l12,t0,r3,b0)", r.Decisions.Single(d => d.Class == "ExplorerBar" && d.Part == "SPECIALGROUPHEAD" && d.Property == "CONTENTMARGINS" && d.Action == "applied-shellstyle").Result);
+            Assert.AreEqual("(l10,t0,r3,b0)", r.Decisions.Single(d => d.Class == "ExplorerBar" && d.Part == "SPECIALGROUPHEAD" && d.Property == "CONTENTMARGINS" && d.Action == "applied-shellstyle").Result);
         }
 
         [TestMethod]
