@@ -87,6 +87,7 @@
     <Compile Include="Import\XpShellImport.cs" />
     <Compile Include="Import\XpShellStyle.cs" />
     <Compile Include="Import\XpStripRemap.cs" />
+    <Compile Include="Import\XpThemeExtras.cs" />
     <Compile Include="Import\XpThemeFiles.cs" />
     <Compile Include="Import\XpThemeImport.cs" />
     <Compile Include="Margins.cs" />

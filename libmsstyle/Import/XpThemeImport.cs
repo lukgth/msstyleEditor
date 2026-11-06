@@ -167,6 +167,7 @@ namespace libmsstyle.Import
                 // machine they were made on ("C:\WINDOWS\xanadu.jpg"), so the file travels with the style and the
                 // generated .theme points at the copy. Resolved before the report is written, so the note lands in it.
                 XpThemeFiles.Desktop desktop = null;
+                XpThemeExtras extras = null;
                 string wallpaper = o.Wallpaper;
                 if (wallpaper == null)
                 {
@@ -187,6 +188,10 @@ namespace libmsstyle.Import
                         {
                             report.Warnings.Add($"desktop: {Path.GetFileName(desktop.ThemePath)} names wallpaper \"{desktop.Wallpaper}\" but that file isn't next to the style; using {XpThemeFiles.DefaultWallpaper}");
                         }
+                        // metrics, cursors, icons, screensaver, sounds: only what the pack shipped or this machine has.
+                        extras = XpThemeExtras.Read(desktop, Path.GetDirectoryName(Path.GetFullPath(o.SourcePath)), styleDir, name);
+                        report.Notes.AddRange(extras.Notes);
+                        report.Warnings.AddRange(extras.Warnings);
                     }
                 }
                 wallpaper = wallpaper ?? XpThemeFiles.DefaultWallpaper;
@@ -209,7 +214,7 @@ namespace libmsstyle.Import
                     written.Load(res.StylePath);
                     colors = XpThemeFiles.SysColors(written);
                 }
-                XpThemeFiles.WriteTheme(res.ThemePath, XpThemeFiles.BuildTheme(display, name, file, wallpaper, colors, scheme.InternalName, desktop));
+                XpThemeFiles.WriteTheme(res.ThemePath, XpThemeFiles.BuildTheme(display, name, file, wallpaper, colors, scheme.InternalName, desktop, extras));
             }
             if (o.Write) try { Directory.Delete(Path.Combine(outDir, ".work"), true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
             return results;
