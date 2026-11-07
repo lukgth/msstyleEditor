@@ -532,6 +532,8 @@ namespace libmsstyle.Import
             if (m_source.Platform == Platform.WinXP) TransparentForTrueAlpha();
             if (m_source.Platform == Platform.WinXP) SizingTypeFromXp();
             if (m_source.Platform == Platform.WinXP) DropGlyphlessXpButtonDpi();
+            if (m_source.Platform == Platform.WinXP) CompositeXpComboButton();
+            if (m_source.Platform == Platform.WinXP) DropXpComboPlate();
             if (m_source.Platform == Platform.WinXP) FrameXpCombo();
             if (m_source.Platform == Platform.WinXP) FitXpStartPanel();
         }
@@ -665,14 +667,142 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
+        /// xp only. xp's Combobox|DROPDOWNBUTTON is two pictures: IMAGEFILE is the 21x22-per-state button
+        /// face (a vertical strip) and GLYPHIMAGEFILE is the 10x7-per-state arrow; xp composites them when it
+        /// draws. win10 has one picture and picks it from the dpi set (IMAGEFILE1-7), which the merge
+        /// filled with the arrow alone - so the dropdown drew the arrow strip stretched across the whole
+        /// button (the "detached grey square" in the control preview and the address bar). Copying the
+        /// arrow onto the face per state and pointing both IMAGEFILE and IMAGEFILE1-7 at the composite
+        /// gives win10 the picture xp drew.
+        /// </summary>
+        private void CompositeXpComboButton()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
+                || !m_source.ClassesByName.TryGetValue("Combobox", out var sc)) return;
+            var srcNames = SemanticModel.PartNames(sc.ClassName, Platform.WinXP);
+            var tgtNames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            var slots = new[] { IDENTIFIER.IMAGEFILE, IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3,
+                                IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5, IDENTIFIER.IMAGEFILE6, IDENTIFIER.IMAGEFILE7 };
+
+            foreach (var tp in tc.Parts.Values)
+            {
+                if (!tgtNames.TryGetValue(tp.PartId, out string partName)) continue;
+                if (!string.Equals(partName, "DROPDOWNBUTTON", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(partName, "DROPDOWNBUTTONRIGHT", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(partName, "DROPDOWNBUTTONLEFT", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!tp.States.TryGetValue(0, out var first)) continue;
+
+                int spid = -1;
+                foreach (var kv in srcNames) if (string.Equals(kv.Value, partName, StringComparison.OrdinalIgnoreCase)) { spid = kv.Key; break; }
+                if (spid < 0 || !sc.Parts.TryGetValue(spid, out var sp) || !sp.States.TryGetValue(0, out var ss)) continue;
+
+                var picProp = SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.IMAGEFILE);
+                var glyphProp = SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.GLYPHIMAGEFILE);
+                if (picProp == null || glyphProp == null) continue;
+                if (!(picProp.GetValue() is int picId) || !(glyphProp.GetValue() is int glyphId)) continue;
+
+                var picture = Decoded(m_source, "IMAGE", picId & 0xFFFF);
+                var glyph = Decoded(m_source, "IMAGE", glyphId & 0xFFFF);
+                if (picture == null || glyph == null) continue;
+
+                int count = 1;
+                if (SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.IMAGECOUNT)?.GetValue() is int c && c > 0) count = c;
+                int fw = picture.Width, fh = picture.Height;
+                bool picVertical = count > 1 && picture.Height % count == 0;
+                if (picVertical) fh = picture.Height / count;
+                else if (count > 1 && picture.Width % count == 0) fw = picture.Width / count;
+                if (fw <= 0 || fh <= 0) continue;
+
+                int gw = glyph.Width, gh = glyph.Height;
+                bool glyphVertical = count > 1 && glyph.Height % count == 0;
+                if (glyphVertical) gh = glyph.Height / count;
+                else if (count > 1 && glyph.Width % count == 0) gw = glyph.Width / count;
+                if (gw > fw || gh > fh) continue;
+
+                var composite = new ArgbImage(picture.Width, picture.Height);
+                bool any = false;
+                for (int i = 0; i < count; ++i)
+                {
+                    int sx = picVertical ? 0 : i * fw;
+                    int sy = picVertical ? i * fh : 0;
+                    if (sx + fw > picture.Width || sy + fh > picture.Height) continue;
+                    var frame = picture.Crop(new Rectangle(sx, sy, fw, fh));
+                    int gx = glyphVertical ? 0 : i * gw;
+                    int gy = glyphVertical ? i * gh : 0;
+                    if (gx + gw <= glyph.Width && gy + gh <= glyph.Height)
+                        frame.BlendOver(glyph.Crop(new Rectangle(gx, gy, gw, gh)), (fw - gw) / 2, (fh - gh) / 2);
+                    composite.Blit(frame, sx, sy);
+                    any = true;
+                }
+                if (!any) continue;
+
+                var png = ImageIdentity.EncodePngVerified(composite);
+                int newId = PlaceResource("IMAGE", picId, png, ImageIdentity.Analyze(png));
+                foreach (var ident in slots)
+                {
+                    var prop = first.Properties.FirstOrDefault(p => p.Header.nameID == (int)ident && p.Header.typeID == (int)IDENTIFIER.FILENAME);
+                    if (prop == null) continue;
+                    if (prop.GetValue() is int cur && cur == newId) continue;
+                    prop.SetValue(newId);
+                    MarkTouched(prop, $"{tc.ClassName}|{partName}|S0|{ident}");
+                }
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName, Part = partName, State = 0, Property = "IMAGEFILE",
+                    Action = "composited-xp-combo-button",
+                    Reason = "xp draws the button face (IMAGEFILE) under a separate arrow (GLYPHIMAGEFILE); win10 draws one picture from the dpi set, which held the arrow alone stretched across the button",
+                    Result = newId.ToString(),
+                });
+                m_report.Count("composited-xp-combo-button");
+            }
+        }
+
+
+        /// <summary>
+        /// xp only. Combobox|0 carries the 42x21 combo plate as a picture behind the whole combo. win10
+        /// paints that part too, but its layout/stretch puts the plate's gradient rows inside the frame,
+        /// above the edit child - visible as a fuzzy blue band over the text field (xp shows only the
+        /// plate's 1px edge there because it composes the picture differently). The plate's edge colour is
+        /// already on the border fills (see <see cref="FrameXpCombo"/>), so the picture does not travel:
+        /// the field is the border fill, the button is the composited picture.
+        /// </summary>
+        private void DropXpComboPlate()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")) return;
+            if (!tc.Parts.TryGetValue(0, out var p)) return;
+            var drop = new[] { IDENTIFIER.IMAGEFILE, IDENTIFIER.BGTYPE, IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.SIZINGTYPE };
+            foreach (var st in p.States.Values)
+            {
+                for (int i = st.Properties.Count - 1; i >= 0; --i)
+                {
+                    var prop = st.Properties[i];
+                    if (!drop.Any(d => (int)d == prop.Header.nameID)) continue;
+                    string partName = "Common Properties";
+                    m_report.Decisions.Add(new MergeDecision
+                    {
+                        Class = tc.ClassName, Part = partName, State = st.StateId,
+                        Property = SemanticModel.PropertyName(prop.Header.nameID),
+                        Action = "dropped-xp-combo-plate",
+                        Reason = "win10 paints this picture over the whole combo and its gradient rows land above the edit; part 4/5 carry the edge and fill the metadata is for",
+                        Result = "NONE",
+                    });
+                    RemovedRecords.Add($"{tc.ClassId}/0/{st.StateId}/{prop.Header.nameID}/{prop.Header.typeID}");
+                    st.Properties.RemoveAt(i);
+                    m_report.Count("dropped-xp-combo-plate");
+                }
+            }
+        }
+
+        /// <summary>
         /// xp only. xp paints the combo frame from Combobox|0 as a nine-slice picture (Elfin2's 12x25
-        /// plate: a 193 grey edge around a 206 face). win10 draws the frame from Combobox|4 BORDER as a
-        /// border fill and reads the fill from the class colors, so that plate is never drawn and the
-        /// source's *fallback* colors - the pair xp uses only when no plate is set (Elfin2: 0,0,0 edge
-        /// and 140,140,140 face) - painted a black box with a dark grey face on the address bar. The
-        /// plate's edge and face colors go onto the colors win10 reads. A theme whose Combobox|0 is
-        /// already a BORDERFILL (stock Luna's blue edge on white) carries its colors directly and is
-        /// left alone.
+        /// plate: a 193 grey edge around a 206 face). win10 draws the frame from Combobox|4/5 BORDER as a
+        /// border fill, so that plate is never drawn and the source's *fallback* colors - the pair xp uses
+        /// only when no plate is set (Elfin2: 0,0,0 edge and 140,140,140 face) - painted a black box with a
+        /// dark grey face on the address bar. The plate's darkest edge goes onto BORDERCOLOR and the fill
+        /// follows xp's own layering: white on part 4 (the edit covers it, but the pixels the edit doesn't
+        /// reach are white in xp, not the plate) and the plate face on part 5 for a closed drop-down list.
+        /// A theme whose Combobox|0 is already a BORDERFILL (stock Luna's blue edge on white) carries its
+        /// colors directly and is left alone.
         /// </summary>
         private void FrameXpCombo()
         {
@@ -683,25 +813,45 @@ namespace libmsstyle.Import
             if (img == null || !(img.GetValue() is int id)) return;
             var plate = Decoded(m_source, "IMAGE", id & 0xFFFF);
             if (plate == null || plate.Width < 3 || plate.Height < 3) return;
-            Margins margins = null;
-            if (SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins sm) margins = sm;
 
-            uint edgePixel = plate.Pixels[0];
-            int ix = margins != null && margins.Left > 0 ? Math.Min(margins.Left, plate.Width - 1) : plate.Width / 2;
-            int iy = margins != null && margins.Top > 0 ? Math.Min(margins.Top, plate.Height - 1) : plate.Height / 2;
-            uint facePixel = plate.Pixels[iy * plate.Width + ix];
-            if ((edgePixel >> 24) != 0xFF || (facePixel >> 24) != 0xFF) return;
+            // The corner pixel is the plate's anti-aliased outside; win10 paints the frame as one
+            // 1px BORDERCOLOR line, so take the darkest pixel of the outer ring (MSN: the 144,162,206
+            // bottom line) - the corner's 227,233,246 is invisible against the band.
+            uint edgePixel = 0;
+            int edgeLum = int.MaxValue;
+            void ConsiderPixel(int x, int y)
+            {
+                uint px = plate.Pixels[y * plate.Width + x];
+                if ((px >> 24) != 0xFF) return;
+                int lum = (int)(((px >> 16) & 0xFF) * 30 + ((px >> 8) & 0xFF) * 59 + (px & 0xFF) * 11) / 100;
+                if (lum < edgeLum) { edgeLum = lum; edgePixel = px; }
+            }
+            for (int x = 0; x < plate.Width; ++x) { ConsiderPixel(x, 0); ConsiderPixel(x, plate.Height - 1); }
+            for (int y = 0; y < plate.Height; ++y) { ConsiderPixel(0, y); ConsiderPixel(plate.Width - 1, y); }
+            if ((edgePixel >> 24) != 0xFF) return;
             var edge = Color.FromArgb((int)((edgePixel >> 16) & 0xFF), (int)((edgePixel >> 8) & 0xFF), (int)(edgePixel & 0xFF));
-            var face = Color.FromArgb((int)((facePixel >> 16) & 0xFF), (int)((facePixel >> 8) & 0xFF), (int)(facePixel & 0xFF));
 
             var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            Margins margins = null;
+            if (SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins sm) margins = sm;
+            int fix = margins != null && margins.Left > 0 ? Math.Min(margins.Left, plate.Width - 1) : plate.Width / 2;
+            int fiy = margins != null && margins.Top > 0 ? Math.Min(margins.Top, plate.Height - 1) : plate.Height / 2;
+            uint facePixel = plate.Pixels[fiy * plate.Width + fix];
+            var face = (facePixel >> 24) == 0xFF
+                ? Color.FromArgb((int)((facePixel >> 16) & 0xFF), (int)((facePixel >> 8) & 0xFF), (int)(facePixel & 0xFF))
+                : Color.FromArgb(210, 217, 240);
             foreach (int partId in new[] { 0, 4, 5 })
             {
                 if (!tc.Parts.TryGetValue(partId, out var part)) continue;
                 string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
+                // xp fills the editable combo white (the edit covers it) and the readonly one with the
+                // plate's pale face; win10's border fill paints the same colour when the edit is absent.
+                var pairs = partId == 4 ? new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, Color.White) }
+                          : partId == 5 ? new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, face) }
+                          : new[] { (IDENTIFIER.BORDERCOLOR, edge) };
                 foreach (var st in part.States.Values)
                 {
-                    foreach (var (ident, color) in new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, face) })
+                    foreach (var (ident, color) in pairs)
                     {
                         if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, ident.ToString())) continue;
                         var prop = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)ident && p.Header.typeID == (int)IDENTIFIER.COLOR);
@@ -726,6 +876,39 @@ namespace libmsstyle.Import
                         });
                         m_report.Count("applied-xp-combo-colors");
                     }
+                }
+            }
+
+            // xp's Combobox|0 comes from the plate's metadata with BORDERSIZE 0 (the picture draws the
+            // edge); win10's template keeps 1 on part 0 and part 4, and ComboBoxEx (the address bar) draws
+            // its frame from part 0 - at 0 the edit child covers the 1px line and the field looks borderless.
+            foreach (int partId in new[] { 0, 4 })
+            {
+                if (!tc.Parts.TryGetValue(partId, out var part)) continue;
+                string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
+                foreach (var st in part.States.Values)
+                {
+                    var prop = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.BORDERSIZE && p.Header.typeID == (int)IDENTIFIER.INT);
+                    if (prop == null)
+                    {
+                        prop = new StyleProperty(new PropertyHeader((int)IDENTIFIER.BORDERSIZE, (int)IDENTIFIER.INT) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
+                        st.Properties.Add(prop);
+                        AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)IDENTIFIER.BORDERSIZE}/{(int)IDENTIFIER.INT}");
+                    }
+                    if (prop.GetValue() is int bs && bs == 1) continue;
+                    prop.SetValue(1);
+                    MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{IDENTIFIER.BORDERSIZE}");
+                    m_report.Decisions.Add(new MergeDecision
+                    {
+                        Class = tc.ClassName,
+                        Part = partName,
+                        State = st.StateId,
+                        Property = IDENTIFIER.BORDERSIZE.ToString(),
+                        Action = "applied-xp-combo-border",
+                        Reason = "xp draws the edge in the common picture, so the source's BORDERSIZE is 0; win10 draws the 1px frame from it and 0 makes the field look borderless",
+                        Result = "1",
+                    });
+                    m_report.Count("applied-xp-combo-border");
                 }
             }
         }

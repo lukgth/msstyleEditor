@@ -122,6 +122,13 @@ namespace libmsstyle.Import
                             map = donorMap;
                             m_report.Notes.Add($"{label}: template redrew this strip; it takes part {mapDonors[donorKey]}'s frame map, the part it is drawn on.");
                         }
+                        if (map == null && sc != null && IsGripper(bc.ClassName, bp.PartId)
+                            && RefitOwnFrames(m_source, sc, bp.PartId, bs.StateId, tg, tc, out var refit))
+                        {
+                            m_report.Notes.Add($"{label}: template re-cut the strip from {bg} to {tg} frames with art that isn't stock xp; the source's own {refit} gripper frames are repeated into the template's {tg} cut so the merge carries them.");
+                            m_report.Count("xp-strip-refit");
+                            continue;
+                        }
                         if (map == null)
                         {
                             m_report.Notes.Add($"{label}: template re-cut the strip from {bg} to {tg} frames with art that isn't stock xp; the template's strip stays.");
@@ -164,6 +171,52 @@ namespace libmsstyle.Import
                     }
                 }
             }
+        }
+
+        /// <summary>the strips xp cuts into its own states and win10 re-cut into another count where no stock map
+        /// exists: the status bar's size grip (xp: 2 frames, the win10/Luna10 template: 8).</summary>
+        private static bool IsGripper(string className, int part) =>
+            string.Equals(className, "Status", StringComparison.OrdinalIgnoreCase) && part == 3;
+
+        /// <summary>
+        /// Rebuilds the source's gripper strip in the template's cut: the source's own frames (xp's normal/pressed
+        /// grip art) are scaled to the template's frame size and repeated across the template's frame count and
+        /// orientation. The merge then sees a source picture that splits the template's way and carries it into
+        /// every dpi slot (the template's own gripper art is redrawn, so it can't be mapped by pixels).
+        /// </summary>
+        private bool RefitOwnFrames(VisualStyle srcStyle, StyleClass sc, int part, int state, Geometry tg, StyleClass tc, out string sourceCut)
+        {
+            sourceCut = null;
+            if (sc == null || !sc.Parts.TryGetValue(part, out var sp) || !sp.States.TryGetValue(state, out var ss)) return false;
+            var img = ss.Properties.FirstOrDefault(p => StripIds.Contains(p.Header.nameID));
+            var pic = img == null ? null : Decode(srcStyle, img);
+            if (pic == null) return false;
+            var sg = GeometryOf(srcStyle, sc, part, state);
+            int fw = sg.Horizontal ? pic.Width / Math.Max(1, sg.Count) : pic.Width;
+            int fh = sg.Horizontal ? pic.Height : pic.Height / Math.Max(1, sg.Count);
+            if (fw <= 0 || fh <= 0) return false;
+            sourceCut = $"{sg.Count} {(sg.Horizontal ? "horizontal" : "vertical")}";
+
+            var timg = tc.Parts.TryGetValue(part, out var tp) && tp.States.TryGetValue(state, out var ts)
+                ? ts.Properties.FirstOrDefault(p => StripIds.Contains(p.Header.nameID)) : null;
+            var tpic = timg == null ? null : Decode(m_target, timg);
+            if (tpic == null) return false;
+            var tframes = Frames(tpic, tg);
+            if (tframes.Length == 0) return false;
+            int tw = tframes[0].Width, th = tframes[0].Height;
+
+            var frames = new ArgbImage[sg.Count];
+            for (int i = 0; i < sg.Count; ++i)
+                frames[i] = pic.Crop(new Rectangle(sg.Horizontal ? i * fw : 0, sg.Horizontal ? 0 : i * fh, fw, fh));
+            var outImg = tg.Horizontal ? new ArgbImage(tw * tg.Count, th) : new ArgbImage(tw, th * tg.Count);
+            for (int j = 0; j < tg.Count; ++j)
+            {
+                var f = frames[j % frames.Length];
+                if (f.Width != tw || f.Height != th) f = Scale(f, tw, th);
+                outImg.Blit(f, tg.Horizontal ? j * tw : 0, tg.Horizontal ? 0 : j * th);
+            }
+            img.SetValue(srcStyle.AddXpImage(ImageIdentity.EncodePngVerified(outImg)));
+            return true;
         }
 
         private static List<StyleProperty> WithGlyph(StyleState state, List<StyleProperty> images)

@@ -60,6 +60,34 @@ namespace libmsstyle.Import
                 Array.Copy(src.Pixels, row * src.Width, Pixels, (y + row) * Width + x, src.Width);
         }
 
+        /// <summary>
+        /// Straight-alpha source over the destination. Blit copies raw pixels, which punches a hole in
+        /// the destination wherever the source is transparent (a glyph drawn onto its button face).
+        /// </summary>
+        public void BlendOver(ArgbImage src, int x, int y)
+        {
+            if (x < 0 || y < 0 || x + src.Width > Width || y + src.Height > Height)
+                throw new ArgumentOutOfRangeException(nameof(src), "blend target is outside the image");
+            for (int row = 0; row < src.Height; ++row)
+            {
+                for (int col = 0; col < src.Width; ++col)
+                {
+                    uint s = src.Pixels[row * src.Width + col];
+                    int sa = (int)(s >> 24);
+                    if (sa == 0) continue;
+                    int di = (y + row) * Width + x + col;
+                    uint d = Pixels[di];
+                    if (sa == 255) { Pixels[di] = s; continue; }
+                    int da = (int)(d >> 24);
+                    int r = ((int)((s >> 16) & 0xFF) * sa + (int)((d >> 16) & 0xFF) * da * (255 - sa) / 255) / 255;
+                    int g = ((int)((s >> 8) & 0xFF) * sa + (int)((d >> 8) & 0xFF) * da * (255 - sa) / 255) / 255;
+                    int b = ((int)(s & 0xFF) * sa + (int)(d & 0xFF) * da * (255 - sa) / 255) / 255;
+                    int a = sa + da * (255 - sa) / 255;
+                    Pixels[di] = ((uint)a << 24) | ((uint)r << 16) | ((uint)g << 8) | (uint)b;
+                }
+            }
+        }
+
         public bool RegionEquals(Rectangle r, ArgbImage other, Rectangle o)
         {
             if (r.Width != o.Width || r.Height != o.Height) return false;
