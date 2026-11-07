@@ -910,6 +910,9 @@ namespace libmsstyle.Import
 
         private static bool SameBytes(byte[] a, byte[] b) => a != null && b != null && a.SequenceEqual(b);
 
+        /// <summary>bitmap ids an xp shellstyle and a win10 shellstyle share (see <see cref="PatchShellStyleBitmaps"/>).</summary>
+        private static bool IsSharedBitmapId(int id) => (id >= 10 && id <= 25) || (id >= 100 && id <= 112);
+
         /// <summary>
         /// The win10 shellstyle keeps xp's RT_BITMAP ids (folder watermarks 10-25, task pane art
         /// 100-112) for whoever still loads them (xp appwiz, shell32's legacy paths). Each id both
@@ -923,6 +926,12 @@ namespace libmsstyle.Import
             foreach (int id in source.BitmapIds().Distinct())
             {
                 if (!present.Contains(id)) continue;
+                // only the ids win10's shellstyle keeps from xp: the folder watermarks (10-25) and the task pane art
+                // (100-112). Any other number that both files happen to use is the win10 shellstyle's own graphic; its
+                // UIFILE references them directly (e.g. graphic(121,2,-1,0,0,0,0)), and swapping in the xp picture of
+                // the same number (SevenVG's 200x551 task pane background for an 11x8 win10 glyph) makes Explorer fail
+                // to parse the shellstyle at window creation (DUIXMLParserFailure, "Unable to load graphics").
+                if (!IsSharedBitmapId(id)) continue;
                 var s = source.GetBitmap(id);
                 if (s == null || SameBytes(s, stock.GetBitmap(id))) continue;
                 replace[id] = s;

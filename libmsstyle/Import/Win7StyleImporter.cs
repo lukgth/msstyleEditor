@@ -526,6 +526,9 @@ namespace libmsstyle.Import
             if (m_source.Platform == Platform.WinXP) MenuColorsFromXp();
             if (m_source.Platform == Platform.WinXP) TransparentForTrueAlpha();
             if (m_source.Platform == Platform.WinXP) SizingTypeFromXp();
+            if (m_source.Platform == Platform.WinXP) DropGlyphlessXpButtonDpi();
+            if (m_source.Platform == Platform.WinXP) FrameXpCombo();
+            if (m_source.Platform == Platform.WinXP) FitXpStartPanel();
         }
 
         /// <summary>
@@ -552,6 +555,17 @@ namespace libmsstyle.Import
                     int? spid = null;
                     foreach (var kv in snames)
                         if (string.Equals(kv.Value, partName, StringComparison.OrdinalIgnoreCase)) { spid = kv.Key; break; }
+                    // win10 mirrors a few button parts for right-to-left (Combobox DROPDOWNBUTTONRIGHT/LEFT); xp has
+                    // the one part, and a style needn't declare the mirrored ids, so a part the source lacks falls
+                    // back to the name it mirrors.
+                    if ((spid == null || !sc.Parts.ContainsKey(spid.Value))
+                        && (partName.EndsWith("RIGHT", StringComparison.Ordinal) || partName.EndsWith("LEFT", StringComparison.Ordinal)))
+                    {
+                        string stem = partName.Substring(0, partName.Length - (partName.EndsWith("RIGHT", StringComparison.Ordinal) ? 5 : 4));
+                        foreach (var kv in snames)
+                            if (string.Equals(kv.Value, stem, StringComparison.OrdinalIgnoreCase) && sc.Parts.ContainsKey(kv.Key))
+                            { spid = kv.Key; break; }
+                    }
                     if (spid == null) continue;
 
                     if (!sc.Parts.TryGetValue(spid.Value, out var spart)) continue;
@@ -586,6 +600,209 @@ namespace libmsstyle.Import
                         m_report.Count("applied-xp-sizingtype");
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// xp only. win10 draws the combo button two ways: from a dpi-selected glyph set (IMAGEFILE1-7,
+        /// picked by IMAGESELECTTYPE; Luna10's arrow works that way, the button plate in IMAGEFILE and
+        /// the arrow in GLYPHIMAGEFILE), or from the single IMAGEFILE picture. Elfin2's xp button is one
+        /// 10x10 arrow per state drawn TRUESIZE, with an empty GLYPHIMAGEFILE. The port copied that
+        /// picture into the win10 button parts (the address bar reads DROPDOWNBUTTONRIGHT) but left the
+        /// template's dpi selection on, so uxtheme re-cut the arrow strip as a dpi glyph: a broken arrow
+        /// almost twice xp's size. A source part without a glyph of its own that already draws the
+        /// source's picture turns the dpi selection off, so uxtheme draws the picture with the source's
+        /// SIZINGTYPE/IMAGELAYOUT/IMAGECOUNT (SizingTypeFromXp covers the sizing type).
+        /// </summary>
+        private void DropGlyphlessXpButtonDpi()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
+                || !m_source.ClassesByName.TryGetValue("Combobox", out var sc)) return;
+            int spid = -1;
+            foreach (var kv in SemanticModel.PartNames(sc.ClassName, Platform.WinXP))
+                if (string.Equals(kv.Value, "DROPDOWNBUTTON", StringComparison.OrdinalIgnoreCase)) { spid = kv.Key; break; }
+            if (spid < 0) return;
+            var glyph = SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.GLYPHIMAGEFILE);
+            if (glyph != null)
+            {
+                // a real glyph: the template's dpi glyph set is how win10 draws it (FillDpiSlots feeds it).
+                var glyphImage = Decoded(m_source, "IMAGE", glyph.Header.shortFlag & 0xFFFF);
+                if (glyphImage != null && glyphImage.Pixels.Any(px => (px >> 24) != 0)) return;
+            }
+
+            var imageCache = new Dictionary<int, ImageInfo>();
+            var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            foreach (var tp in tc.Parts.Values)
+            {
+                if (!tnames.TryGetValue(tp.PartId, out string partName)) continue;
+                if (!string.Equals(partName, "DROPDOWNBUTTON", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(partName, "DROPDOWNBUTTONRIGHT", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(partName, "DROPDOWNBUTTONLEFT", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!tp.States.TryGetValue(0, out var st)) continue;
+                var select = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.IMAGESELECTTYPE && p.Header.typeID == (int)IDENTIFIER.ENUM);
+                if (select == null || !(select.GetValue() is int current) || current == (int)0) continue;
+                if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, "IMAGESELECTTYPE")) continue;
+                if (!PicturesFromSource(sc, tc, spid, tp.PartId, 0, imageCache)) continue;
+                select.SetValue((int)0);
+                MarkTouched(select, $"{tc.ClassName}|{partName}|S{st.StateId}|IMAGESELECTTYPE");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName,
+                    Part = partName,
+                    State = st.StateId,
+                    Property = "IMAGESELECTTYPE",
+                    Action = "dropped-xp-button-dpi",
+                    Reason = "the source's button is one picture with no glyph of its own and this part draws that picture; win10's dpi selection would cut it out of the template's glyph set instead",
+                    Result = "NONE",
+                });
+                m_report.Count("dropped-xp-button-dpi");
+            }
+        }
+
+        /// <summary>
+        /// xp only. xp paints the combo frame from Combobox|0 as a nine-slice picture (Elfin2's 12x25
+        /// plate: a 193 grey edge around a 206 face). win10 draws the frame from Combobox|4 BORDER as a
+        /// border fill and reads the fill from the class colors, so that plate is never drawn and the
+        /// source's *fallback* colors - the pair xp uses only when no plate is set (Elfin2: 0,0,0 edge
+        /// and 140,140,140 face) - painted a black box with a dark grey face on the address bar. The
+        /// plate's edge and face colors go onto the colors win10 reads. A theme whose Combobox|0 is
+        /// already a BORDERFILL (stock Luna's blue edge on white) carries its colors directly and is
+        /// left alone.
+        /// </summary>
+        private void FrameXpCombo()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
+                || !m_source.ClassesByName.TryGetValue("Combobox", out var sc)) return;
+            if (!(SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.BGTYPE)?.GetValue() is int bg) || bg != (int)0) return;
+            var img = SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.IMAGEFILE);
+            if (img == null || !(img.GetValue() is int id)) return;
+            var plate = Decoded(m_source, "IMAGE", id & 0xFFFF);
+            if (plate == null || plate.Width < 3 || plate.Height < 3) return;
+            Margins margins = null;
+            if (SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins sm) margins = sm;
+
+            uint edgePixel = plate.Pixels[0];
+            int ix = margins != null && margins.Left > 0 ? Math.Min(margins.Left, plate.Width - 1) : plate.Width / 2;
+            int iy = margins != null && margins.Top > 0 ? Math.Min(margins.Top, plate.Height - 1) : plate.Height / 2;
+            uint facePixel = plate.Pixels[iy * plate.Width + ix];
+            if ((edgePixel >> 24) != 0xFF || (facePixel >> 24) != 0xFF) return;
+            var edge = Color.FromArgb((int)((edgePixel >> 16) & 0xFF), (int)((edgePixel >> 8) & 0xFF), (int)(edgePixel & 0xFF));
+            var face = Color.FromArgb((int)((facePixel >> 16) & 0xFF), (int)((facePixel >> 8) & 0xFF), (int)(facePixel & 0xFF));
+
+            var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            foreach (int partId in new[] { 0, 4, 5 })
+            {
+                if (!tc.Parts.TryGetValue(partId, out var part)) continue;
+                string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
+                foreach (var st in part.States.Values)
+                {
+                    foreach (var (ident, color) in new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, face) })
+                    {
+                        if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, ident.ToString())) continue;
+                        var prop = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)ident && p.Header.typeID == (int)IDENTIFIER.COLOR);
+                        if (prop != null && prop.GetValue() is Color same && same.R == color.R && same.G == color.G && same.B == color.B) continue;
+                        if (prop == null)
+                        {
+                            prop = new StyleProperty(new PropertyHeader((int)ident, (int)IDENTIFIER.COLOR) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
+                            st.Properties.Add(prop);
+                            AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)ident}/{(int)IDENTIFIER.COLOR}");
+                        }
+                        prop.SetValue(color);
+                        MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{ident}");
+                        m_report.Decisions.Add(new MergeDecision
+                        {
+                            Class = tc.ClassName,
+                            Part = partName,
+                            State = st.StateId,
+                            Property = ident.ToString(),
+                            Action = "applied-xp-combo-colors",
+                            Reason = "xp draws the combo frame from the Combobox common picture; win10 draws it as a border fill from these colors, so they were sampled off the source's picture instead of using the source's no-picture fallback colors",
+                            Result = $"{color.R},{color.G},{color.B}",
+                        });
+                        m_report.Count("applied-xp-combo-colors");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// xp only. ExplorerEx builds the classic start panel straight from the theme's StartPanel records:
+        /// part 1 DEFAULTPANESIZE is the panel width, the other panes' DEFAULTPANESIZE must tile inside it,
+        /// and part 6 (PLACELIST) CONTENTMARGINS place the places listview inside its pane (windows clip
+        /// children to the parent, so a negative left moves the listview's contents under the clip).
+        /// SevenVG declares panel 375, logoff 406x37, a pane starting at top -30 and places left -38: the
+        /// logoff buttons ran 31px past the panel edge and "My Computer"/"Control Panel"/"Run..." lost their
+        /// first letters. Templates derived from Luna fit (panel 380, user pane 190, logoff 190x37, places left
+        /// 4), so only the misfit is trimmed.
+        /// The places listview puts its item text 30px right of its origin and draws the leading shell icon in
+        /// the 26px before it, so a negative offset between 0 and -28 leaves a cut-off icon and one below -28
+        /// cuts the labels. -28 is the offset that hides the icon without touching the text, which is what the
+        /// negative margin asks for: the theme paints a window-7 style sidebar with plain labels, and at 0 the
+        /// 130px column wraps "My Computer".
+        /// </summary>
+        private void FitXpStartPanel()
+        {
+            if (!m_target.ClassesByName.TryGetValue("StartPanel", out var tc)) return;
+            if (m_target.DuplicateClassNames.Contains("StartPanel")) return;
+
+            (StyleProperty Prop, int State) Find(int partId, IDENTIFIER id)
+            {
+                if (!tc.Parts.TryGetValue(partId, out var part)) return (null, 0);
+                foreach (var st in part.States.Values)
+                    foreach (var p in st.Properties)
+                        if (p.Header.nameID == (int)id) return (p, st.StateId);
+                return (null, 0);
+            }
+
+            var (userPane, _) = Find(1, IDENTIFIER.DEFAULTPANESIZE);
+            if (!(userPane?.GetValue() is Margins up) || up.Right <= 0) return;
+            int panelWidth = up.Right;
+            var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+
+            for (int partId = 0; partId <= 8; partId++)
+            {
+                var (prop, stateId) = Find(partId, IDENTIFIER.DEFAULTPANESIZE);
+                if (prop == null || !(prop.GetValue() is Margins m)) continue;
+                bool width = m.Right > panelWidth, edge = m.Left < 0 || m.Top < 0;
+                if (!width && !edge) continue;
+
+                string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
+                m.Left = Math.Max(0, m.Left);
+                m.Top = Math.Max(0, m.Top);
+                m.Right = Math.Min(m.Right, panelWidth);
+                prop.SetValue(m);
+                MarkTouched(prop, $"{tc.ClassName}|{partName}|S{stateId}|DEFAULTPANESIZE");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName,
+                    Part = partName,
+                    State = stateId,
+                    Property = "DEFAULTPANESIZE",
+                    Action = "fitted-xp-startpanel",
+                    Reason = "xp's shell lays every start panel pane out inside the panel width; the source's pane would overflow or start outside its host, so it is clipped by the shell",
+                    Result = $"{m.Left},{m.Top},{m.Right},{m.Bottom}",
+                });
+                m_report.Count("fitted-xp-startpanel");
+            }
+
+            var (places, placesState) = Find(6, IDENTIFIER.CONTENTMARGINS);
+            if (places?.GetValue() is Margins pm && pm.Left < 0)
+            {
+                string partName = tnames.TryGetValue(6, out var n) ? n : "PLACELIST";
+                pm.Left = -28;
+                places.SetValue(pm);
+                MarkTouched(places, $"{tc.ClassName}|{partName}|S{placesState}|CONTENTMARGINS");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName,
+                    Part = partName,
+                    State = placesState,
+                    Property = "CONTENTMARGINS",
+                    Action = "fitted-xp-startpanel",
+                    Reason = "the source hides the places icons by pulling the listview left; a smaller pull leaves a cut-off icon in front of every label and a larger one cuts the labels themselves, and -28 is the only offset that does neither",
+                    Result = $"{pm.Left},{pm.Top},{pm.Right},{pm.Bottom}",
+                });
+                m_report.Count("fitted-xp-startpanel");
             }
         }
 
