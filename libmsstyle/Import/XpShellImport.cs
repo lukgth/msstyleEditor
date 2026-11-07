@@ -97,6 +97,9 @@ namespace libmsstyle.Import
                 SetColor(Background, 0, IDENTIFIER.GRADIENTCOLOR2, stock ? (Color?)null : sFill[sFill.Length - 1], "task pane background (end)");
             }
 
+            // xp's folder watermark: the sectionlist's content picture (the theme's mark at the pane's bottom).
+            PaneWatermark();
+
             // task pane padding: xp's sectionlist padding is the win10 UIFILE's gtmar(ExplorerBar, 0, 0, 3602)
             // (ExplorerBarBackground padding); stock luna's 12rp on every side equals the Luna port's record.
             var pad = Both(x => x.Pane, false, "padding");
@@ -131,6 +134,7 @@ namespace libmsstyle.Import
             TaskHover(specialMain);
             SectionIcons();
             ControlPanelPage();
+            DetailsText();
         }
 
         // xp's category view (cpview.uix CategoryView, CategoryViewSS) and the win10 record that draws the same thing
@@ -141,6 +145,14 @@ namespace libmsstyle.Import
         // shstyle.h IDB_CPANEL_WATERMARK; cpview.cpp _CreateWatermark draws it GRAPHIC_TransColor with blend value 255,
         // RGB(255,0,0): red is see-through, bottom-right aligned.
         private const int CplWatermarkId = 26;
+
+        // xp's details section: shell32's NameSpaceItemInfoList sheet (the info lines' foreground; themed mode has
+        // none, so they inherit system windowtext unless a theme overrides it). Windows 10 draws them through
+        // genericlayoutstyle's MetadataElement rules, which read PreviewPane: 5/0 the title line, 6/0 the subtitle,
+        // 7/0 and 7/1 the metadata rows.
+        private const string DetailsSheet = "NameSpaceItemInfoList";
+        private const string PreviewClass = "PreviewPane";
+        private static readonly (int Part, int State)[] DetailsParts = { (5, 0), (6, 0), (7, 0), (7, 1) };
 
         /// <summary>
         /// The Control Panel's "Pick a category" page. xp drew it from the shellstyle (CategoryViewSS view background,
@@ -164,18 +176,18 @@ namespace libmsstyle.Import
             var bg = Src("CategoryViewSS", "element [id=atom(view)]", "background", out bool bgStock);
             if (!bgStock && bg is Color fill)
             {
-                CplColor(cls, CplContent, 0, IDENTIFIER.FILLCOLOR, fill, "category view background");
+                ClassColor(cls, CplContent, 0, IDENTIFIER.FILLCOLOR, fill, "Control Panel category view's background");
                 CplContentStrip(cls, fill);
             }
             var title = Src("DirectiveSS", "element", "foreground", out bool titleStock);
-            if (!titleStock && title is Color tc) CplColor(cls, CplTitle, 0, IDENTIFIER.TEXTCOLOR, tc, "\"Pick a category\" title color");
+            if (!titleStock && title is Color tc) ClassColor(cls, CplTitle, 0, IDENTIFIER.TEXTCOLOR, tc, "Control Panel category view's \"Pick a category\" title color");
             var link = Src("CategoryListItemSS", "linkelement", "foreground", out bool linkStock);
             if (!linkStock && link is Color lc)
-                foreach (int state in new[] { 0, 1, 2 }) CplColor(cls, CplLink, state, IDENTIFIER.TEXTCOLOR, lc, "category link color");
+                foreach (int state in new[] { 0, 1, 2 }) ClassColor(cls, CplLink, state, IDENTIFIER.TEXTCOLOR, lc, "Control Panel category view's link color");
             CplWatermark(cls);
         }
 
-        private StyleState CplState(StyleClass cls, int part, int state)
+        private StyleState ClassState(StyleClass cls, int part, int state)
         {
             if (!cls.Parts.TryGetValue(part, out var p)) return null;
             if (!p.States.TryGetValue(state, out var st))
@@ -186,7 +198,7 @@ namespace libmsstyle.Import
             return st;
         }
 
-        private StyleProperty CplProp(StyleClass cls, int part, StyleState st, IDENTIFIER name, IDENTIFIER type)
+        private StyleProperty ClassProp(StyleClass cls, int part, StyleState st, IDENTIFIER name, IDENTIFIER type)
         {
             var prop = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
             if (prop != null) return prop;
@@ -196,34 +208,34 @@ namespace libmsstyle.Import
             return prop;
         }
 
-        private void CplChanged(StyleClass cls, StyleProperty p, int part, int state, string reason)
+        private void ClassChanged(StyleClass cls, StyleProperty p, int part, int state, string reason)
         {
-            string partName = SemanticModel.PartNames(CplClass, Platform.Win10).TryGetValue(part, out var n) ? n : "Part " + part;
+            string partName = SemanticModel.PartNames(cls.ClassName, Platform.Win10).TryGetValue(part, out var n) ? n : "Part " + part;
             string prop = SemanticModel.PropertyName(p.Header.nameID);
-            m_imp.MarkTouched(p, $"{CplClass}|{partName}|S{state}|{prop}");
+            m_imp.MarkTouched(p, $"{cls.ClassName}|{partName}|S{state}|{prop}");
             m_imp.Report.Decisions.Add(new MergeDecision
             {
-                Class = CplClass, Part = partName, State = state, Property = prop, Action = "applied-shellstyle",
-                Reason = $"the Control Panel category view's {reason} from the source shellstyle", Result = SemanticModel.FormatValue(p),
+                Class = cls.ClassName, Part = partName, State = state, Property = prop, Action = "applied-shellstyle",
+                Reason = $"{reason} from the source shellstyle", Result = SemanticModel.FormatValue(p),
             });
             m_imp.Report.Count("applied-shellstyle");
         }
 
-        private void CplColor(StyleClass cls, int part, int state, IDENTIFIER name, Color c, string reason)
+        private void ClassColor(StyleClass cls, int part, int state, IDENTIFIER name, Color c, string reason)
         {
-            var st = CplState(cls, part, state);
+            var st = ClassState(cls, part, state);
             if (st == null) return;
-            var p = CplProp(cls, part, st, name, IDENTIFIER.COLOR);
+            var p = ClassProp(cls, part, st, name, IDENTIFIER.COLOR);
             var v = Color.FromArgb(255, c);
             if (p.GetValue() is Color cur && cur.ToArgb() == v.ToArgb()) return;
             p.SetValue(v);
-            CplChanged(cls, p, part, state, reason);
+            ClassChanged(cls, p, part, state, reason);
         }
 
         /// <summary>the content background picture (state 1): Luna10's blue strip, redrawn flat in the source's color, template size.</summary>
         private void CplContentStrip(StyleClass cls, Color fill)
         {
-            var st = CplState(cls, CplContent, 1);
+            var st = ClassState(cls, CplContent, 1);
             var img = st?.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
             if (img == null || !(img.GetValue() is int id)) return;
             var t = m_imp.Decoded(m_imp.Target, "IMAGE", id);
@@ -235,7 +247,7 @@ namespace libmsstyle.Import
             int nid = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
             if (nid == id) return;
             img.SetValue(nid);
-            CplChanged(cls, img, CplContent, 1, "background (flat strip)");
+            ClassChanged(cls, img, CplContent, 1, "Control Panel category view background (flat strip)");
         }
 
         /// <summary>the watermark: glyph of the content background (state 1), bottom-right like xp's.</summary>
@@ -243,14 +255,31 @@ namespace libmsstyle.Import
         {
             var src = m_src.GetBitmap(CplWatermarkId);
             if (src == null || SameBytes(src, m_base.GetBitmap(CplWatermarkId))) return;
-            var st = CplState(cls, CplContent, 1);
+            var st = ClassState(cls, CplContent, 1);
             var glyph = st?.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.GLYPHIMAGEFILE);
             if (glyph == null) { m_imp.Report.Warnings.Add($"shellstyle: the template's {CplClass} content background has no glyph; the Control Panel watermark stays."); return; }
             byte[] png = ImageConverter.ConvertXpDibToPremultipliedPng(src, Color.FromArgb(255, 0, 0));
             int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
             if ((glyph.Header.shortFlag & 0xFFFF) == id) return;
             glyph.SetValue(id);
-            CplChanged(cls, glyph, CplContent, 1, "watermark (bitmap 26)");
+            ClassChanged(cls, glyph, CplContent, 1, "Control Panel category view watermark (bitmap 26)");
+        }
+
+        /// <summary>
+        /// The details section's text ("My Computer" / "System Folder" under the Details header): xp's info lines draw
+        /// no color of their own in themed mode and inherit system windowtext, and a theme overrides it in its shellstyle
+        /// (<see cref="DetailsSheet"/>: CrystalBlue's `foreground: white` over its dark group art; stock luna's sheet has
+        /// none). Windows 10's genericlayoutstyle reads <see cref="PreviewClass"/> instead, so the source's override
+        /// becomes those records; without one the template's black stays, as on xp.
+        /// </summary>
+        private void DetailsText()
+        {
+            if (!m_imp.Target.ClassesByName.TryGetValue(PreviewClass, out var cls) || m_imp.Target.DuplicateClassNames.Contains(PreviewClass)) return;
+            var c = XpShellStyle.ParseColor(m_src.Get(DetailsSheet, "NameSpaceItemInfo", "foreground"));
+            if (c == null) return;
+            if (SameColor(c, XpShellStyle.ParseColor(m_base.Get(DetailsSheet, "NameSpaceItemInfo", "foreground")))) return;
+            foreach (var (part, state) in DetailsParts)
+                ClassColor(cls, part, state, IDENTIFIER.TEXTCOLOR, c.Value, "details section text (NameSpaceItemInfo foreground)");
         }
 
         // xp's special section icons (shstyle.h IDB_MUSIC_ICON_BMP 10, IDB_PICTURES_ICON_BMP 13, IDB_CPANEL_ICON_BMP 22) in
@@ -313,6 +342,64 @@ namespace libmsstyle.Import
         /// color or gradient. <see cref="PatchShellStyleLayout"/> points the pane's background at it.
         /// </summary>
         public (int Part, int State)? PaneRecord { get; private set; }
+
+        /// <summary>
+        /// ExplorerBar record holding the source's folder watermark (the source shellstyle's sectionlist content
+        /// picture) and its own height in pixels; null where the source has none. <see cref="PatchShellStyleLayout"/>
+        /// adds a bottom band that draws it.
+        /// </summary>
+        public (int Part, int State, int Height)? WatermarkRecord { get; private set; }
+
+        /// <summary>
+        /// xp's folder watermark: the taskpane sectionlist's content picture (CrystalBlue: rcbmp(113, 2, 255), the "(c)
+        /// 2006 beginner design" line in white, contentalign bottomcenter, bottom padding 1rp). Windows 10's folder
+        /// layout has no such element and draws no shellstyle rcbmp, so the picture goes into a spare state of the
+        /// background part and the layout patch adds a bottom band that draws it.
+        /// </summary>
+        private void PaneWatermark()
+        {
+            var water = Both(x => x.Pane, false, "content");
+            if (!XpShellStyle.ParseRcBmp(water.Src, out int id, out var key, out bool autoKey)) return;
+            byte[] dib = m_src.GetBitmap(id);
+            if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: folder watermark bitmap {id} is missing; no watermark."); return; }
+            var png = XpShellBitmap(dib, key, autoKey);
+            if (XpShellStyle.ParseRcBmp(water.Stock, out int sid, out var skey, out bool sAuto))
+            {
+                byte[] sdib = m_base.GetBitmap(sid);
+                if (sdib != null && SameBytes(png, XpShellBitmap(sdib, skey, sAuto))) return; // stock luna draws the same picture
+            }
+
+            if (!m_cls.Parts.TryGetValue(Background, out var p)) return;
+            if (!p.States.TryGetValue(WatermarkState, out var st))
+            {
+                st = new StyleState { StateId = WatermarkState, StateName = "State " + WatermarkState };
+                p.States.Add(WatermarkState, st);
+            }
+            int img = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            Put(st, Background, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, "folder watermark", WatermarkReason);       // IMAGEFILE
+            Put(st, Background, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, "folder watermark", WatermarkReason);
+            Put(st, Background, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, "folder watermark", WatermarkReason);
+            Put(st, Background, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, 1, "folder watermark", WatermarkReason);          // STRETCH
+            Put(st, Background, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, new Margins(0, 0, 0, 0), "folder watermark", WatermarkReason);
+            WatermarkRecord = (Background, WatermarkState, ImageIdentity.Decode(png).Height);
+        }
+
+        // a state of the background part nothing in the shell draws (the UIFILEs read state 0 through gtc and the
+        // pane picture state 1 through dtb; the watermark band points at this one).
+        private const int WatermarkState = 2;
+        private const string WatermarkReason = "folder watermark of the source shellstyle (win10 draws it from this record, see the shellstyle layout notes)";
+
+        /// <summary>an XP shellstyle bitmap as the png win10 stores: the color key (or its automatic top-left pixel)
+        /// see-through, per-pixel alpha where the DirectUI mode has none (mode 2).</summary>
+        private byte[] XpShellBitmap(byte[] dib, Color? key, bool autoKey)
+        {
+            if (autoKey)
+            {
+                uint p0 = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null)).Pixels[0];
+                key = Color.FromArgb((int)((p0 >> 16) & 0xFF), (int)((p0 >> 8) & 0xFF), (int)(p0 & 0xFF));
+            }
+            return ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null);
+        }
 
         /// <summary>
         /// xp's task pane background as a bitmap (Ana Muslims Vista: rcbmp(120, 5, ...), a 200x604 grey-to-white
@@ -606,7 +693,10 @@ namespace libmsstyle.Import
         /// The group background (win10 dtb(ExplorerBar, 5/9) on the clipper): what xp showed behind the tasks (the first
         /// opaque fill of tasklist, watermark, clipper, expando and pane, background inheriting through), framed by the
         /// tasklist border where its borderthickness draws one (luna rect(1,0,1,1)). A solid fill is a 10x10 nine-grid
-        /// tile, a gradient (Opus OS paints its groups with the pane's gradient) a stretched strip.
+        /// tile, a gradient (Opus OS paints its groups with the pane's gradient) a stretched strip, and a bitmap (XP's
+        /// groups: mode 6, color-keyed) the source's picture, stretched into the clipper with its key see-through. The
+        /// bitmap's transparent top band is the header's area on xp (the expando's background covers the header too);
+        /// win10 draws the header as a separate element, so the band is cut off before the picture goes in.
         /// </summary>
         private void GroupTile(int part, bool main, string what)
         {
@@ -615,7 +705,23 @@ namespace libmsstyle.Import
             var src = GroupLook(m_srcDui, main);
             var stock = GroupLook(m_baseDui, main);
             if (src.Key == stock.Key) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, what + " background"); RestoreGeometry(part); return; }
-            if (src.Fill == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} background \"{src.Key}\" isn't a color or gradient the porter reads; template tile kept."); return; }
+            if (src.Fill == null && src.Pic == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} background \"{src.Key}\" isn't a picture, color or gradient the porter reads; template tile kept."); return; }
+
+            if (src.Pic.HasValue)
+            {
+                int picId = src.Pic.Value.Id;
+                Color? picKey = src.Pic.Value.Key;
+                bool picAutoKey = src.Pic.Value.AutoKey;
+                byte[] dib = m_src.GetBitmap(picId);
+                if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} background bitmap {picId} is missing; template tile kept."); return; }
+                var pic = ImageIdentity.Decode(XpShellBitmap(dib, picKey, picAutoKey));
+                int top = 0;
+                while (top < pic.Height && Enumerable.Range(0, pic.Width).All(x => (pic.Pixels[top * pic.Width + x] >> 24) == 0)) ++top;
+                if (top > 0 && top < pic.Height) pic = pic.Crop(new Rectangle(0, top, pic.Width, pic.Height - top));
+                PlaceImage(img, part, ImageIdentity.EncodePngVerified(pic), $"{what} background bitmap {picId}");
+                SetGeometry(part, new Margins(0, 0, 0, 0), "the group background is the source's picture, stretched as xp did");
+                return;
+            }
 
             PlaceImage(img, part, ImageIdentity.EncodePngVerified(Paint(src.Fill, src.Border, src.Thickness, out var sizing)), $"{what} background {src.Key}");
             if (sizing == null) RestoreGeometry(part); // the tile's 1px frame stays a frame with the luna port's 1px margins.
@@ -631,18 +737,24 @@ namespace libmsstyle.Import
         /// at the same x in and between groups): the group is see-through, a transparent tile, and win10's clipper
         /// shows its ExplorerBarBackground the same way. A re-drawn gradient would restart at each group's edge.
         /// </summary>
-        private (DuiFill? Fill, Color Border, Margins Thickness, string Key) GroupLook(DuiCascade dui, bool main)
+        private (DuiFill? Fill, (int Id, Color? Key, bool AutoKey)? Pic, Color Border, Margins Thickness, string Key) GroupLook(DuiCascade dui, bool main)
         {
             var s = DuiCascade.Build(main);
             var pane = XpShellStyle.ParseFill(dui.Resolve(s.Pane, "background"));
-            DuiFill? fill = DuiFill.Clear; string fillText = "transparent";
+            DuiFill? fill = DuiFill.Clear; (int, Color?, bool)? pic = null; string fillText = "transparent";
             foreach (var node in new[] { s.TaskList, s.Watermark, s.Clipper, s.Expando })
             {
                 if (node == null) continue;
                 var v = dui.Resolve(node, "background", out var origin);
                 if (v == null || origin != node) continue;
                 var f = DuiFill.Parse(v);
-                if (f == null) { fill = null; fillText = v; break; } // a bitmap or something unparsable: reported, not guessed.
+                if (f == null)
+                {
+                    // a bitmap (xp's groups: rcbmp(id, 6, key); CrystalBlue's 115/116) or something unparsable.
+                    fill = null; fillText = v;
+                    if (XpShellStyle.ParseRcBmp(v, out int id, out var rcKey, out bool autoKey)) pic = (id, rcKey, autoKey);
+                    break;
+                }
                 if (!f.Value.Opaque) continue;
                 if (f.Value.Stops.Length > 1 && SameFill(f.Value.Stops, pane)) break; // the pane's gradient again: see-through
                 fill = f; fillText = v; break;
@@ -651,7 +763,7 @@ namespace libmsstyle.Import
             var border = XpShellStyle.ParseColor(dui.Resolve(s.TaskList, "bordercolor")) ?? Color.Black; // DUI default SC_Black
             bool framed = thick.Left + thick.Top + thick.Right + thick.Bottom > 0;
             string key = $"{fillText}|{(framed ? $"{border.ToArgb()}|{thick.Left},{thick.Top},{thick.Right},{thick.Bottom}" : "")}";
-            return (fill, border, thick, key);
+            return (fill, pic, border, thick, key);
         }
 
         /// <summary>a solid color or gradient(c1, c2, mode) fill as DirectUI paints it (render.cpp: GradientFill across the element).</summary>
@@ -975,7 +1087,7 @@ namespace libmsstyle.Import
         /// </summary>
         public static (List<string> notes, List<string> warnings) PatchShellStyleLayout(string win10ShellStyle, XpShellStyle source, XpShellStyle stock,
             IReadOnlyDictionary<bool, Margins> headerMargins, IReadOnlyDictionary<bool, (int Part, int State)> hoverRecords,
-            (int Part, int State)? paneRecord, bool dryRun)
+            (int Part, int State)? paneRecord, (int Part, int State, int Height)? watermarkRecord, bool dryRun)
         {
             var notes = new List<string>(); var warnings = new List<string>();
             DuiCascade src = new DuiCascade(source), bas = new DuiCascade(stock);
@@ -1028,7 +1140,6 @@ namespace libmsstyle.Import
             (int Part, int State)? Hover(bool prefer) => hoverRecords == null ? null
                 : hoverRecords.TryGetValue(prefer, out var r) ? r : hoverRecords.TryGetValue(!prefer, out var o) ? o : ((int, int)?)null;
             var navHover = Hover(false); var taskHover = Hover(true);
-            if (gapDelta == 0 && align.Values.All(a => a == null) && navHover == null && paneRecord == null) return (notes, warnings);
 
             var updates = new List<(string type, uint id, ushort lang, byte[] data)>();
             var mod = Win32Api.LoadLibraryEx(win10ShellStyle, IntPtr.Zero, Win32Api.LoadLibraryFlags.LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE);
@@ -1054,6 +1165,20 @@ namespace libmsstyle.Import
                         {
                             sheet = sheet.Substring(0, pf) + $"background=\"dtb(ExplorerBar, {paneRecord.Value.Part}, {paneRecord.Value.State})\"" + sheet.Substring(pf + paneFill.Length);
                             notes.Add($"shellstyle layout: task pane background drawn with dtb(ExplorerBar, {paneRecord.Value.Part}, {paneRecord.Value.State}), the source's background picture.");
+                        }
+                    }
+                    {
+                        // the special section in music/picture folders (accname music_bg/photo_bg) paints CommandModule
+                        // part 11, the port's own music/picture background picture; xp drew those folders' section with
+                        // the same art as every other special group, and its light picture left the source's white group
+                        // text invisible, so the overrides go and ExplorerBar's group background shows.
+                        var special = new System.Text.RegularExpressions.Regex(
+                            @"\s*<if accname=""(?:music|photo)_bg"">\s*<clipper background=""themeable\(dtb\(CommandModule,\s*11,\s*\d\),\s*window\)""/>\s*</if>",
+                            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        if (special.IsMatch(sheet))
+                        {
+                            sheet = special.Replace(sheet, "");
+                            notes.Add("shellstyle layout: music and picture folder groups (accname music_bg/photo_bg) draw the theme's special group background instead of CommandModule part 11, whose light picture left the source's white group text unreadable.");
                         }
                     }
                     if (gapDelta != 0)
@@ -1114,6 +1239,15 @@ namespace libmsstyle.Import
                             notes.Add($"shellstyle layout: place links (NavigateButton) hover with dtb(ExplorerBar, {np}, {ns}), the source's task hover background; the row's 5rp/2rp padding moved onto the link's icon and label so the bar covers it.");
                         }
                     }
+                    if (watermarkRecord.HasValue)
+                    {
+                        int wp = watermarkRecord.Value.Part, ws = watermarkRecord.Value.State;
+                        const string style = "<style resid=\"ExplorerBarStyle\">";
+                        // the band is a bottom child of the pane element (SHELL32_UIFILE patch below); its picture comes
+                        // from the record, since win10's DirectUI draws no shellstyle rcbmp.
+                        sheet = sheet.Insert(style.Length, $"\r\n\t\t\t<if class=\"PaneWatermark\">\r\n\t\t\t\t<element background=\"dtb(ExplorerBar, {wp}, {ws})\"/>\r\n\t\t\t</if>");
+                        notes.Add($"shellstyle layout: folder watermark drawn with dtb(ExplorerBar, {wp}, {ws}), the source shellstyle's pane watermark, on a bottom band.");
+                    }
                     t = t.Substring(0, sb) + sheet + t.Substring(se);
                     if (taskHover.HasValue)
                     {
@@ -1145,17 +1279,47 @@ namespace libmsstyle.Import
                 // links' flowlayout() size each row to its text, so the hover would only cover the text).
                 var stretch = align.Where(a => a.Value != null).Select(a => a.Key).ToList();
                 bool fullRows = navHover.HasValue || taskHover.HasValue;
-                if (stretch.Count > 0 || fullRows)
                 {
+                    // runs always: the pane watermark band and the music/picture folder backgrounds are patched here even
+                    // when the template already fits the source's titles and task rows.
                     var pattern = stretch.Count == 0 ? null : new System.Text.RegularExpressions.Regex($@"(<button class=""(?:{string.Join("|", stretch)})"")\s+layoutpos=""left""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     const string list = "<element id=\"atom(tasklist)\" layoutpos=\"top\" layout=\"verticalflowlayout(0,0,0)\">";
                     const string item = "<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\">";
-                    int files = 0, rowFiles = 0;
+                    const string pane = "class=\"ExplorerBarBackground\">";
+                    int files = 0, rowFiles = 0, bandFiles = 0, detailsOpen = 0;
+                    string band = watermarkRecord.HasValue
+                        ? $"\r\n\t\t\t\t<element class=\"PaneWatermark\" layoutpos=\"bottom\" height=\"{watermarkRecord.Value.Height}rp\"/>"
+                        : null;
                     foreach (uint id in ResourceIds(mod, "SHELL32_UIFILE"))
                         foreach (var (lang, text, utf16) in TextResources(mod, "SHELL32_UIFILE", id))
                         {
                             string t = pattern == null ? text : pattern.Replace(text, "$1");
-                            if (t != text) files++;
+                            if (pattern != null && t != text) files++;
+                            {
+                                // the Details section's Expando starts Expanded="false"; Windows 10 then shows the section
+                                // closed (title row only) until the info module has an item, while xp drew the folder's own
+                                // name/type as soon as the folder opened (checked live: without this, opening a folder from
+                                // My Computer's My Documents link left "Details" closed; with Expanded="true" it opens).
+                                int i = 0;
+                                while ((i = t.IndexOf("<Expando", i, StringComparison.OrdinalIgnoreCase)) >= 0)
+                                {
+                                    int close = t.IndexOf('>', i);
+                                    int end = close < 0 ? -1 : t.IndexOf("</Expando>", close, StringComparison.OrdinalIgnoreCase);
+                                    if (close < 0 || end < 0) break;
+                                    if (t.IndexOf("content=\"Details\"", close, end - close, StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        int e = t.IndexOf("Expanded=\"false\"", i, close - i, StringComparison.OrdinalIgnoreCase);
+                                        if (e < 0) e = t.IndexOf("expanded=\"false\"", i, close - i, StringComparison.OrdinalIgnoreCase);
+                                        if (e >= 0)
+                                        {
+                                            t = t.Substring(0, e) + "Expanded=\"true\"" + t.Substring(e + "Expanded=\"false\"".Length);
+                                            detailsOpen++;
+                                        }
+                                        break;
+                                    }
+                                    i = end + 10;
+                                }
+                            }
                             if (fullRows)
                             {
                                 // verticalflowlayout(wrap, xalign, xlinealign): ALIGN_JUSTIFY (3) stretches the column to the
@@ -1164,6 +1328,14 @@ namespace libmsstyle.Import
                                 string r = t.Replace(list, list.Replace("verticalflowlayout(0,0,0)", "verticalflowlayout(0,3,3)"))
                                             .Replace(item, item.Replace("flowlayout()", "filllayout()"));
                                 if (r != t) rowFiles++;
+                                t = r;
+                            }
+                            if (band != null && t.Contains(pane))
+                            {
+                                // the band is a child of the pane element (borderlayout): pinned to the pane's bottom,
+                                // inside its padding, so the picture gets xp's content box (the source's 12rp/1rp padding).
+                                string r = t.Replace(pane, pane + band);
+                                if (r != t) bandFiles++;
                                 t = r;
                             }
                             if (t != text) updates.Add(("SHELL32_UIFILE", id, lang, Encode(t, utf16)));
@@ -1178,6 +1350,15 @@ namespace libmsstyle.Import
                         if (rowFiles == 0) warnings.Add("shellstyle layout: the template's task lists aren't verticalflowlayout(0,0,0) / flowlayout() rows; the hover background covers only the text.");
                         else notes.Add($"shellstyle layout: task rows stretched to the task list's width (hover covers the row as on xp), in {rowFiles} pane layouts.");
                     }
+                    if (band != null)
+                    {
+                        if (bandFiles == 0) warnings.Add("shellstyle layout: no ExplorerBarBackground element in the template's SHELL32_UIFILE markup; the folder watermark isn't drawn.");
+                        else notes.Add($"shellstyle layout: folder watermark on a {watermarkRecord.Value.Height}rp bottom band of the pane, in {bandFiles} pane layouts.");
+                    }
+                    if (detailsOpen > 0)
+                        notes.Add($"shellstyle layout: details section open from the start (Expanded=\"true\") in {detailsOpen} pane layouts; win10 leaves it closed until the info module has an item, xp showed the folder's own name/type.");
+                    else
+                        warnings.Add("shellstyle layout: no Details Expando (Expanded=\"false\") in the template's SHELL32_UIFILE markup; the details section stays closed until an item is selected.");
                 }
             }
             finally { Win32Api.FreeLibrary(mod); }
