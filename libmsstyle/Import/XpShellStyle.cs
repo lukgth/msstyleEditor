@@ -62,7 +62,10 @@ namespace libmsstyle.Import
                     m_rules[style.Groups[1].Value] = rules = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
                 if (!m_ruleLists.TryGetValue(style.Groups[1].Value, out var list))
                     m_ruleLists[style.Groups[1].Value] = list = new List<DuiRule>();
-                foreach (Match rule in Regex.Matches(style.Groups[2].Value, @"([^{}]+)\{([^}]*)\}"))
+                // block comments (Xp: /* *** TASK PANEL *** */ right before a rule) would otherwise become part of the
+                // selector text and DuiRule.Parse drops the rule (XtremeXP's sectionlist background was lost that way).
+                string body = Regex.Replace(style.Groups[2].Value, @"/\*.*?\*/", "", RegexOptions.Singleline);
+                foreach (Match rule in Regex.Matches(body, @"([^{}]+)\{([^}]*)\}"))
                 {
                     string sel = NormalizeSelector(rule.Groups[1].Value);
                     if (!rules.TryGetValue(sel, out var props)) rules[sel] = props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -135,6 +138,29 @@ namespace libmsstyle.Import
                 return true;
             }, IntPtr.Zero, Win32Api.EnumResourceFlags.RESOURCE_ENUM_LN, 0);
             return ids;
+        }
+
+        /// <summary>
+        /// A value from any sheet, for packs whose rule sits under a stylesheet the element tree's node doesn't name
+        /// (XtremeXP keeps its task pane rules in their own blocks, so the cascade resolves nothing and the pane,
+        /// task list and section gap all looked "unset"). Matches XP's class+id selector, no state flags, and takes
+        /// the most specific match; null when no sheet states it.
+        /// </summary>
+        public string GetAny(string cls, string id, string property)
+        {
+            var atom = System.Text.RegularExpressions.Regex.Match(id ?? "", @"^atom\(\w+\)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (atom.Success) id = atom.Groups[1].Value; // DuiRule keeps the bare atom name
+            DuiRule best = null;
+            foreach (var list in m_ruleLists.Values)
+                foreach (var r in list)
+                {
+                    if (!string.Equals(r.Class, cls, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!string.Equals(r.Id, id, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (r.Flags.Count != 0) continue;
+                    if (!r.Decls.ContainsKey(property)) continue;
+                    if (best == null || r.Specificity > best.Specificity) best = r;
+                }
+            return best == null ? null : MapSysColor(best.Decls[property]);
         }
 
         public void Dispose()
@@ -211,7 +237,10 @@ namespace libmsstyle.Import
             if (a.Count < 1 || !int.TryParse(a[0], out id)) return false;
             if (a.Count == 1) { autoKey = true; return true; }
             if (!int.TryParse(a[1], out int mode)) return false;
-            if (mode == 6 && a.Count >= 3) key = ParseColor(a[2]);
+            // any mode but 2 (DirectUI per-pixel alpha) takes its explicit key: mode 6 is the common one, but packs
+            // also use rcbmp(id, 3, #FF00FF,...) for the same color key (XtremeXP's arrows came in magenta because only
+            // mode 6 was read).
+            if (mode != 2 && a.Count >= 3) key = ParseColor(a[2]);
             return true;
         }
 

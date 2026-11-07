@@ -636,8 +636,31 @@ namespace libmsstyle.Import
             else r.Notes.Add($"sounds: {set} event sounds set");
         }
 
+        // per-user DefaultIcon values this porter wrote on a previous apply, so switching to a theme that doesn't name
+        // that CLSID drops the old override instead of keeping the previous theme's icon (My Documents and the Recycle
+        // Bin stayed on CrystalBlue's icons after every later theme).
+        private const string IconOverrides = @"Software\xpThemePort\DefaultIcons";
+
         private static void ApplyIcons(ThemeIni ini, ThemeApplyResult r)
         {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(IconOverrides, false))
+                {
+                    if (k != null)
+                        foreach (var name in k.GetValueNames())
+                        {
+                            string v = k.GetValue(name) as string;
+                            int bar = (v ?? "").IndexOf('|');
+                            if (bar < 0) continue;
+                            using (var t = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\" + v.Substring(0, bar), true))
+                                if (t != null) t.DeleteValue(v.Substring(bar + 1), false);
+                        }
+                    Registry.CurrentUser.DeleteSubKeyTree(IconOverrides, false);
+                }
+            }
+            catch (Exception) { }
+            var written = new List<string>();
             int set = 0;
             foreach (var section in ini.Sections)
             {
@@ -652,11 +675,19 @@ namespace libmsstyle.Import
                     {
                         using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\" + section.Key))
                             k.SetValue(name, v, RegistryValueKind.String);
+                        written.Add(section.Key + "|" + name);
                         ++set;
                     }
                     catch (Exception) { }
                 }
             }
+            if (written.Count > 0)
+                try
+                {
+                    using (var k = Registry.CurrentUser.CreateSubKey(IconOverrides))
+                        for (int i = 0; i < written.Count; ++i) k.SetValue("v" + i, written[i], RegistryValueKind.String);
+                }
+                catch (Exception) { }
             if (set == 0) r.Notes.Add("icons: no default icons to set");
             else
             {

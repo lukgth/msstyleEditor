@@ -87,9 +87,12 @@ namespace libmsstyle.Import
 
             // task pane background gradient: the sectionlist element.
             var pane = Both(x => x.Pane, false, "background");
-            var sFill = XpShellStyle.ParseFill(pane.Src);
-            var bFill = XpShellStyle.ParseFill(pane.Stock);
-            if (sFill == null && XpShellStyle.ParseRcBmp(pane.Src, out _, out _)) PaneBitmap(pane.Src);
+            // the pack's rules may sit in a sheet the element tree doesn't name (XtremeXP), so the cascade finds nothing.
+            string paneSrc = pane.Src ?? m_src.GetAny("element", "atom(sectionlist)", "background");
+            string paneStock = pane.Stock ?? (m_base != null ? m_base.GetAny("element", "atom(sectionlist)", "background") : null);
+            var sFill = XpShellStyle.ParseFill(paneSrc);
+            var bFill = XpShellStyle.ParseFill(paneStock);
+            if (sFill == null && XpShellStyle.ParseRcBmp(paneSrc, out _, out _)) PaneBitmap(paneSrc);
             else if (Usable(sFill, "task pane background"))
             {
                 bool stock = SameFill(sFill, bFill);
@@ -135,6 +138,7 @@ namespace libmsstyle.Import
             SectionIcons();
             ControlPanelPage();
             DetailsText();
+            RebarBand();
         }
 
         // xp's category view (cpview.uix CategoryView, CategoryViewSS) and the win10 record that draws the same thing
@@ -272,6 +276,50 @@ namespace libmsstyle.Import
         /// none). Windows 10's genericlayoutstyle reads <see cref="PreviewClass"/> instead, so the source's override
         /// becomes those records; without one the template's black stays, as on xp.
         /// </summary>
+        /// <summary>
+        /// The rebar band the address bar sits on. XP draws Rebar|BAND state 0 as a see-through band (TRANSPARENT true, no
+        /// fill of its own), so the rebar background picture (Rebar part 0 IMAGEFILE, XtremeXP's ribbed strip) shows
+        /// through it. Windows 10 fills the band's own box from its BGTYPE 2 fill instead, leaving a flat strip where XP
+        /// had the picture, so the band gets the rebar background's picture and geometry.
+        /// </summary>
+        private void RebarBand()
+        {
+            const string rebar = "Rebar";
+            if (!m_imp.Target.ClassesByName.TryGetValue(rebar, out var cls) || m_imp.Target.DuplicateClassNames.Contains(rebar)) return;
+            if (!cls.Parts.TryGetValue(0, out var bgPart) || !bgPart.States.TryGetValue(0, out var bgSt)) return;
+            if (!cls.Parts.TryGetValue(3, out var bandPart) || !bandPart.States.TryGetValue(0, out var bandSt)) return;
+            if (!(bgSt.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE)?.GetValue() is int imageId)) return;
+
+            StyleProperty P(StyleState st, IDENTIFIER name) => st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
+            bool seeThrough;
+            {
+                object tr = P(bandSt, IDENTIFIER.TRANSPARENT_)?.GetValue();
+                seeThrough = tr is bool tb ? tb : tr is int ti && ti != 0;
+            }
+            if (!seeThrough) return;
+            if (P(bandSt, IDENTIFIER.FILLCOLOR) != null || P(bandSt, IDENTIFIER.FILLCOLORHINT) != null) return;
+            if (!(P(bandSt, IDENTIFIER.BGTYPE)?.GetValue() is int bt && bt == 2)) return;
+
+            void Copy(IDENTIFIER name, object value, IDENTIFIER type)
+            {
+                var dst = ClassProp(cls, 3, bandSt, name, type);
+                if (value is Margins mg) dst.SetValue(new Margins(mg.Left, mg.Top, mg.Right, mg.Bottom));
+                else if (value is Color c) dst.SetValue(Color.FromArgb(255, c));
+                else if (value is int i) dst.SetValue(i);
+                else dst.SetValue(value);
+                ClassChanged(cls, dst, 3, 0, "address bar band background (xp's see-through band shows the rebar picture through it)");
+            }
+            Copy(IDENTIFIER.BGTYPE, 0, IDENTIFIER.ENUM);
+            Copy(IDENTIFIER.IMAGEFILE, imageId, IDENTIFIER.FILENAME);
+            Copy(IDENTIFIER.IMAGECOUNT, 1, IDENTIFIER.INT);
+            foreach (var name in new[] { IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGTYPE, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.TRANSPARENT_, IDENTIFIER.TRANSPARENTCOLOR })
+            {
+                var src = P(bgSt, name);
+                if (src == null) continue;
+                Copy(name, src.GetValue(), (IDENTIFIER)src.Header.typeID);
+            }
+        }
+
         private void DetailsText()
         {
             if (!m_imp.Target.ClassesByName.TryGetValue(PreviewClass, out var cls) || m_imp.Target.DuplicateClassNames.Contains(PreviewClass)) return;
@@ -597,8 +645,15 @@ namespace libmsstyle.Import
         {
             var p = Find(NormalBg, 0, IDENTIFIER.CONTENTMARGINS);
             if (p == null || !m_snapshot.TryGetValue(K(NormalBg, 0, IDENTIFIER.CONTENTMARGINS), out var orig) || !(orig.GetValue() is Margins t)) return;
-            var s = XpShellStyle.ParseRect(m_srcDui.Resolve(DuiCascade.Build(false).TaskList, "padding")) ?? new Margins(0, 0, 0, 0);
-            var b = XpShellStyle.ParseRect(m_baseDui.Resolve(DuiCascade.Build(false).TaskList, "padding")) ?? new Margins(0, 0, 0, 0);
+            var sp = XpShellStyle.ParseRect(m_srcDui.Resolve(DuiCascade.Build(false).TaskList, "padding"))
+                     ?? XpShellStyle.ParseRect(m_src.GetAny("tasklist", "atom(tasklist)", "padding"));
+            // no padding rule the cascade resolves: the source doesn't state it (its sheet puts it where DUI looks it
+            // up, e.g. tasklist [id=atom(tasklist)] under the section sheet), so the template's inset stays. Reading it
+            // as 0 pulled XtremeXP's task lists 12px/10px out to the group's edge.
+            if (sp == null) return;
+            var b = XpShellStyle.ParseRect(m_baseDui.Resolve(DuiCascade.Build(false).TaskList, "padding"))
+                    ?? XpShellStyle.ParseRect(m_base.GetAny("tasklist", "atom(tasklist)", "padding")) ?? sp;
+            var s = sp;
             var m = new Margins(Math.Max(0, t.Left + s.Left - b.Left), Math.Max(0, t.Top + s.Top - b.Top), Math.Max(0, t.Right + s.Right - b.Right), Math.Max(0, t.Bottom + s.Bottom - b.Bottom));
             if (p.GetValue() is Margins cur && cur.Left == m.Left && cur.Top == m.Top && cur.Right == m.Right && cur.Bottom == m.Bottom) return;
             if (m.Left == t.Left && m.Top == t.Top && m.Right == t.Right && m.Bottom == t.Bottom) { Restore(p, NormalBg, 0, IDENTIFIER.CONTENTMARGINS, "task list padding"); return; }
@@ -1092,12 +1147,17 @@ namespace libmsstyle.Import
             var notes = new List<string>(); var warnings = new List<string>();
             DuiCascade src = new DuiCascade(source), bas = new DuiCascade(stock);
 
-            int Gap(DuiCascade d)
+            // -1: the sheet doesn't state the margin where the cascade looks (xp's rules sit under the section
+            // sheets, e.g. expando { margin: rect(0,5,0,0) } in mainsectionss); reading it as 0 collapsed XtremeXP's
+            // section gap from stock luna's 15rp to 0rp.
+            int Gap(DuiCascade d, XpShellStyle sheet)
             {
-                var m = XpShellStyle.ParseRect(d.Resolve(DuiCascade.Build(false).Expando, "margin")) ?? new Margins(0, 0, 0, 0);
-                return Math.Max(m.Top, m.Bottom);
+                var m = XpShellStyle.ParseRect(d.Resolve(DuiCascade.Build(false).Expando, "margin"))
+                        ?? XpShellStyle.ParseRect(sheet.GetAny("expando", null, "margin"));
+                return m == null ? -1 : Math.Max(m.Top, m.Bottom);
             }
-            int gapDelta = Gap(src) - Gap(bas);
+            int gapSrc = Gap(src, source), gapStock = Gap(bas, stock);
+            int gapDelta = gapSrc < 0 || gapStock < 0 ? 0 : gapSrc - gapStock;
 
             // the title's contentalign as win10 takes it ("middlecenter"), or null when it's left (win10's placement
             // already). The vertical part is the source's too: "topcenter" put SHADED's middlecenter titles against
@@ -1189,7 +1249,7 @@ namespace libmsstyle.Import
                         {
                             int bottom = Math.Max(0, int.Parse(m.Groups[5].Value) + gapDelta);
                             sheet = sheet.Substring(0, m.Index) + m.Groups[1].Value + $"rect({m.Groups[2].Value},{m.Groups[3].Value},{m.Groups[4].Value},{bottom}rp)\"" + sheet.Substring(m.Index + m.Length);
-                            notes.Add($"shellstyle layout: sections {Gap(src)}rp apart as on xp (stock luna {Gap(bas)}rp): Expando bottom padding {m.Groups[5].Value}rp -> {bottom}rp.");
+                            notes.Add($"shellstyle layout: sections {Gap(src, source)}rp apart as on xp (stock luna {Gap(bas, stock)}rp): Expando bottom padding {m.Groups[5].Value}rp -> {bottom}rp.");
                         }
                     }
                     foreach (var kv in align.Where(a => a.Value != null))
