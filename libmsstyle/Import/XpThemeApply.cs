@@ -133,11 +133,17 @@ namespace libmsstyle.Import
             public int iPaddedBorderWidth;
         }
 
+        /// <summary>
+        /// The icon metrics Windows 10 accepts: cbSize, the icon cell's width and height (what SM_CXICONSPACING
+        /// reports), iTitleWrap, LOGFONTW. There is no separate spacing pair in this layout: putting the .theme's
+        /// spacing numbers here (as the old struct did with iHorzSpacing first) shifted every field by 8 bytes and the
+        /// shell took the first two as cell width/height (107px cells for CrystalBlue instead of xp's 75).
+        /// </summary>
         [StructLayout(LayoutKind.Sequential)]
         private struct ICONMETRICSW
         {
             public uint cbSize;
-            public int iHorzSpacing, iVertSpacing, iTitleWrap;
+            public int iWidth, iHeight, iTitleWrap;
             public LOGFONTW lfFont;
         }
 
@@ -505,12 +511,16 @@ namespace libmsstyle.Import
         private static ICONMETRICSW? IconMetricsAnsiToWide(byte[] b)
         {
             if (b == null || b.Length < 76 || BitConverter.ToUInt32(b, 0) != 76) return null;
+            // xp's theme engine reads only the icon title font out of the .theme's IconMetrics (themeui/themefile.cpp:
+            // m_systemMetrics.schemeData.lfIconTitle = iconMetricsW.lfFont); the blob's numbers are not the desktop's
+            // icon spacing. xp's default cell is 75px (IconSpacing -1125 twips), so that is what goes in; taking the
+            // blob's numbers made win10 open 107px cells.
             return new ICONMETRICSW
             {
                 cbSize = 108,
-                iHorzSpacing = BitConverter.ToInt32(b, 4),
-                iVertSpacing = BitConverter.ToInt32(b, 8),
-                iTitleWrap = BitConverter.ToInt32(b, 12),
+                iWidth = 75,
+                iHeight = 75,
+                iTitleWrap = 1,
                 lfFont = LogFontAnsiToWide(b, 16),
             };
         }
