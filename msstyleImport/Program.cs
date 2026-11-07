@@ -23,7 +23,9 @@ namespace msstyleImport
                     case "schemes": return args.Length == 2 ? Schemes(args[1]) : Usage();
                     case "noop": return NoOp(args.Skip(1).ToArray());
                     case "inventory": return args.Length == 3 ? Inventory(args[1], args[2]) : Usage();
-                    case "apply-theme": return args.Length == 2 ? ApplyTheme(args[1]) : Usage();
+                    case "apply-theme": return args.Length >= 2 ? ApplyTheme(args[1], args.Length > 2 && args[2] == "--style-only") : Usage();
+                    case "dumpres": return args.Length == 4 ? DumpResource(args[1], args[2], args[3]) : Usage();
+                    case "reslist": return args.Length == 2 ? ListResources(args[1]) : Usage();
                     default: return Usage();
                 }
             }
@@ -40,16 +42,20 @@ namespace msstyleImport
 @"usage:
   msstyleImport import --source <custom win7.msstyles> --template <working win10.msstyles>
                        --report <path prefix> [--base <stock win7 aero.msstyles, default: built in>]
+                       [--companion <style whose Shell\.mui folders travel with the candidate>]
                        [--write --out <candidate.msstyles>]
                        [--prefer-source Class|Part|Prop]... [--exclude Class|Part|Prop]...
                        [--image-tolerance N]
       dry run unless --write is given. reports: <prefix>.json, <prefix>.md, <prefix>.threeway.json
   msstyleImport import-xp --source <custom xp.msstyles> --template <working win10 xp port.msstyles>
                        --out-dir <dir> [--scheme <name>]... [--base <stock xp luna.msstyles, default: built in>]
+                       [--companion <style whose Shell and .mui folders travel with the candidate>]
                        [--base-scheme NormalColor|Metallic|HomeStead] [--name <display name>]
                        [--shellstyle <xp shellstyle.dll, default: Shell\<scheme>\shellstyle.dll next to the source>]
                        [--wallpaper <path>] [--write]
-                       [--prefer-source Class|Part|Prop]... [--exclude Class|Part|Prop]... [--image-tolerance N]
+                       [--task-band] [--prefer-source Class|Part|Prop]... [--exclude Class|Part|Prop]...
+                       [--image-tolerance N]
+      the task pane stays on the left (win10's layout); --task-band moves it to xp's full-width band across the top.
       the wallpaper is the one the xp pack's .theme files name next to the source (copied into the style folder);
       --wallpaper overrides it, and %WinDir%\Web\Wallpaper\Bliss.bmp is used when the pack ships none.
       one output per color scheme (all schemes unless --scheme is given):
@@ -61,23 +67,52 @@ namespace msstyleImport
       lists the color schemes of an xp style.
   msstyleImport noop --template <style> --out <copy.msstyles>
       saves the template through libmsstyle without changes and validates the copy against it.
+  msstyleImport reslist <pe>
+      every resource of a PE as type/name/language/size lines (debug helper).
+  msstyleImport dumpres <pe> <type> <name>
+      raw bytes of one PE resource (integer ids as #12), as a size line and a base64 line (debug helper).
   msstyleImport inventory <style> <out.tsv>
       flat dump: classes, resources, string tables, every property by name.
-  msstyleImport apply-theme <installed .theme>
+  msstyleImport apply-theme <installed .theme> [--style-only]
       applies an installed theme without any UI: the visual style through uxtheme's SetSystemVisualStyle, then the
-      .theme's colors, desktop picture, metrics, cursors, sounds and default icons. prints one line per section.
+      .theme's colors, desktop picture, metrics, cursors, sounds and default icons. --style-only stops after the visual
+      style (fast; for iterating on a port, existing windows keep their colors until the next full apply). prints one line per section.
       exit 0 when the style was accepted, 1 when it was rejected (the lines say why).
       this does write the machine's current theme/colors: that is the point, and it's what deskn.cpl does.");
             return 2;
         }
 
-        static int ApplyTheme(string themePath)
+        static int ApplyTheme(string themePath, bool styleOnly = false)
         {
-            var r = XpThemeApply.Apply(themePath);
+            var r = XpThemeApply.Apply(themePath, styleOnly);
             foreach (var n in r.Notes) Console.WriteLine("ok   " + n);
             foreach (var w in r.Warnings) Console.WriteLine("warn " + w);
             foreach (var w in r.Warnings) Console.Error.WriteLine("warning: " + w);
             return r.Ok ? 0 : 1;
+        }
+
+        // every resource type/name/language of a PE (one per line), debug helper.
+        static int ListResources(string pe)
+        {
+            using (var inv = new libmsstyle.Import.ResourceInventory(pe))
+                foreach (var e in inv.Entries)
+                    Console.WriteLine($"{e.Type}\t{e.Name}\t{e.Language}\t{e.Size}");
+            return 0;
+        }
+
+        // raw bytes of one PE resource: dumpres <pe> <type> <name>, both "#500" for integer ids. debug helper.
+        static int DumpResource(string pe, string type, string name)
+        {
+            using (var inv = new libmsstyle.Import.ResourceInventory(pe))
+            {
+                var e = inv.Entries.FirstOrDefault(x => x.Type == type && x.Name == name);
+                if (e == null) { Console.Error.WriteLine("no resource " + type + "/" + name); return 1; }
+                byte[] b = inv.GetData(e);
+                Console.Out.Write(b.Length + "\n");
+                Console.Out.Write(Convert.ToBase64String(b));
+                Console.Out.Write("\n");
+            }
+            return 0;
         }
 
         static Dictionary<string, List<string>> ParseArgs(string[] args)
@@ -88,7 +123,7 @@ namespace msstyleImport
                 if (!args[i].StartsWith("--")) throw new ArgumentException($"unexpected argument \"{args[i]}\"");
                 string k = args[i].Substring(2);
                 if (!d.TryGetValue(k, out var l)) d[k] = l = new List<string>();
-                if (k == "write") continue;
+                if (k == "write" || k == "task-band") continue;
                 if (i + 1 >= args.Length) throw new ArgumentException($"--{k} needs a value");
                 l.Add(args[++i]);
             }
@@ -110,7 +145,9 @@ namespace msstyleImport
                 SourcePath = One(a, "source"),
                 BasePath = One(a, "base", required: false),
                 TemplatePath = One(a, "template"),
+                CompanionSourcePath = One(a, "companion", required: false),
                 DryRun = !a.ContainsKey("write"),
+                TaskBand = a.ContainsKey("task-band"),
                 PreferSource = a.TryGetValue("prefer-source", out var ps) ? ps : new List<string>(),
                 Exclude = a.TryGetValue("exclude", out var ex) ? ex : new List<string>(),
             };
@@ -152,6 +189,7 @@ namespace msstyleImport
             {
                 SourcePath = One(a, "source"),
                 TemplatePath = One(a, "template"),
+                CompanionSourcePath = One(a, "companion", required: false),
                 OutDir = One(a, "out-dir"),
                 Schemes = a.TryGetValue("scheme", out var ws) ? ws : null,
                 Name = One(a, "name", required: false),
@@ -160,6 +198,7 @@ namespace msstyleImport
                 ShellStylePath = One(a, "shellstyle", required: false),
                 Wallpaper = One(a, "wallpaper", required: false),
                 Write = a.ContainsKey("write"),
+                TaskBand = a.ContainsKey("task-band"),
                 PreferSource = a.TryGetValue("prefer-source", out var ps) ? ps : new List<string>(),
                 Exclude = a.TryGetValue("exclude", out var ex) ? ex : new List<string>(),
             };

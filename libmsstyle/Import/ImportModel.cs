@@ -19,6 +19,12 @@ namespace libmsstyle.Import
         public string SourceSize { get; set; }
         /// <summary>xp only: scheme of the base the template was ported from (NormalColor, Metallic, HomeStead). Empty = the first one.</summary>
         public string BaseScheme { get; set; }
+        /// <summary>
+        /// xp only: draw the task pane as a full-width band across the top of the folder window (xp's My Computer /
+        /// My Documents WebView layout) instead of Windows 10's 200rp left pane. Off by default: the port keeps the
+        /// left pane; pass --task-band to ask for the band.
+        /// </summary>
+        public bool TaskBand { get; set; } = false;
         /// <summary>xp only: the source's shellstyle.dll. Empty = Shell\&lt;SourceScheme&gt;\shellstyle.dll next to the source, if there is one.</summary>
         public string SourceShellStylePath { get; set; }
         /// <summary>known-working windows 10 style; the output is a modified copy of this file.</summary>

@@ -1078,6 +1078,8 @@ namespace msstyleEditor
                 OutputPath = candidate,
                 // the snapshot sits alone in temp; Shell and the .mui come from the file that's open.
                 CompanionSourcePath = m_style.Path,
+                // the editor's import always keeps Windows 10's left task pane; the xp band is the CLI's --task-band.
+                TaskBand = false,
                 DryRun = false,
             };
 
@@ -1157,6 +1159,8 @@ namespace msstyleEditor
                 // the snapshot sits alone in temp; Shell and the .mui come from the file that's open.
                 CompanionSourcePath = m_style.Path,
                 OutDir = outDir,
+                // the editor's import always keeps Windows 10's left task pane; the xp band is the CLI's --task-band.
+                TaskBand = false,
                 Write = true,
             };
 

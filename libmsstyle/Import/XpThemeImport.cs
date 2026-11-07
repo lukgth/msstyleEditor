@@ -28,6 +28,8 @@ namespace libmsstyle.Import
         public List<string> PreferSource { get; set; } = new List<string>();
         public List<string> Exclude { get; set; } = new List<string>();
         public int? ImageTolerance { get; set; }
+        /// <summary>draw the task pane as xp's top band instead of win10's left pane (see <see cref="Win7ImportOptions.TaskBand"/>). Off by default.</summary>
+        public bool TaskBand { get; set; } = false;
     }
 
     /// <summary>One color scheme's port.</summary>
@@ -100,6 +102,7 @@ namespace libmsstyle.Import
                 PreferSource = o.PreferSource ?? new List<string>(),
                 Exclude = o.Exclude ?? new List<string>(),
                 ImageTolerance = o.ImageTolerance ?? 2,
+                TaskBand = o.TaskBand,
             };
             string FileOf(XpColorScheme scheme) => (all.Count == 1 ? name : XpThemeFiles.SafeName(scheme.InternalName)) + ".msstyles";
             string LabelOf(XpColorScheme scheme) => all.Count == 1 ? name : $"{name} {XpThemeFiles.SafeName(scheme.InternalName)}";
@@ -134,6 +137,14 @@ namespace libmsstyle.Import
                 string display = all.Count == 1 ? themeName : $"{themeName} {scheme.DisplayName.Trim()}";
                 string work = WorkOf(scheme);
                 var (opt, report) = ports[at++];
+                // the folder views (the task pane and every view template) are the template's shellstyle: a lone
+                // .msstyles template has no Shell folder, and the port would then open every folder window empty
+                // (no band, no view templates) instead of looking like xp.
+                if (report.Status == ImportStatus.ReadyForVmTest && !Directory.Exists(Path.Combine(work, "normal", "Shell", "NormalColor")))
+                {
+                    report.Status = ImportStatus.Blocked;
+                    report.Errors.Add($"template: no Shell\\NormalColor next to the template .msstyles; the folder views need its shellstyle and UIFILEs, so nothing was written. Port from a full template folder (the .msstyles and its Shell folder), not from a lone .msstyles.");
+                }
                 var res = new XpSchemeResult
                 {
                     Scheme = scheme,

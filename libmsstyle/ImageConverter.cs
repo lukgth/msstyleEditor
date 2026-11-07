@@ -41,9 +41,46 @@ namespace libmsstyle
         /// PreMultiplyAlpha), so a 0/255 mask only means anything where xp copies the bitmap into a 32bpp
         /// DIB and keeps its alpha (see VisualStyle.XpKeepsImageAlpha).
         /// </summary>
+        /// <summary>
+        /// Converts an OS/2 BITMAPCOREHEADER DIB (biSize 12: 16-bit width/height/planes/bpp, 3-byte palette
+        /// entries; some xp-era themes, Klarheit among them, store their bitmaps this way) into the
+        /// BITMAPINFOHEADER form GDI+ and the other converters here read. Other DIBs come back unchanged.
+        /// </summary>
+        public static byte[] NormalizeDib(byte[] dib)
+        {
+            if (dib == null || dib.Length < 12 || BitConverter.ToInt32(dib, 0) != 12) return dib;
+            short width = BitConverter.ToInt16(dib, 4);
+            short height = BitConverter.ToInt16(dib, 6);
+            short bpp = BitConverter.ToInt16(dib, 10);
+            if (width <= 0 || height == 0 || bpp <= 0) return dib;
+            int colors = bpp <= 8 ? 1 << bpp : 0;
+            int paletteBytes = colors * 3;
+            int pixelOffset = 12 + paletteBytes;
+            byte[] header = new byte[40];
+            Array.Copy(BitConverter.GetBytes(40), 0, header, 0, 4);
+            Array.Copy(BitConverter.GetBytes((int)width), 0, header, 4, 4);
+            Array.Copy(BitConverter.GetBytes((int)height), 0, header, 8, 4);
+            Array.Copy(BitConverter.GetBytes((short)1), 0, header, 12, 2);
+            Array.Copy(BitConverter.GetBytes(bpp), 0, header, 14, 2);
+            byte[] palette = new byte[colors * 4];
+            for (int i = 0; i < colors; ++i)
+            {
+                palette[i * 4 + 0] = i * 3 + 2 < dib.Length ? dib[12 + i * 3 + 2] : (byte)0; // B
+                palette[i * 4 + 1] = dib[12 + i * 3 + 1]; // G
+                palette[i * 4 + 2] = dib[12 + i * 3 + 0]; // R
+            }
+            int pixels = Math.Max(0, dib.Length - pixelOffset);
+            byte[] outDib = new byte[40 + palette.Length + pixels];
+            Array.Copy(header, 0, outDib, 0, 40);
+            if (palette.Length > 0) Array.Copy(palette, 0, outDib, 40, palette.Length);
+            if (pixels > 0) Array.Copy(dib, pixelOffset, outDib, 40 + palette.Length, pixels);
+            return outDib;
+        }
+
         public static bool HasAlphaMask(byte[] dib)
         {
             if (dib == null || dib.Length < 40) return false;
+            dib = NormalizeDib(dib);
             short biBitCount = BitConverter.ToInt16(dib, 14);
             if (biBitCount != 32) return false;
             int biSize = BitConverter.ToInt32(dib, 0);
@@ -76,6 +113,7 @@ namespace libmsstyle
         /// </summary>
         public static byte[] ConvertXpDibToPremultipliedPng(byte[] dib, Color? transparentKey, bool anyAlpha = false)
         {
+            dib = NormalizeDib(dib);
             short biBitCount = BitConverter.ToInt16(dib, 14);
             using (Bitmap bmp = biBitCount == 32 ? CreateArgbBitmapFromDib(dib) : CreateBitmapFromDib(dib))
             {

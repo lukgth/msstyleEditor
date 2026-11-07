@@ -227,6 +227,21 @@ namespace libmsstyle.Import
         /// </summary>
         public static bool ParseRcBmp(string v, out int id, out Color? key) => ParseRcBmp(v, out id, out key, out _);
 
+        /// <summary>
+        /// the blend mode of an rcbmp(...) value: 5/6/7 are DirectUI's nine-grid modes (render.cpp GRAPHIC_NineGrid*,
+        /// which take the element's borderthickness as their margins), 1 stretch, 2 per-pixel alpha. Null when the value
+        /// isn't an rcbmp.
+        /// </summary>
+        public static int? RcBmpMode(string v)
+        {
+            if (v == null) return null;
+            var m = Regex.Match(v, @"^rcbmp\s*\(([^)]*)\)$", RegexOptions.IgnoreCase);
+            if (!m.Success) return null;
+            var a = SplitArgs(m.Groups[1].Value);
+            if (a.Count < 2 || !int.TryParse(a[1], out int mode)) return null;
+            return mode;
+        }
+
         public static bool ParseRcBmp(string v, out int id, out Color? key, out bool autoKey)
         {
             id = 0; key = null; autoKey = false;

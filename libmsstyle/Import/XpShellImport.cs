@@ -92,7 +92,9 @@ namespace libmsstyle.Import
             string paneStock = pane.Stock ?? (m_base != null ? m_base.GetAny("element", "atom(sectionlist)", "background") : null);
             var sFill = XpShellStyle.ParseFill(paneSrc);
             var bFill = XpShellStyle.ParseFill(paneStock);
-            if (sFill == null && XpShellStyle.ParseRcBmp(paneSrc, out _, out _)) PaneBitmap(paneSrc);
+            var paneBorder = Both(x => x.Pane, false, "borderthickness");
+            string paneBorderSrc = paneBorder.Src ?? m_src.GetAny("element", "atom(sectionlist)", "borderthickness");
+            if (sFill == null && XpShellStyle.ParseRcBmp(paneSrc, out _, out _)) PaneBitmap(paneSrc, XpShellStyle.ParseRect(paneBorderSrc));
             else if (Usable(sFill, "task pane background"))
             {
                 bool stock = SameFill(sFill, bFill);
@@ -136,6 +138,7 @@ namespace libmsstyle.Import
             TaskHover(false);
             TaskHover(specialMain);
             SectionIcons();
+            GroupBackground();
             ControlPanelPage();
             DetailsText();
             RebarBand();
@@ -337,6 +340,10 @@ namespace libmsstyle.Import
         private const string IconClass = "CommandModule";
         private const int IconPart = 12;
 
+        /// <summary>whether the source shellstyle has any of the special-section icon bitmaps (10/13/22). When it
+        /// hasn't (Glitch), xp drew no icon next to "Picture Tasks"/"Music Tasks" and the template's strip must go too.</summary>
+        public bool HasSectionIcons { get; private set; }
+
         /// <summary>
         /// The special section icons (the music note on Music Tasks). xp drew the shellstyle's bitmap
         /// (duiview.cpp _BuildSection: DUILoadBitmap, GRAPHIC_AlphaConstPerPix, a 32bpp alpha picture); Windows 10
@@ -351,6 +358,7 @@ namespace libmsstyle.Import
                 || !part.States.TryGetValue(0, out var st)) return;
             var src = SectionIconIds.Select(b => m_src.GetBitmap(b)).ToArray();
             var stock = SectionIconIds.Select(b => m_base.GetBitmap(b)).ToArray();
+            HasSectionIcons = src.Any(b => b != null);
             if (src.All(b => b == null) || src.Zip(stock, (s, b) => s == null || SameBytes(s, b)).All(x => x)) return;
             var img = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
             var count = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGECOUNT);
@@ -378,6 +386,51 @@ namespace libmsstyle.Import
             m_imp.Report.Count("applied-shellstyle");
         }
 
+        // xp's special section background pictures (shstyle.h IDB_MUSIC_TASKS_BMP 11, IDB_PICTURES_TASKS_BMP 14,
+        // IDB_VIDEO_TASKS_BMP 20). Windows 10 draws the group's background from CommandModule part 11, one frame per
+        // section: the template's rules read dtb(CommandModule, 11, 1) for music_bg and (11, 2) for photo_bg, the
+        // same shape the working Luna port uses. Frame 0 stays transparent (no art for other groups).
+        private static readonly int[] GroupBackgroundIds = { 11, 14 };
+        private const int GroupPart = 11;
+
+        /// <summary>
+        /// the music/pictures section backgrounds: rebuilds CommandModule part 11's strip from the source shellstyle
+        /// (frames 1 and 2; frame 0 transparent, like xp's plain groups). Stock xp art keeps the template strip.
+        /// </summary>
+        private void GroupBackground()
+        {
+            if (!m_imp.Target.ClassesByName.TryGetValue(IconClass, out var cls) || !cls.Parts.TryGetValue(GroupPart, out var part)
+                || !part.States.TryGetValue(0, out var st)) return;
+            var src = GroupBackgroundIds.Select(b => m_src.GetBitmap(b)).ToArray();
+            var stock = GroupBackgroundIds.Select(b => m_base.GetBitmap(b)).ToArray();
+            if (src.All(b => b == null) || src.Zip(stock, (s, b) => s == null || SameBytes(s, b)).All(x => x)) return;
+            var img = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
+            var count = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGECOUNT);
+            var layout = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGELAYOUT);
+            if (img == null || !(count?.GetValue() is int n) || n != GroupBackgroundIds.Length + 1)
+            { m_imp.Report.Warnings.Add($"shellstyle: the template's {IconClass} part {GroupPart} isn't a {GroupBackgroundIds.Length + 1}-frame picture; the section backgrounds stay."); return; }
+            // keyed like xp's group picture: the art's own background colour turns transparent, the note stays
+            var pics = src.Select((b, i) => b ?? stock[i]).Select(b => b == null ? null
+                : ImageIdentity.Decode(XpShellBitmap(b, null, true))).ToList();
+            if (pics.Any(p => p == null)) { m_imp.Report.Warnings.Add("shellstyle: a section background is missing from both the source and stock shellstyle; the section backgrounds stay."); return; }
+            int w = pics.Max(p => p.Width), h = pics.Max(p => p.Height);
+            bool vertical = layout?.GetValue() is int lo && lo == 0;
+            var strip = vertical ? new ArgbImage(w, h * (pics.Count + 1)) : new ArgbImage(w * (pics.Count + 1), h);
+            for (int i = 0; i < pics.Count; ++i) strip.Blit(pics[i], vertical ? 0 : (i + 1) * w, vertical ? (i + 1) * h : 0);
+            byte[] png = ImageIdentity.EncodePngVerified(strip);
+            int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            if ((img.Header.shortFlag & 0xFFFF) == id) return;
+            img.SetValue(id);
+            m_imp.MarkTouched(img, $"{IconClass}|Part {GroupPart}|S0|IMAGEFILE");
+            m_imp.Report.Decisions.Add(new MergeDecision
+            {
+                Class = IconClass, Part = "Part " + GroupPart, State = 0, Property = "IMAGEFILE", Action = "applied-shellstyle",
+                Reason = "the music and picture section backgrounds of the source shellstyle (bitmaps 11, 14; win10 draws them from this strip, frame 1/2 via dtb(CommandModule, 11, 1/2))",
+                Result = "IMAGE " + id,
+            });
+            m_imp.Report.Count("applied-shellstyle");
+        }
+
         /// <summary>
         /// state of the group background part (normal 5, special 9) that carries the task hover picture, per section
         /// (true = main/special). Only set where the source draws one; <see cref="PatchShellStyleLayout"/> points the
@@ -391,12 +444,28 @@ namespace libmsstyle.Import
         /// </summary>
         public (int Part, int State)? PaneRecord { get; private set; }
 
+        /// <summary>one watermark picture's ExplorerBar record and its height in pixels.</summary>
+        public readonly struct PaneWatermarkRecord
+        {
+            public PaneWatermarkRecord(int part, int state, int height) { Part = part; State = state; Height = height; }
+            public int Part { get; }
+            public int State { get; }
+            public int Height { get; }
+        }
+
         /// <summary>
-        /// ExplorerBar record holding the source's folder watermark (the source shellstyle's sectionlist content
-        /// picture) and its own height in pixels; null where the source has none. <see cref="PatchShellStyleLayout"/>
-        /// adds a bottom band that draws it.
+        /// The source's pane watermarks. <c>All</c> is the taskpane sectionlist's content picture (drawn on every
+        /// folder's pane); <c>Music</c>/<c>Pictures</c> are xp's per-folder pictures (shellstyle bitmaps 12 and 15, IDB_*_LISTVIEW_BMP,
+        /// drawn only on music/picture folders' panes). <see cref="PatchShellStyleLayout"/> adds a bottom band per layout.
         /// </summary>
-        public (int Part, int State, int Height)? WatermarkRecord { get; private set; }
+        public class PaneWatermarkSet
+        {
+            public PaneWatermarkRecord? All { get; set; }
+            public PaneWatermarkRecord? Music { get; set; }
+            public PaneWatermarkRecord? Pictures { get; set; }
+        }
+
+        public PaneWatermarkSet Watermarks { get; } = new PaneWatermarkSet();
 
         /// <summary>
         /// xp's folder watermark: the taskpane sectionlist's content picture (CrystalBlue: rcbmp(113, 2, 255), the "(c)
@@ -404,38 +473,72 @@ namespace libmsstyle.Import
         /// layout has no such element and draws no shellstyle rcbmp, so the picture goes into a spare state of the
         /// background part and the layout patch adds a bottom band that draws it.
         /// </summary>
+        // xp drew two kinds of pane watermark: the taskpane sectionlist's own content picture (every folder's pane) and
+        // per-folder pictures from the shellstyle, chosen by shell32's folder template (music 12, pictures 15,
+        // search 18, video 21; nt5src shell\inc\shstyle.h IDB_*_LISTVIEW_BMP). Windows 10's DirectUI draws no shellstyle
+        // rcbmp, so each picture goes into its own spare state of ExplorerBar part 0, and only the matching folder
+        // layout's pane gets the bottom band that draws it (a plain folder shows none, like xp).
+        private const int MusicWatermarkId = 12;
+        private const int PicturesWatermarkId = 15;
+        // states of part 0 the shell doesn't read: its UIFILE draws state 0 (gradient) and state 1 (pane picture).
+        private const int FirstWatermarkState = 2;
+        private int m_nextWatermarkState = FirstWatermarkState;
+        private const string WatermarkReason = "folder watermark of the source shellstyle (win10 draws it from this record, see the shellstyle layout notes)";
+
         private void PaneWatermark()
         {
+            // the sectionlist content picture: a theme-wide watermark (CrystalBlue: rcbmp(113, 2, 255), "(c) 2006
+            // beginner design"), drawn on every pane. Glitch's rule is a transparent 1x1, so nothing is recorded for it
+            // unless it differs from stock.
             var water = Both(x => x.Pane, false, "content");
-            if (!XpShellStyle.ParseRcBmp(water.Src, out int id, out var key, out bool autoKey)) return;
-            byte[] dib = m_src.GetBitmap(id);
-            if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: folder watermark bitmap {id} is missing; no watermark."); return; }
-            var png = XpShellBitmap(dib, key, autoKey);
-            if (XpShellStyle.ParseRcBmp(water.Stock, out int sid, out var skey, out bool sAuto))
+            if (XpShellStyle.ParseRcBmp(water.Src, out int wid, out Color? wkey, out bool wAuto))
             {
-                byte[] sdib = m_base.GetBitmap(sid);
-                if (sdib != null && SameBytes(png, XpShellBitmap(sdib, skey, sAuto))) return; // stock luna draws the same picture
+                byte[] dib = m_src.GetBitmap(wid);
+                if (dib != null)
+                {
+                    var png = XpShellBitmap(dib, wkey, wAuto);
+                    bool sameAsStock = XpShellStyle.ParseRcBmp(water.Stock, out int sid, out var skey, out bool sAuto)
+                        && (m_base.GetBitmap(sid) is byte[] sdib) && SameBytes(png, XpShellBitmap(sdib, skey, sAuto));
+                    if (!sameAsStock) Watermarks.All = AddWatermark(png, "task pane watermark");
+                }
             }
-
-            if (!m_cls.Parts.TryGetValue(Background, out var p)) return;
-            if (!p.States.TryGetValue(WatermarkState, out var st))
-            {
-                st = new StyleState { StateId = WatermarkState, StateName = "State " + WatermarkState };
-                p.States.Add(WatermarkState, st);
-            }
-            int img = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
-            Put(st, Background, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, "folder watermark", WatermarkReason);       // IMAGEFILE
-            Put(st, Background, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, "folder watermark", WatermarkReason);
-            Put(st, Background, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, "folder watermark", WatermarkReason);
-            Put(st, Background, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, 1, "folder watermark", WatermarkReason);          // STRETCH
-            Put(st, Background, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, new Margins(0, 0, 0, 0), "folder watermark", WatermarkReason);
-            WatermarkRecord = (Background, WatermarkState, ImageIdentity.Decode(png).Height);
+            // the per-folder pictures: only music and picture folders have pane layouts in the win10 templates.
+            Watermarks.Music = FolderWatermark(MusicWatermarkId, "music folder watermark");
+            Watermarks.Pictures = FolderWatermark(PicturesWatermarkId, "picture folder watermark");
         }
 
-        // a state of the background part nothing in the shell draws (the UIFILEs read state 0 through gtc and the
-        // pane picture state 1 through dtb; the watermark band points at this one).
-        private const int WatermarkState = 2;
-        private const string WatermarkReason = "folder watermark of the source shellstyle (win10 draws it from this record, see the shellstyle layout notes)";
+        /// <summary>a per-folder watermark picture (shellstyle bitmap), as a record; null where it's missing or stock.</summary>
+        private PaneWatermarkRecord? FolderWatermark(int id, string reason)
+        {
+            byte[] dib = m_src.GetBitmap(id);
+            if (dib == null) return null;
+            // xp's template drew these with a color key (the picture is white-backed art on the blue pane)
+            var png = XpShellBitmap(dib, Color.White, false);
+            byte[] stock = m_base.GetBitmap(id);
+            if (stock != null && SameBytes(png, XpShellBitmap(stock, Color.White, false))) return null;
+            // fills the strip under the section's rows (the record's SIZINGTYPE is STRETCH)
+            return AddWatermark(png, reason, 1);
+        }
+
+        /// <summary>stores a watermark picture in the next spare state of the background part.</summary>
+        private PaneWatermarkRecord? AddWatermark(byte[] png, string reason, int sizingType = 1)
+        {
+            if (!m_cls.Parts.TryGetValue(Background, out var p)) return null;
+            int state = m_nextWatermarkState++;
+            if (!p.States.TryGetValue(state, out var st))
+            {
+                st = new StyleState { StateId = state, StateName = "State " + state };
+                p.States.Add(state, st);
+            }
+            int img = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
+            Put(st, Background, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, reason, WatermarkReason);       // IMAGEFILE
+            Put(st, Background, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, reason, WatermarkReason);
+            Put(st, Background, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, reason, WatermarkReason);
+            Put(st, Background, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, sizingType, reason, WatermarkReason);  // 0 TRUESIZE, 1 STRETCH
+            Put(st, Background, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, new Margins(0, 0, 0, 0), reason, WatermarkReason);
+            return new PaneWatermarkRecord(Background, state, ImageIdentity.Decode(png).Height);
+        }
+
 
         /// <summary>an XP shellstyle bitmap as the png win10 stores: the color key (or its automatic top-left pixel)
         /// see-through, per-pixel alpha where the DirectUI mode has none (mode 2).</summary>
@@ -461,7 +564,49 @@ namespace libmsstyle.Import
         /// own last column and row out to <see cref="PaneTileWidth"/> x <see cref="PaneTileHeight"/>, so a wider or
         /// taller pane continues the picture's edge colors instead of repeating it.
         /// </summary>
-        private void PaneBitmap(string v)
+        /// <summary>a picture without its left and right border columns (the band spans the window, so those would
+        /// draw as vertical strips at its edges).</summary>
+        private static ArgbImage CropColumns(ArgbImage pic, int left, int right)
+        {
+            int l = Math.Max(0, Math.Min(left, pic.Width / 2 - 1));
+            int r = Math.Max(0, Math.Min(right, pic.Width - l - 1));
+            int w = pic.Width - l - r;
+            var dst = new ArgbImage(w, pic.Height);
+            for (int y = 0; y < pic.Height; ++y)
+                for (int x = 0; x < w; ++x)
+                    dst.Pixels[y * w + x] = pic.Pixels[y * pic.Width + (x + l)];
+            return dst;
+        }
+
+        /// <summary>draws <paramref name="pic"/> nine-sliced into <paramref name="dst"/>: the border pixels keep their
+        /// size, the middle stretches. The margins are clamped to the picture so a pack with oversized margins still
+        /// renders.</summary>
+        private static void NineSlice(ArgbImage pic, Margins m, ArgbImage dst)
+        {
+            int l = Math.Max(0, Math.Min(m.Left, pic.Width - 1)), r = Math.Max(0, Math.Min(m.Right, pic.Width - 1 - l));
+            int t = Math.Max(0, Math.Min(m.Top, pic.Height - 1)), b = Math.Max(0, Math.Min(m.Bottom, pic.Height - 1 - t));
+            int dl = Math.Min(l, dst.Width - 1), dr = Math.Min(r, dst.Width - 1 - dl);
+            int dt = Math.Min(t, dst.Height - 1), db = Math.Min(b, dst.Height - 1 - dt);
+            for (int y = 0; y < dst.Height; ++y)
+            {
+                int sy;
+                if (y < dt) sy = y;
+                else if (y >= dst.Height - db) sy = pic.Height - (dst.Height - y);
+                else sy = t + (int)((long)(y - dt) * (pic.Height - t - b) / Math.Max(1, dst.Height - dt - db));
+                sy = Math.Max(0, Math.Min(sy, pic.Height - 1));
+                for (int x = 0; x < dst.Width; ++x)
+                {
+                    int sx;
+                    if (x < dl) sx = x;
+                    else if (x >= dst.Width - dr) sx = pic.Width - (dst.Width - x);
+                    else sx = l + (int)((long)(x - dl) * (pic.Width - l - r) / Math.Max(1, dst.Width - dl - dr));
+                    sx = Math.Max(0, Math.Min(sx, pic.Width - 1));
+                    dst.Pixels[y * dst.Width + x] = pic.Pixels[sy * pic.Width + sx];
+                }
+            }
+        }
+
+        private void PaneBitmap(string v, Margins thick)
         {
             XpShellStyle.ParseRcBmp(v, out int id, out var key, out bool autoKey);
             var dib = m_src.GetBitmap(id);
@@ -471,13 +616,41 @@ namespace libmsstyle.Import
                 uint p0 = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null)).Pixels[0];
                 key = Color.FromArgb((int)((p0 >> 16) & 0xFF), (int)((p0 >> 8) & 0xFF), (int)(p0 & 0xFF));
             }
+            // nine-grid pictures (rcbmp mode 5/6/7) are a frame: their borderthickness says which edges stay put and
+            // which middle stretches, so they go in whole with those margins (stretch + SIZINGMARGINS is a nine-grid in
+            // the theme records). The padding below would leave the frame's top-left corner in place and continue its
+            // last row down the pane (Glitch's 159x83 black-body frame showed a grey strip instead of the body).
+            int? mode = XpShellStyle.RcBmpMode(v);
+            bool nineGrid = mode.HasValue && mode.Value >= 5 && mode.Value <= 7 && thick != null
+                && (thick.Left | thick.Top | thick.Right | thick.Bottom) != 0;
+            byte[] png;
+            Margins sizing;
+            int sizingType;
             var pic = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null));
             int w = Math.Max(pic.Width, PaneTileWidth), h = Math.Max(pic.Height, PaneTileHeight);
             var padded = new ArgbImage(w, h);
-            for (int y = 0; y < h; ++y)
-                for (int x = 0; x < w; ++x)
-                    padded.Pixels[y * w + x] = pic.Pixels[Math.Min(y, pic.Height - 1) * pic.Width + Math.Min(x, pic.Width - 1)];
-            byte[] png = ImageIdentity.EncodePngVerified(padded);
+            if (nineGrid)
+            {
+                // Explorer's pane renderer stretches the ExplorerBar picture across the whole pane and ignores the
+                // record's SIZINGMARGINS (tried live: the frame's top band scaled with the pane), so the nine-grid is
+                // rendered into the tile here: borders keep their pixels, the middle stretches.
+                // the band spans the window: the frame's left/right border columns would show as light vertical
+                // strips at its edges, so they are cropped away and the gradient between them spans the band's width.
+                NineSlice(CropColumns(pic, thick.Left, thick.Right), new Margins(0, thick.Top, 0, thick.Bottom), padded);
+                // STRETCH, not TILE: in the band layout the pane is a full-width strip on top, so the picture has to
+                // scale across it (a tile would repeat the frame's left/right borders every 210px).
+                sizing = new Margins(0, 0, 0, 0);
+                sizingType = 1; // STRETCH
+            }
+            else
+            {
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x)
+                        padded.Pixels[y * w + x] = pic.Pixels[Math.Min(y, pic.Height - 1) * pic.Width + Math.Min(x, pic.Width - 1)];
+                sizing = new Margins(0, 0, 0, 0);
+                sizingType = 2; // TILE
+            }
+            png = ImageIdentity.EncodePngVerified(padded);
             if (!m_cls.Parts.TryGetValue(Background, out var p)) return;
             if (!p.States.TryGetValue(PaneState, out var st))
             {
@@ -489,8 +662,8 @@ namespace libmsstyle.Import
             Put(st, Background, IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0, what, PaneReason);              // IMAGEFILE
             Put(st, Background, IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, img, what, PaneReason);
             Put(st, Background, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, 1, what, PaneReason);
-            Put(st, Background, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, 2, what, PaneReason);          // TILE
-            Put(st, Background, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, new Margins(0, 0, 0, 0), what, PaneReason);
+            Put(st, Background, IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, sizingType, what, PaneReason);
+            Put(st, Background, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, sizing, what, PaneReason);
             PaneRecord = (Background, PaneState);
         }
 
@@ -1142,7 +1315,8 @@ namespace libmsstyle.Import
         /// </summary>
         public static (List<string> notes, List<string> warnings) PatchShellStyleLayout(string win10ShellStyle, XpShellStyle source, XpShellStyle stock,
             IReadOnlyDictionary<bool, Margins> headerMargins, IReadOnlyDictionary<bool, (int Part, int State)> hoverRecords,
-            (int Part, int State)? paneRecord, (int Part, int State, int Height)? watermarkRecord, bool dryRun)
+            (int Part, int State)? paneRecord, PaneWatermarkSet watermarks, bool dryRun, bool taskBand = true,
+            bool noSectionIcons = false)
         {
             var notes = new List<string>(); var warnings = new List<string>();
             DuiCascade src = new DuiCascade(source), bas = new DuiCascade(stock);
@@ -1214,6 +1388,17 @@ namespace libmsstyle.Import
                     int se = sb < 0 ? -1 : t.IndexOf("</style>", sb, StringComparison.Ordinal);
                     if (se < 0) { warnings.Add("shellstyle layout: the template's UIFILE 1 has no ExplorerBarStyle sheet; section spacing and title alignment stay."); break; }
                     string sheet = t.Substring(sb, se - sb);
+                    if (taskBand)
+                    {
+                        // the ExplorerBarBackground element is 200rp wide for the left pane; the band spans the window.
+                        int wi = sheet.IndexOf(" width=\"200rp\"", StringComparison.Ordinal);
+                        if (wi >= 0)
+                        {
+                            sheet = sheet.Remove(wi, " width=\"200rp\"".Length);
+                            notes.Add("shellstyle layout: task pane is a band across the top (xp's My Computer layout), not the 200rp left pane; the ExplorerBarBackground width goes.");
+                        }
+                        else warnings.Add("shellstyle layout: no width=\"200rp\" on the ExplorerBarBackground element; the band may not span the window.");
+                    }
                     if (paneRecord.HasValue)
                     {
                         const string paneFill = "background=\"gradient(gtc(ExplorerBar,0,0,3810), gtc(ExplorerBar,0,0,3811), 1)\"";
@@ -1225,20 +1410,6 @@ namespace libmsstyle.Import
                         {
                             sheet = sheet.Substring(0, pf) + $"background=\"dtb(ExplorerBar, {paneRecord.Value.Part}, {paneRecord.Value.State})\"" + sheet.Substring(pf + paneFill.Length);
                             notes.Add($"shellstyle layout: task pane background drawn with dtb(ExplorerBar, {paneRecord.Value.Part}, {paneRecord.Value.State}), the source's background picture.");
-                        }
-                    }
-                    {
-                        // the special section in music/picture folders (accname music_bg/photo_bg) paints CommandModule
-                        // part 11, the port's own music/picture background picture; xp drew those folders' section with
-                        // the same art as every other special group, and its light picture left the source's white group
-                        // text invisible, so the overrides go and ExplorerBar's group background shows.
-                        var special = new System.Text.RegularExpressions.Regex(
-                            @"\s*<if accname=""(?:music|photo)_bg"">\s*<clipper background=""themeable\(dtb\(CommandModule,\s*11,\s*\d\),\s*window\)""/>\s*</if>",
-                            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                        if (special.IsMatch(sheet))
-                        {
-                            sheet = special.Replace(sheet, "");
-                            notes.Add("shellstyle layout: music and picture folder groups (accname music_bg/photo_bg) draw the theme's special group background instead of CommandModule part 11, whose light picture left the source's white group text unreadable.");
                         }
                     }
                     if (gapDelta != 0)
@@ -1299,15 +1470,6 @@ namespace libmsstyle.Import
                             notes.Add($"shellstyle layout: place links (NavigateButton) hover with dtb(ExplorerBar, {np}, {ns}), the source's task hover background; the row's 5rp/2rp padding moved onto the link's icon and label so the bar covers it.");
                         }
                     }
-                    if (watermarkRecord.HasValue)
-                    {
-                        int wp = watermarkRecord.Value.Part, ws = watermarkRecord.Value.State;
-                        const string style = "<style resid=\"ExplorerBarStyle\">";
-                        // the band is a bottom child of the pane element (SHELL32_UIFILE patch below); its picture comes
-                        // from the record, since win10's DirectUI draws no shellstyle rcbmp.
-                        sheet = sheet.Insert(style.Length, $"\r\n\t\t\t<if class=\"PaneWatermark\">\r\n\t\t\t\t<element background=\"dtb(ExplorerBar, {wp}, {ws})\"/>\r\n\t\t\t</if>");
-                        notes.Add($"shellstyle layout: folder watermark drawn with dtb(ExplorerBar, {wp}, {ws}), the source shellstyle's pane watermark, on a bottom band.");
-                    }
                     t = t.Substring(0, sb) + sheet + t.Substring(se);
                     if (taskHover.HasValue)
                     {
@@ -1344,17 +1506,21 @@ namespace libmsstyle.Import
                     // when the template already fits the source's titles and task rows.
                     var pattern = stretch.Count == 0 ? null : new System.Text.RegularExpressions.Regex($@"(<button class=""(?:{string.Join("|", stretch)})"")\s+layoutpos=""left""", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                     const string list = "<element id=\"atom(tasklist)\" layoutpos=\"top\" layout=\"verticalflowlayout(0,0,0)\">";
-                    const string item = "<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\">";
+                    const string item = "<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">";
                     const string pane = "class=\"ExplorerBarBackground\">";
-                    int files = 0, rowFiles = 0, bandFiles = 0, detailsOpen = 0;
-                    string band = watermarkRecord.HasValue
-                        ? $"\r\n\t\t\t\t<element class=\"PaneWatermark\" layoutpos=\"bottom\" height=\"{watermarkRecord.Value.Height}rp\"/>"
-                        : null;
+                    int files = 0, rowFiles = 0, bandFiles = 0, detailsOpen = 0, bandLayoutFiles = 0;
+
                     foreach (uint id in ResourceIds(mod, "SHELL32_UIFILE"))
                         foreach (var (lang, text, utf16) in TextResources(mod, "SHELL32_UIFILE", id))
                         {
                             string t = pattern == null ? text : pattern.Replace(text, "$1");
                             if (pattern != null && t != text) files++;
+                            // which picture this folder's pane gets: the theme-wide one (xp's sectionlist content
+                            // picture) on any folder, else the music/picture folders' own picture (xp's shellstyle
+                            // bitmaps 12/15), else none (a plain folder's pane had none).
+                            // only the theme-wide picture becomes a band; the per-folder pictures are the music/picture
+                            // task list's own background (patched below in the stylesheet), like xp's sectionlist content.
+                            PaneWatermarkRecord? layoutWatermark = watermarks?.All;
                             {
                                 // the Details section's Expando starts Expanded="false"; Windows 10 then shows the section
                                 // closed (title row only) until the info module has an item, while xp drew the folder's own
@@ -1390,12 +1556,32 @@ namespace libmsstyle.Import
                                 if (r != t) rowFiles++;
                                 t = r;
                             }
-                            if (band != null && t.Contains(pane))
+                            if (!taskBand && layoutWatermark.HasValue && t.Contains(pane))
                             {
                                 // the band is a child of the pane element (borderlayout): pinned to the pane's bottom,
                                 // inside its padding, so the picture gets xp's content box (the source's 12rp/1rp padding).
+                                // inline picture: the shared ExplorerBarStyle can't give each folder layout its own picture.
+                                string band = $"\r\n\t\t\t\t<element class=\"PaneWatermark\" layoutpos=\"bottom\" height=\"{layoutWatermark.Value.Height}rp\" background=\"dtb(ExplorerBar, {layoutWatermark.Value.Part}, {layoutWatermark.Value.State})\"/>";
                                 string r = t.Replace(pane, pane + band);
                                 if (r != t) bandFiles++;
+                                t = r;
+                            }
+                            if (noSectionIcons && t.Contains("dtb(CommandModule, 12,"))
+                            {
+                                // the source theme drew no icon beside "Picture Tasks"/"Music Tasks" (no shellstyle
+                                // bitmap 10/13/22), but the template's strip would still show its own art there.
+                                var icon = new System.Text.RegularExpressions.Regex(
+                                    @"\s*<button\s+layoutpos=""left""\s+active=""inactive""\s+content=""themeable\(dtb\(CommandModule,\s*12,\s*\d\),''\)""\s*/>");
+                                if (icon.IsMatch(t))
+                                {
+                                    t = icon.Replace(t, "");
+                                    bandLayoutFiles++;
+                                }
+                            }
+                            if (taskBand && t.Contains(pane))
+                            {
+                                string r = BandLayout(t, t.Contains("content=\"System Tasks\""));
+                                if (r != t) bandLayoutFiles++;
                                 t = r;
                             }
                             if (t != text) updates.Add(("SHELL32_UIFILE", id, lang, Encode(t, utf16)));
@@ -1410,10 +1596,15 @@ namespace libmsstyle.Import
                         if (rowFiles == 0) warnings.Add("shellstyle layout: the template's task lists aren't verticalflowlayout(0,0,0) / flowlayout() rows; the hover background covers only the text.");
                         else notes.Add($"shellstyle layout: task rows stretched to the task list's width (hover covers the row as on xp), in {rowFiles} pane layouts.");
                     }
-                    if (band != null)
+                    if (!taskBand && watermarks?.All != null)
                     {
                         if (bandFiles == 0) warnings.Add("shellstyle layout: no ExplorerBarBackground element in the template's SHELL32_UIFILE markup; the folder watermark isn't drawn.");
-                        else notes.Add($"shellstyle layout: folder watermark on a {watermarkRecord.Value.Height}rp bottom band of the pane, in {bandFiles} pane layouts.");
+                        else notes.Add($"shellstyle layout: folder watermark on a bottom band of the pane, in {bandFiles} pane layouts (theme-wide picture: {(watermarks?.All != null ? "yes" : "no")}, music/pictures pictures: {(watermarks?.Music != null ? "yes" : "no")}/{(watermarks?.Pictures != null ? "yes" : "no")}).");
+                    }
+                    if (taskBand)
+                    {
+                        if (bandLayoutFiles == 0) warnings.Add("shellstyle layout: no left-docked sidebar with ExplorerBarBackground in the template's SHELL32_UIFILE markup; the pane stays on the left.");
+                        else notes.Add($"shellstyle layout: task pane moved to a band across the top (xp's WebView layout) in {bandLayoutFiles} folder layouts; the pane's other sections (Other Places, Details) are dropped, the folder's own tasks stay.");
                     }
                     if (detailsOpen > 0)
                         notes.Add($"shellstyle layout: details section open from the start (Expanded=\"true\") in {detailsOpen} pane layouts; win10 leaves it closed until the info module has an item, xp showed the folder's own name/type.");
@@ -1430,6 +1621,153 @@ namespace libmsstyle.Import
             foreach (var u in updates) ok &= Win32Api.UpdateResource(h, u.type, u.id, u.lang, u.data, (uint)u.data.Length);
             if (!Win32Api.EndUpdateResource(h, !ok) || !ok) throw new IOException($"updating the layout in \"{win10ShellStyle}\" failed");
             return (notes, warnings);
+        }
+
+        /// <summary>
+        /// Turns one folder layout's left sidebar into xp's band across the top. Windows 10's folder template
+        /// (SHELL32_UIFILE, "FolderLayout") docks the pane with <c>&lt;element layoutpos="left"&gt;</c> around a
+        /// 210rp scrollviewer, then stacks "System Tasks"/"File and Folder Tasks", "Other Places" and "Details" in it;
+        /// xp's My Computer/My Documents WebView draws the folder's own tasks as a full-width band under one header.
+        /// The sidebar becomes a <c>layoutpos="top"</c> element, its scrollviewer loses the fixed width, the folder tree
+        /// module goes (the band has no tree), and only the first Expando (the folder's task list) stays.
+        /// </summary>
+        private static string BandLayout(string t, bool systemTasks)
+        {
+            int pane = t.IndexOf("class=\"ExplorerBarBackground\">", StringComparison.Ordinal);
+            if (pane < 0) return t;
+            int side = t.LastIndexOf("<element layoutpos=\"left\"", pane, StringComparison.Ordinal);
+            if (side < 0) return t;
+            int sideTag = t.IndexOf('>', side);
+            if (sideTag < 0) return t;
+            string tag = t.Substring(side, sideTag - side);
+            t = t.Substring(0, side) + tag.Replace("layoutpos=\"left\"", "layoutpos=\"top\"") + t.Substring(sideTag);
+            int scroller = t.IndexOf("<scrollviewer", side, StringComparison.Ordinal);
+            if (scroller >= 0)
+            {
+                int sc = t.IndexOf('>', scroller);
+                if (sc > scroller)
+                    t = t.Substring(0, scroller) + t.Substring(scroller, sc - scroller)
+                        .Replace(" width=\"210rp\"", "")
+                        .Replace(" borderthickness=\"rect(1rp, 0, 0, 1rp)\" bordercolor=\"window\"", "") + t.Substring(sc);
+            }
+            int tree = t.IndexOf("<ProperTreeModule", side, StringComparison.Ordinal);
+            if (tree >= 0)
+            {
+                int te = t.IndexOf("/>", tree, StringComparison.Ordinal);
+                if (te > tree) t = t.Substring(0, tree) + t.Substring(te + 2);
+            }
+            // only the folder's own section stays: drop the second and later Expandos of the pane element.
+            int pane2 = t.IndexOf("class=\"ExplorerBarBackground\">", StringComparison.Ordinal);
+            int exp = pane2 < 0 ? -1 : t.IndexOf("<Expando", pane2, StringComparison.Ordinal);
+            if (exp < 0) return t;
+            var spans = new List<(int Start, int End)>();
+            int at = exp;
+            while (at >= 0)
+            {
+                int end = CloseExpandos(t, at);
+                if (end < 0) break;
+                spans.Add((at, end));
+                at = t.IndexOf("<Expando", end, StringComparison.Ordinal);
+            }
+            for (int k = spans.Count - 1; k >= 1; --k)
+                t = t.Substring(0, spans[k].Start) + t.Substring(spans[k].End);
+            // xp's band header: 28px tall, title text at x=18 (header padding 13 + the 5 CONTENTMARGINS), the
+            // collapse arrow's right edge 13px from the band's edge (measured on the xp reference).
+            t = t.Replace("<accessiblebutton id=\"atom(arrow)\" class=\"NormalGroupHeader\" layoutpos=\"top\" layout=\"filllayout()\">",
+                "<accessiblebutton id=\"atom(arrow)\" class=\"NormalGroupHeader\" layoutpos=\"top\" layout=\"filllayout()\" height=\"28rp\" padding=\"rect(13rp,0,13rp,0)\">");
+            t = t.Replace("<accessiblebutton id=\"atom(arrow)\" class=\"SpecialGroupHeader\" layoutpos=\"bottom\" layout=\"borderlayout()\">",
+                "<accessiblebutton id=\"atom(arrow)\" class=\"SpecialGroupHeader\" layoutpos=\"bottom\" layout=\"borderlayout()\" height=\"28rp\" padding=\"rect(13rp,0,13rp,0)\">");
+            if (!systemTasks)
+            {
+                // sections whose tasks are plain links (Picture Tasks) instead of the folder command module: put them
+                // in one row as xp's band did. The command module sections (File and Folder Tasks) can't reflow: the
+                // module lays its own command elements out in a column, and a row/border layout on the module, its
+                // clipper or its tasklist, and hosting the module directly changed nothing (checked live).
+                int tlist = t.IndexOf("<element id=\"atom(tasklist)\"", pane2, StringComparison.Ordinal);
+                int tclose = tlist < 0 ? -1 : t.IndexOf('>', tlist);
+                int tend = tlist < 0 ? -1 : CloseElement(t, tlist);
+                if (tlist >= 0 && tclose > tlist && tend > tclose
+                    && t.IndexOf("<FolderBandModule", tlist, tend - tlist, StringComparison.Ordinal) < 0)
+                {
+                    string listTag = t.Substring(tlist, tclose - tlist);
+                    if (listTag.Contains("layout=\""))
+                        listTag = System.Text.RegularExpressions.Regex.Replace(listTag, "layout=\"[^\"]*\"", "layout=\"rowlayout()\"");
+                    else listTag += " layout=\"rowlayout()\"";
+                    listTag += " height=\"22rp\"";
+                    t = t.Substring(0, tlist) + listTag + t.Substring(tclose);
+                }
+                return t;
+            }
+
+            // "System Tasks" (My Computer). Windows 10 draws its three commands with a FolderBandModule, whose native
+            // toolbar is vertical inside a task pane: the band showed them three rows tall. xp's band puts them side
+            // by side in one row. The three commands are the same xp ran, so each becomes a NavigateButton in a row
+            // layout (shell targets: System Properties, Add or Remove Programs, Control Panel).
+            int list = t.IndexOf("<element id=\"atom(tasklist)\"", pane2, StringComparison.Ordinal);
+            if (list >= 0)
+            {
+                int listTag = t.IndexOf('>', list);
+                int listEnd = CloseElement(t, list);
+                int mod = t.IndexOf("<FolderBandModule", list, StringComparison.Ordinal);
+                if (listTag > list && listEnd > listTag && mod >= 0 && mod < listEnd)
+                {
+                    string head = "<element id=\"atom(tasklist)\" layoutpos=\"top\" height=\"22rp\" padding=\"rect(10rp,0,0,0)\" layout=\"rowlayout()\">";
+                    string tail = "</element>";
+                    string buttons =
+                        "\r\n\t\t\t\t\t\t\t<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">\r\n" +
+                        "\t\t\t\t\t\t\t\t<NavigateButton layout=\"borderlayout()\" shellexecute=\"sysdm.cpl\">\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"icon\" layoutpos=\"left\" content=\"icon(253, sysmetric(49), sysmetric(50), library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"View system information\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t</NavigateButton>\r\n" +
+                        "\t\t\t\t\t\t\t</element>\r\n" +
+                        "\t\t\t\t\t\t\t<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">\r\n" +
+                        "\t\t\t\t\t\t\t\t<NavigateButton layout=\"borderlayout()\" shellexecute=\"appwiz.cpl\">\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"icon\" layoutpos=\"left\" content=\"icon(271, sysmetric(49), sysmetric(50), library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"Add or remove programs\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t</NavigateButton>\r\n" +
+                        "\t\t\t\t\t\t\t</element>\r\n" +
+                        "\t\t\t\t\t\t\t<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">\r\n" +
+                        "\t\t\t\t\t\t\t\t<NavigateButton layout=\"borderlayout()\" shellexecute=\"control.exe\">\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"icon\" layoutpos=\"left\" content=\"icon(137, sysmetric(49), sysmetric(50), library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"Change a setting\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t</NavigateButton>\r\n" +
+                        "\t\t\t\t\t\t\t</element>";
+                    t = t.Substring(0, list) + head + buttons + "\r\n\t\t\t\t\t\t" + tail + t.Substring(listEnd);
+                }
+            }
+            return t;
+        }
+
+        /// <summary>the index just past the &lt;/element&gt; matching the element tag at <paramref name="start"/>.</summary>
+        private static int CloseElement(string t, int start)
+        {
+            int depth = 0, at = start;
+            while (true)
+            {
+                int open = t.IndexOf("<element", at, StringComparison.OrdinalIgnoreCase);
+                int close = t.IndexOf("</element>", at, StringComparison.OrdinalIgnoreCase);
+                if (close < 0) return -1;
+                if (open >= 0 && open < close) { depth++; at = open + 8; continue; }
+                depth--;
+                at = close + "</element>".Length;
+                if (depth <= 0) return at;
+            }
+        }
+
+        /// <summary>the index just past the &lt;/Expando&gt; matching the &lt;Expando ...&gt; at <paramref name="start"/>.</summary>
+        private static int CloseExpandos(string t, int start)
+        {
+            int depth = 0, at = start;
+            while (true)
+            {
+                int open = t.IndexOf("<Expando", at, StringComparison.OrdinalIgnoreCase);
+                int close = t.IndexOf("</Expando>", at, StringComparison.OrdinalIgnoreCase);
+                if (close < 0) return -1;
+                if (open >= 0 && open < close) { depth++; at = open + 8; continue; }
+                depth--;
+                at = close + "</Expando>".Length;
+                if (depth <= 0) return at;
+            }
         }
 
         private static byte[] Encode(string t, bool utf16)

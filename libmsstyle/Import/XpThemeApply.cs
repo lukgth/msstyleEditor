@@ -151,7 +151,7 @@ namespace libmsstyle.Import
         /// Applies <paramref name="themePath"/> (a .theme installed under %WINDIR%\Resources\Themes) without opening any
         /// Windows UI. Returns notes for each section and Ok only when the visual style itself was accepted by uxtheme.
         /// </summary>
-        public static ThemeApplyResult Apply(string themePath)
+        public static ThemeApplyResult Apply(string themePath, bool styleOnly = false)
         {
             var r = new ThemeApplyResult();
             if (!File.Exists(themePath)) throw new FileNotFoundException("theme file not found", themePath);
@@ -182,6 +182,13 @@ namespace libmsstyle.Import
             }
             r.Ok = true;
             r.Notes.Add($"style: {Path.GetFileName(stylePath)} ({color}, {size})");
+            if (styleOnly)
+            {
+                // the style is the only step that matters when iterating on a port: colors, desktop picture, metrics and
+                // icons each broadcast WM_SETTINGCHANGE and take tens of seconds with a busy desktop.
+                r.Notes.Add("style-only: colors, desktop, metrics, cursors, sounds and icons kept");
+                return r;
+            }
 
             // windows swaps the style on its own thread; touching metrics/colors before it is done lets it clobber them
             // (the editor's preview waits the same 500 ms for this).

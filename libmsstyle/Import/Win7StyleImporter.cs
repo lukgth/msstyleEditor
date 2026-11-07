@@ -104,7 +104,8 @@ namespace libmsstyle.Import
                     m_headerMargins = shell?.HeaderContentMargins();
                     m_hoverRecords = shell?.HoverRecords;
                     m_paneRecord = shell?.PaneRecord;
-                    m_watermarkRecord = shell?.WatermarkRecord;
+                    m_watermarkRecord = shell?.Watermarks;
+                    m_noSectionIcons = shell != null && !shell.HasSectionIcons;
                     ReportTemplateOnlyImages();
                     CollectFrameWaivers();
 
@@ -153,7 +154,8 @@ namespace libmsstyle.Import
         // ExplorerBar record holding the source's task pane background picture, for the same patch.
         private (int Part, int State)? m_paneRecord;
         // ExplorerBar record holding the source's folder watermark and its height, for the same patch.
-        private (int Part, int State, int Height)? m_watermarkRecord;
+        private XpShellImport.PaneWatermarkSet m_watermarkRecord;
+        private bool m_noSectionIcons;
 
         /// <summary>
         /// source and stock shellstyle for this scheme. A source without Shell\&lt;scheme&gt;\shellstyle.dll is drawn
@@ -221,7 +223,7 @@ namespace libmsstyle.Import
                         + "; nothing to replace, so Shell\\NormalColor keeps the port's own bitmaps, which are that same stock art transcribed for win10.");
                 m_report.Count("shellstyle-bitmaps-replaced", ids.Count);
                 m_report.AddNoteIfAny("shellstyle: {0} ExplorerBar records follow the source shellstyle. The win10 task pane is drawn from msstyles ExplorerBar records, and the port transcribed stock xp's shellstyle into them; where the source shellstyle resolves to that stock art the template's transcription stays.", "restored-shellstyle");
-                var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, m_paneRecord, m_watermarkRecord, false);
+                var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, m_paneRecord, m_watermarkRecord, false, m_opt.TaskBand, m_noSectionIcons);
                 m_report.Notes.AddRange(notes);
                 m_report.Warnings.AddRange(warnings);
             }
