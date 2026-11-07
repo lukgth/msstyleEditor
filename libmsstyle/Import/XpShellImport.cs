@@ -951,8 +951,17 @@ namespace libmsstyle.Import
                 return;
             }
 
-            PlaceImage(img, part, ImageIdentity.EncodePngVerified(Paint(src.Fill, src.Border, src.Thickness, out var sizing)), $"{what} background {src.Key}");
-            if (sizing == null) RestoreGeometry(part); // the tile's 1px frame stays a frame with the luna port's 1px margins.
+            bool solid = src.Fill != null && src.Fill.Value.Stops.Length == 1 && src.Fill.Value.Opaque;
+            // A solid colour fills the group body edge to edge on xp: MSN's tasklist border (2,0,2,2) is not drawn
+            // there, and stretching a 10x10 tile with the template's 1px margins scaled that border into a wide band.
+            // Only when the template's margins can't hold the border (they're smaller) is it dropped; where the margins
+            // match the border (stock luna's 1px frame) it stays a frame.
+            var tpl = m_snapshot.TryGetValue(K(part, 0, IDENTIFIER.SIZINGMARGINS), out var tplM) && tplM.GetValue() is Margins tm ? tm : new Margins(0, 0, 0, 0);
+            bool dropFrame = solid && (tpl.Left < src.Thickness.Left || tpl.Top < src.Thickness.Top || tpl.Right < src.Thickness.Right || tpl.Bottom < src.Thickness.Bottom);
+            var thick = dropFrame ? new Margins(0, 0, 0, 0) : src.Thickness;
+            PlaceImage(img, part, ImageIdentity.EncodePngVerified(Paint(src.Fill, src.Border, thick, out var sizing)), $"{what} background {src.Key}");
+            if (dropFrame) SetGeometry(part, new Margins(0, 0, 0, 0), "group background is a flat colour, stretched without a border");
+            else if (sizing == null) RestoreGeometry(part); // the tile's 1px frame stays a frame with the luna port's 1px margins.
             else SetGeometry(part, sizing, "group background is a gradient, stretched");
             // FILLCOLOR is what win10 fills the group with where the picture isn't used; a see-through group has none.
             if (Find(part, 0, IDENTIFIER.FILLCOLOR) != null && src.Fill.Value.Opaque) SetColor(part, 0, IDENTIFIER.FILLCOLOR, src.Fill.Value.Stops[0], what + " background");
