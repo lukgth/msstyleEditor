@@ -123,9 +123,11 @@ namespace libmsstyle.Import
                             m_report.Notes.Add($"{label}: template redrew this strip; it takes part {mapDonors[donorKey]}'s frame map, the part it is drawn on.");
                         }
                         if (map == null && sc != null && IsGripper(bc.ClassName, bp.PartId)
-                            && RefitOwnFrames(m_source, sc, bp.PartId, bs.StateId, tg, tc, out var refit))
+                            && sc.Parts.TryGetValue(bp.PartId, out var gripPart) && gripPart.States.TryGetValue(bs.StateId, out var gripState)
+                            && !SamePictures(gripState, images)
+                            && RefitOwnFrames(m_source, sc, bp.PartId, bs.StateId, tg, out var refit))
                         {
-                            m_report.Notes.Add($"{label}: template re-cut the strip from {bg} to {tg} frames with art that isn't stock xp; the source's own {refit} gripper frames are repeated into the template's {tg} cut so the merge carries them.");
+                            m_report.Notes.Add($"{label}: template redrew the resize grip; the source's own {refit} alignment frames are retained at their native size and expanded into {tg} frames (top alignments reflected vertically).");
                             m_report.Count("xp-strip-refit");
                             continue;
                         }
@@ -173,49 +175,46 @@ namespace libmsstyle.Import
             }
         }
 
-        /// <summary>the strips xp cuts into its own states and win10 re-cut into another count where no stock map
-        /// exists: the status bar's size grip (xp: 2 frames, the win10/Luna10 template: 8).</summary>
+        /// <summary>Both native resize-grip consumers use right/left alignment frames on XP.</summary>
         private static bool IsGripper(string className, int part) =>
-            string.Equals(className, "Status", StringComparison.OrdinalIgnoreCase) && part == 3;
+            (string.Equals(className, "Status", StringComparison.OrdinalIgnoreCase) && part == 3)
+            || (string.Equals(className, "ScrollBar", StringComparison.OrdinalIgnoreCase) && part == 10);
 
         /// <summary>
-        /// Rebuilds the source's gripper strip in the template's cut: the source's own frames (xp's normal/pressed
-        /// grip art) are scaled to the template's frame size and repeated across the template's frame count and
-        /// orientation. The merge then sees a source picture that splits the template's way and carries it into
-        /// every dpi slot (the template's own gripper art is redrawn, so it can't be mapped by pixels).
+        /// XP supplies right/left size grips; Win10 adds top and half alignment states. Keep each
+        /// consumer's own art and native true-size dimensions, not the template's redrawn glyph size.
+        /// The eight states are right, left, top-right, top-left, then their half-size counterparts.
+        /// The latter use the same full motif in the template; only the top variants need reflection.
+        /// Stock source art is deliberately not refitted, preserving the template's stock adaptations.
         /// </summary>
-        private bool RefitOwnFrames(VisualStyle srcStyle, StyleClass sc, int part, int state, Geometry tg, StyleClass tc, out string sourceCut)
+        private bool RefitOwnFrames(VisualStyle srcStyle, StyleClass sc, int part, int state, Geometry tg, out string sourceCut)
         {
             sourceCut = null;
             if (sc == null || !sc.Parts.TryGetValue(part, out var sp) || !sp.States.TryGetValue(state, out var ss)) return false;
-            var img = ss.Properties.FirstOrDefault(p => StripIds.Contains(p.Header.nameID));
-            var pic = img == null ? null : Decode(srcStyle, img);
-            if (pic == null) return false;
             var sg = GeometryOf(srcStyle, sc, part, state);
-            int fw = sg.Horizontal ? pic.Width / Math.Max(1, sg.Count) : pic.Width;
-            int fh = sg.Horizontal ? pic.Height : pic.Height / Math.Max(1, sg.Count);
-            if (fw <= 0 || fh <= 0) return false;
-            sourceCut = $"{sg.Count} {(sg.Horizontal ? "horizontal" : "vertical")}";
-
-            var timg = tc.Parts.TryGetValue(part, out var tp) && tp.States.TryGetValue(state, out var ts)
-                ? ts.Properties.FirstOrDefault(p => StripIds.Contains(p.Header.nameID)) : null;
-            var tpic = timg == null ? null : Decode(m_target, timg);
-            if (tpic == null) return false;
-            var tframes = Frames(tpic, tg);
-            if (tframes.Length == 0) return false;
-            int tw = tframes[0].Width, th = tframes[0].Height;
-
-            var frames = new ArgbImage[sg.Count];
-            for (int i = 0; i < sg.Count; ++i)
-                frames[i] = pic.Crop(new Rectangle(sg.Horizontal ? i * fw : 0, sg.Horizontal ? 0 : i * fh, fw, fh));
-            var outImg = tg.Horizontal ? new ArgbImage(tw * tg.Count, th) : new ArgbImage(tw, th * tg.Count);
-            for (int j = 0; j < tg.Count; ++j)
+            if ((sg.Count != 1 && sg.Count != 2) || tg.Count != 8) return false;
+            var images = ss.Properties.Where(p => StripIds.Contains(p.Header.nameID)).ToList();
+            var decoded = images.Select(p => Decode(srcStyle, p)).ToList();
+            if (images.Count == 0 || decoded.Any(p => p == null || (sg.Horizontal ? p.Width : p.Height) < sg.Count)) return false;
+            sourceCut = sg.ToString();
+            for (int i = 0; i < images.Count; ++i)
             {
-                var f = frames[j % frames.Length];
-                if (f.Width != tw || f.Height != th) f = Scale(f, tw, th);
-                outImg.Blit(f, tg.Horizontal ? j * tw : 0, tg.Horizontal ? 0 : j * th);
+                var frames = Frames(decoded[i], sg);
+                int w = frames[0].Width, h = frames[0].Height;
+                var outImg = new ArgbImage(tg.Horizontal ? w * tg.Count : w, tg.Horizontal ? h : h * tg.Count);
+                for (int j = 0; j < tg.Count; ++j)
+                {
+                    bool left = (j & 1) != 0, top = (j & 2) != 0;
+                    var frame = frames[left && frames.Length > 1 ? 1 : 0];
+                    int ox = tg.Horizontal ? j * w : 0, oy = tg.Horizontal ? 0 : j * h;
+                    for (int y = 0; y < h; ++y)
+                        for (int x = 0; x < w; ++x)
+                            outImg.Pixels[(oy + y) * outImg.Width + ox + x] = frame.Pixels[(top ? h - y - 1 : y) * w + (left && frames.Length == 1 ? w - x - 1 : x)];
+                }
+                images[i].SetValue(srcStyle.AddXpImage(ImageIdentity.EncodePngVerified(outImg)));
             }
-            img.SetValue(srcStyle.AddXpImage(ImageIdentity.EncodePngVerified(outImg)));
+            Upsert(ss, sc, part, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, tg.Count);
+            Upsert(ss, sc, part, IDENTIFIER.IMAGELAYOUT, IDENTIFIER.ENUM, tg.Horizontal ? 1 : 0);
             return true;
         }
 

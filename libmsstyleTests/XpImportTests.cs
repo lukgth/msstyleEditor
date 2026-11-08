@@ -190,6 +190,70 @@ namespace libmsstyleTests
         }
 
         [TestMethod]
+        public void ResizeGripsRetainOwnNativeArtAcrossModernAlignments()
+        {
+            // Synthetic redrawn template: no dependency on a redistributable Win10 Luna port.
+            // Exercise both consumers independently, including single-frame custom XP grips.
+            foreach (int count in new[] { 1, 2 })
+            using (var stock = new VisualStyle())
+            using (var source = new VisualStyle())
+            using (var target = new VisualStyle())
+            {
+                stock.Load(XpLuna); source.Load(XpLuna); target.Load(XpLuna);
+                foreach (string cls in new[] { "Status", "ScrollBar" })
+                {
+                    int part = cls == "Status" ? 3 : 10;
+                    var own = new ArgbImage(7 * count, 9);
+                    for (int y = 0; y < own.Height; ++y)
+                        for (int x = 0; x < own.Width; ++x)
+                            own.Pixels[y * own.Width + x] = 0xFF000000u | (cls == "Status" ? 0x00800000u : 0x00008000u) | (uint)(y * own.Width + x);
+                    SetXpGrip(source, cls, part, own, count, 1);
+                    var redraw = new ArgbImage(16, 128);
+                    for (int i = 0; i < redraw.Pixels.Length; ++i) redraw.Pixels[i] = 0xFF000000u;
+                    SetXpGrip(target, cls, part, redraw, 8, 0);
+                }
+                var remapper = typeof(Win7StyleImporter).Assembly.GetType("libmsstyle.Import.XpStripRemap", true);
+                var instance = Activator.CreateInstance(remapper, stock, source, target, new ImportReport());
+                remapper.GetMethod("Run").Invoke(instance, null);
+                foreach (string cls in new[] { "Status", "ScrollBar" })
+                {
+                    int part = cls == "Status" ? 3 : 10;
+                    Assert.AreEqual(8, Find(source, cls, part, 0, IDENTIFIER.IMAGECOUNT).GetValue());
+                    Assert.AreEqual(0, Find(source, cls, part, 0, IDENTIFIER.IMAGELAYOUT).GetValue());
+                    var image = ImageIdentity.Decode(source.GetRawResource("IMAGE", Find(source, cls, part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag));
+                    Assert.AreEqual(7, image.Width, "true-size glyph must not be enlarged to template dimensions");
+                    Assert.AreEqual(72, image.Height);
+                    for (int state = 0; state < 8; ++state)
+                        for (int y = 0; y < 9; ++y)
+                            for (int x = 0; x < 7; ++x)
+                            {
+                                bool left = (state & 1) != 0, top = (state & 2) != 0;
+                                int sx = count == 1 && left ? 6 - x : x + (left && count == 2 ? 7 : 0);
+                                int sy = top ? 8 - y : y;
+                                uint expected = 0xFF000000u | (cls == "Status" ? 0x00800000u : 0x00008000u) | (uint)(sy * 7 * count + sx);
+                                Assert.AreEqual(expected, image.Pixels[(state * 9 + y) * 7 + x], cls + " state " + (state + 1));
+                            }
+                }
+            }
+        }
+
+        static void SetXpGrip(VisualStyle style, string cls, int part, ArgbImage image, int count, int layout)
+        {
+            var addImage = typeof(VisualStyle).GetMethod("AddXpImage", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            int id = (int)addImage.Invoke(style, new object[] { ImageIdentity.EncodePngVerified(image) });
+            Find(style, cls, part, 0, IDENTIFIER.IMAGEFILE).SetValue(id);
+            Find(style, cls, part, 0, IDENTIFIER.IMAGECOUNT).SetValue(count);
+            var clsInfo = style.Classes.Values.Single(c => c.ClassName.Equals(cls, StringComparison.OrdinalIgnoreCase));
+            var layoutProp = Find(style, cls, part, 0, IDENTIFIER.IMAGELAYOUT);
+            if (layoutProp == null)
+            {
+                layoutProp = new StyleProperty(new PropertyHeader((int)IDENTIFIER.IMAGELAYOUT, (int)IDENTIFIER.ENUM) { classID = clsInfo.ClassId, partID = part, stateID = 0 });
+                clsInfo.Parts[part].States[0].Properties.Add(layoutProp);
+            }
+            layoutProp.SetValue(layout);
+        }
+
+        [TestMethod]
         public void StockLunaOntoTheLunaPortChangesNothing()
         {
             if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
@@ -326,6 +390,31 @@ namespace libmsstyleTests
                         Find(port, "Window", 5, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag, "maximized caption reused rounded normal artwork");
                     Assert.AreEqual(19, Find(port, "sysmetrics", 0, 0, IDENTIFIER.CAPTIONBARHEIGHT).GetValue());
                     Assert.AreEqual(1, Find(port, "Window", 5, 0, IDENTIFIER.SIZINGTYPE).GetValue());
+                    foreach (string cls in new[] { "Status", "ScrollBar" })
+                    {
+                        int part = cls == "Status" ? 3 : 10;
+                        var xpClass = xp.Classes.Values.Single(c => c.ClassName.Equals(cls, StringComparison.OrdinalIgnoreCase));
+                        var original = ImageIdentity.Decode(xp.GetRawResource("IMAGE", Find(xp, cls, part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag));
+                        int count = (int)Find(xp, cls, part, 0, IDENTIFIER.IMAGECOUNT).GetValue();
+                        bool horizontal = (int)SemanticModel.FindEffective(xp, xpClass, part, 0, IDENTIFIER.IMAGELAYOUT).GetValue() == 1;
+                        int w = horizontal ? original.Width / count : original.Width, h = horizontal ? original.Height : original.Height / count;
+                        Assert.AreEqual(8, Find(port, cls, part, 0, IDENTIFIER.IMAGECOUNT).GetValue());
+                        Assert.AreEqual(0, Find(port, cls, part, 0, IDENTIFIER.IMAGELAYOUT).GetValue());
+                        foreach (var slot in new[] { IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3, IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5, IDENTIFIER.IMAGEFILE6, IDENTIFIER.IMAGEFILE7 })
+                        {
+                            var image = ImageIdentity.Decode(port.GetRawResource("IMAGE", Find(port, cls, part, 0, slot).Header.shortFlag));
+                            Assert.AreEqual(w, image.Width, cls + " " + slot);
+                            Assert.AreEqual(h * 8, image.Height, cls + " " + slot);
+                            for (int state = 0; state < 8; ++state)
+                                for (int y = 0; y < h; ++y)
+                                    for (int x = 0; x < w; ++x)
+                                    {
+                                        int frame = state % 2, sy = (state & 2) != 0 ? h - y - 1 : y;
+                                        int sourceIndex = (horizontal ? sy : frame * h + sy) * original.Width + (horizontal ? frame * w + x : x);
+                                        Assert.AreEqual(original.Pixels[sourceIndex], image.Pixels[(state * h + y) * w + x], cls + " " + slot + " state " + (state + 1));
+                                    }
+                        }
+                    }
                 }
             }
             finally { Directory.Delete(dir, true); }
