@@ -358,20 +358,42 @@ namespace libmsstyle.Import
                 || !part.States.TryGetValue(0, out var st)) return;
             var src = SectionIconIds.Select(b => m_src.GetBitmap(b)).ToArray();
             var stock = SectionIconIds.Select(b => m_base.GetBitmap(b)).ToArray();
-            HasSectionIcons = src.Any(b => b != null);
-            if (src.All(b => b == null) || src.Zip(stock, (s, b) => s == null || SameBytes(s, b)).All(x => x)) return;
+            // art that paints nothing counts as no icon: Elfin2's icons are fully transparent bitmaps, and xp drew no
+            // icon next to "Picture Tasks" (measured on the xp vm), while converting them with the DirectUI alpha
+            // rule painted opaque white slabs over the headers.
+            var art = src.Select(d => d != null && !DrawsNothing(d) ? d : null).ToArray();
+            HasSectionIcons = art.Any(a => a != null);
+            bool stockShown = SectionIconIds.Select((_, i) => art[i] == null
+                    ? stock[i] == null || DrawsNothing(stock[i])
+                    : stock[i] != null && SameBytes(art[i], stock[i]))
+                .All(x => x);
+            if (stockShown) return; // the template strip is what xp showed
             var img = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
             var count = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGECOUNT);
             var layout = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGELAYOUT);
             if (img == null || !(count?.GetValue() is int n) || n != SectionIconIds.Length) { m_imp.Report.Warnings.Add($"shellstyle: the template's {IconClass} part {IconPart} isn't a {SectionIconIds.Length}-frame picture; section icons stay."); return; }
-            var pics = src.Select((b, i) => b ?? stock[i]).Select(b => b == null ? null
-                : ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(b, null, anyAlpha: true))).ToList();
-            if (pics.Any(p => p == null)) { m_imp.Report.Warnings.Add("shellstyle: a section icon is missing from both the source and stock shellstyle; section icons stay."); return; }
-            int w = pics[0].Width, h = pics[0].Height;
-            if (pics.Any(p => p.Width != w || p.Height != h)) { m_imp.Report.Warnings.Add("shellstyle: the source's section icons differ in size; section icons stay."); return; }
+            int w, h;
+            var pics = art.Select(b => b == null ? null : ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(b, null, anyAlpha: true))).ToList();
+            var first = pics.FirstOrDefault(p => p != null);
+            if (first == null || pics.Any(p => p != null && (p.Width != first.Width || p.Height != first.Height)))
+            {
+                // nothing visible to size the strip from: keep the template's frame size and fill it transparent
+                var tpl = TemplatePicture(img);
+                if (first == null && tpl == null) { m_imp.Report.Warnings.Add("shellstyle: the template's section icon strip can't be read; section icons stay."); return; }
+                if (first != null) { m_imp.Report.Warnings.Add("shellstyle: the source's section icons differ in size; section icons stay."); return; }
+                bool vert = layout?.GetValue() is int lo0 && lo0 == 0;
+                w = vert ? tpl.Width : tpl.Width / SectionIconIds.Length;
+                h = vert ? tpl.Height / SectionIconIds.Length : tpl.Height;
+            }
+            else { w = first.Width; h = first.Height; }
             bool vertical = layout?.GetValue() is int lo && lo == 0;
-            var strip = vertical ? new ArgbImage(w, h * pics.Count) : new ArgbImage(w * pics.Count, h);
-            for (int i = 0; i < pics.Count; ++i) strip.Blit(pics[i], vertical ? 0 : i * w, vertical ? i * h : 0);
+            var strip = vertical ? new ArgbImage(w, h * SectionIconIds.Length) : new ArgbImage(w * SectionIconIds.Length, h);
+            for (int i = 0; i < pics.Count; ++i)
+            {
+                if (pics[i] == null) continue; // xp drew no icon for this section
+                if (pics[i].Width != w || pics[i].Height != h) continue;
+                strip.Blit(pics[i], vertical ? 0 : i * w, vertical ? i * h : 0);
+            }
             byte[] png = ImageIdentity.EncodePngVerified(strip);
             int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
             if ((img.Header.shortFlag & 0xFFFF) == id) return;
@@ -380,10 +402,66 @@ namespace libmsstyle.Import
             m_imp.Report.Decisions.Add(new MergeDecision
             {
                 Class = IconClass, Part = "Part " + IconPart, State = 0, Property = "IMAGEFILE", Action = "applied-shellstyle",
-                Reason = "the music, picture and control panel section icons of the source shellstyle (bitmaps 10, 13, 22; win10 draws them from this strip)",
+                Reason = HasSectionIcons
+                    ? "the music, picture and control panel section icons of the source shellstyle (bitmaps 10, 13, 22; win10 draws them from this strip; transparent where the source draws none)"
+                    : "the source shellstyle's section icons are blank (transparent bitmaps), so xp drew no icon; the template's strip is blanked out",
                 Result = "IMAGE " + id,
             });
             m_imp.Report.Count("applied-shellstyle");
+        }
+
+        /// <summary>
+        /// true when an xp shellstyle bitmap paints nothing. A 32bpp picture whose alpha channel is zero everywhere is
+        /// invisible on xp (duiview's GRAPHIC_AlphaConstPerPix sees a transparent picture); packs also blank out slots
+        /// they don't ship by filling them with one colour (Elfin2's folder watermarks are a white field with a
+        /// hairline diagonal, which xp keys away as white). Converting either of those with the per-pixel alpha rule
+        /// gives opaque white art, which is what put white slabs over the task pane headers.
+        /// </summary>
+        internal static bool DrawsNothing(byte[] dib)
+        {
+            if (dib == null || dib.Length < 40) return true;
+            int header = BitConverter.ToInt32(dib, 0);
+            int w = Math.Abs(BitConverter.ToInt32(dib, 4)), h = Math.Abs(BitConverter.ToInt32(dib, 8));
+            short bpp = BitConverter.ToInt16(dib, 14);
+            if (w <= 0 || h <= 0 || header < 40 || header > dib.Length) return true;
+            int stride = ((w * bpp + 31) / 32) * 4;
+            if (dib.Length < header + stride * h) return true;
+            if (bpp == 32)
+            {
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x)
+                        if (dib[header + y * stride + x * 4 + 3] != 0) goto hasAlpha;
+                return true;
+            }
+            hasAlpha:
+            // a white-out: one colour covering nearly the whole picture. xp draws folder art with a colour key, so a
+            // picture that is its own key colour is invisible.
+            int bytesPerPixel = bpp / 8;
+            if (bytesPerPixel < 3) return false; // paletted art always shows something
+            var counts = new Dictionary<int, int>();
+            int total = 0;
+            for (int y = 0; y < h; y += 1 + h / 64)
+            {
+                for (int x = 0; x < w; x += 1 + w / 64, ++total)
+                {
+                    int o = header + y * stride + x * bytesPerPixel;
+                    int key = bpp == 32 ? ((dib[o] << 16) | (dib[o + 1] << 8) | dib[o + 2]) : ((dib[o] << 16) | (dib[o + 1] << 8) | dib[o + 2]);
+                    counts.TryGetValue(key, out int c);
+                    counts[key] = c + 1;
+                }
+            }
+            return total > 0 && counts.Values.Max() >= total * 99 / 100;
+        }
+
+        /// <summary>the template's picture behind a record, decoded; null when it can't be read.</summary>
+        private ArgbImage TemplatePicture(StyleProperty img)
+        {
+            try
+            {
+                var bytes = m_imp.Target.Style.GetRawResource("IMAGE", img.Header.shortFlag & 0xFFFF);
+                return bytes == null ? null : ImageIdentity.Decode(bytes);
+            }
+            catch (ArgumentException) { return null; }
         }
 
         // xp's special section background pictures (shstyle.h IDB_MUSIC_TASKS_BMP 11, IDB_PICTURES_TASKS_BMP 14,
@@ -403,20 +481,44 @@ namespace libmsstyle.Import
                 || !part.States.TryGetValue(0, out var st)) return;
             var src = GroupBackgroundIds.Select(b => m_src.GetBitmap(b)).ToArray();
             var stock = GroupBackgroundIds.Select(b => m_base.GetBitmap(b)).ToArray();
-            if (src.All(b => b == null) || src.Zip(stock, (s, b) => s == null || SameBytes(s, b)).All(x => x)) return;
+            var art = src.Select(d => d != null && !DrawsNothing(d) ? d : null).ToArray();
+            // the template's strip is stock xp's art, which is what a source that keeps the stock pictures shows; any
+            // other source decides per frame, and a frame it doesn't draw stays transparent (Elfin2 ships no group
+            // backgrounds at all, so showing the template's music/picture art drew luna's blue collage in its flat pane)
+            bool stockShown = GroupBackgroundIds.Select((_, i) => art[i] == null
+                    ? stock[i] == null || DrawsNothing(stock[i])
+                    : stock[i] != null && SameBytes(art[i], stock[i]))
+                .All(x => x);
+            if (stockShown) return;
             var img = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE);
             var count = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGECOUNT);
             var layout = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGELAYOUT);
-            if (img == null || !(count?.GetValue() is int n) || n != GroupBackgroundIds.Length + 1)
-            { m_imp.Report.Warnings.Add($"shellstyle: the template's {IconClass} part {GroupPart} isn't a {GroupBackgroundIds.Length + 1}-frame picture; the section backgrounds stay."); return; }
+            if (img == null || !(count?.GetValue() is int n) || n < GroupBackgroundIds.Length || n > GroupBackgroundIds.Length + 1)
+            { m_imp.Report.Warnings.Add($"shellstyle: the template's {IconClass} part {GroupPart} isn't a {GroupBackgroundIds.Length}- or {GroupBackgroundIds.Length + 1}-frame picture; the section backgrounds stay."); return; }
+            // Luna10's strip is one frame per section (music, pictures in that order); a template with a leading blank
+            // frame keeps it and the art starts one frame in.
+            int firstFrame = n - GroupBackgroundIds.Length;
             // keyed like xp's group picture: the art's own background colour turns transparent, the note stays
-            var pics = src.Select((b, i) => b ?? stock[i]).Select(b => b == null ? null
-                : ImageIdentity.Decode(XpShellBitmap(b, null, true))).ToList();
-            if (pics.Any(p => p == null)) { m_imp.Report.Warnings.Add("shellstyle: a section background is missing from both the source and stock shellstyle; the section backgrounds stay."); return; }
-            int w = pics.Max(p => p.Width), h = pics.Max(p => p.Height);
+            var pics = art.Select(b => b == null ? null : ImageIdentity.Decode(XpShellBitmap(b, null, true))).ToList();
+            var first = pics.FirstOrDefault(p => p != null);
             bool vertical = layout?.GetValue() is int lo && lo == 0;
-            var strip = vertical ? new ArgbImage(w, h * (pics.Count + 1)) : new ArgbImage(w * (pics.Count + 1), h);
-            for (int i = 0; i < pics.Count; ++i) strip.Blit(pics[i], vertical ? 0 : (i + 1) * w, vertical ? (i + 1) * h : 0);
+            int w, h;
+            if (first == null)
+            {
+                var tpl = TemplatePicture(img);
+                if (tpl == null) { m_imp.Report.Warnings.Add("shellstyle: the template's section background strip can't be read; the section backgrounds stay."); return; }
+                w = vertical ? tpl.Width : tpl.Width / n;
+                h = vertical ? tpl.Height / n : tpl.Height;
+            }
+            else if (pics.Any(p => p != null && (p.Width != first.Width || p.Height != first.Height)))
+            { m_imp.Report.Warnings.Add("shellstyle: the source's section backgrounds differ in size; the section backgrounds stay."); return; }
+            else { w = first.Width; h = first.Height; }
+            var strip = vertical ? new ArgbImage(w, h * n) : new ArgbImage(w * n, h);
+            for (int i = 0; i < pics.Count; ++i)
+            {
+                if (pics[i] == null) continue; // xp drew no background for this section
+                strip.Blit(pics[i], vertical ? 0 : (firstFrame + i) * w, vertical ? (firstFrame + i) * h : 0);
+            }
             byte[] png = ImageIdentity.EncodePngVerified(strip);
             int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
             if ((img.Header.shortFlag & 0xFFFF) == id) return;
@@ -425,7 +527,7 @@ namespace libmsstyle.Import
             m_imp.Report.Decisions.Add(new MergeDecision
             {
                 Class = IconClass, Part = "Part " + GroupPart, State = 0, Property = "IMAGEFILE", Action = "applied-shellstyle",
-                Reason = "the music and picture section backgrounds of the source shellstyle (bitmaps 11, 14; win10 draws them from this strip, frame 1/2 via dtb(CommandModule, 11, 1/2))",
+                Reason = "the music and picture section backgrounds of the source shellstyle (bitmaps 11, 14; win10 draws them from this strip, frame 1/2 via dtb(CommandModule, 11, 1/2)); frames the source doesn't draw stay transparent instead of showing the template's art",
                 Result = "IMAGE " + id,
             });
             m_imp.Report.Count("applied-shellstyle");
@@ -494,7 +596,7 @@ namespace libmsstyle.Import
             if (XpShellStyle.ParseRcBmp(water.Src, out int wid, out Color? wkey, out bool wAuto))
             {
                 byte[] dib = m_src.GetBitmap(wid);
-                if (dib != null)
+                if (dib != null && !DrawsNothing(dib))
                 {
                     var png = XpShellBitmap(dib, wkey, wAuto);
                     bool sameAsStock = XpShellStyle.ParseRcBmp(water.Stock, out int sid, out var skey, out bool sAuto)
@@ -507,11 +609,11 @@ namespace libmsstyle.Import
             Watermarks.Pictures = FolderWatermark(PicturesWatermarkId, "picture folder watermark");
         }
 
-        /// <summary>a per-folder watermark picture (shellstyle bitmap), as a record; null where it's missing or stock.</summary>
+        /// <summary>a per-folder watermark picture (shellstyle bitmap), as a record; null where it's missing, blank or stock.</summary>
         private PaneWatermarkRecord? FolderWatermark(int id, string reason)
         {
             byte[] dib = m_src.GetBitmap(id);
-            if (dib == null) return null;
+            if (dib == null || DrawsNothing(dib)) return null;
             // xp's template drew these with a color key (the picture is white-backed art on the blue pane)
             var png = XpShellBitmap(dib, Color.White, false);
             byte[] stock = m_base.GetBitmap(id);
@@ -611,6 +713,7 @@ namespace libmsstyle.Import
             XpShellStyle.ParseRcBmp(v, out int id, out var key, out bool autoKey);
             var dib = m_src.GetBitmap(id);
             if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: task pane background bitmap {id} is missing; template kept."); return; }
+            if (DrawsNothing(dib)) return; // a blanked slot: xp painted nothing there, so the fill/gradient stays
             if (autoKey)
             {
                 uint p0 = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null)).Pixels[0];
@@ -1259,6 +1362,21 @@ namespace libmsstyle.Import
 
         private static bool SameBytes(byte[] a, byte[] b) => a != null && b != null && a.SequenceEqual(b);
 
+        /// <summary>a 32bpp bitmap of the same size as <paramref name="dib"/> with alpha zero everywhere: it draws
+        /// nothing anywhere, and every layout that measured the original still fits.</summary>
+        private static byte[] BlankDib(byte[] dib)
+        {
+            int w = Math.Abs(BitConverter.ToInt32(dib, 4)), h = Math.Abs(BitConverter.ToInt32(dib, 8));
+            int stride = w * 4;
+            var blank = new byte[40 + stride * h];
+            BitConverter.GetBytes(40).CopyTo(blank, 0);
+            BitConverter.GetBytes(w).CopyTo(blank, 4);
+            BitConverter.GetBytes(h).CopyTo(blank, 8);
+            BitConverter.GetBytes((ushort)1).CopyTo(blank, 12);
+            BitConverter.GetBytes((ushort)32).CopyTo(blank, 14); // bpp: alpha 0 => nothing drawn
+            return blank;
+        }
+
         /// <summary>bitmap ids an xp shellstyle and a win10 shellstyle share (see <see cref="PatchShellStyleBitmaps"/>).</summary>
         private static bool IsSharedBitmapId(int id) => (id >= 10 && id <= 25) || (id >= 100 && id <= 112);
 
@@ -1283,7 +1401,11 @@ namespace libmsstyle.Import
                 if (!IsSharedBitmapId(id)) continue;
                 var s = source.GetBitmap(id);
                 if (s == null || SameBytes(s, stock.GetBitmap(id))) continue;
-                replace[id] = s;
+                // art that paints nothing on xp (Elfin2's watermarks are a white field with a hairline, its section
+                // icons are zero-alpha bitmaps) must not arrive as visible white: win10's shell draws these bitmaps
+                // without xp's colour key, so the blank slot becomes a white slab in the task pane. A fully
+                // transparent bitmap of the same size keeps every reference valid and draws nothing.
+                replace[id] = DrawsNothing(s) ? BlankDib(s) : s;
             }
             if (dryRun || replace.Count == 0) return replace.Keys.ToList();
 

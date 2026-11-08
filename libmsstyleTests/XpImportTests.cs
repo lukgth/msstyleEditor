@@ -292,6 +292,46 @@ namespace libmsstyleTests
         }
 
         [TestMethod]
+        public void MaximizedCaptionKeepsItsOwnArtworkAndXpMetrics()
+        {
+            string source = Environment.GetEnvironmentVariable("MSSTYLE_XP_ELFIN2");
+            if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
+            if (source == null || !File.Exists(source)) Assert.Inconclusive("set MSSTYLE_XP_ELFIN2 to Elfin2.msstyles");
+            string dir = Path.Combine(Path.GetTempPath(), "msstyle-caption-test-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string output = Path.Combine(dir, "Elfin2.msstyles");
+                var report = Win7StyleImporter.Run(new Win7ImportOptions
+                {
+                    SourcePath = source, SourcePlatform = Platform.WinXP, SourceScheme = "NormalColor",
+                    BaseScheme = "NormalColor", TemplatePath = Luna10, OutputPath = output, DryRun = false,
+                });
+                Assert.AreEqual(ImportStatus.ReadyForVmTest, report.Status, string.Join("\n", report.Errors));
+                using (var xp = new VisualStyle())
+                using (var port = new VisualStyle())
+                {
+                    xp.Load(source);
+                    port.Load(output);
+                    foreach (int part in new[] { 1, 5 })
+                    {
+                        int xpId = Find(xp, "Window", part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
+                        int portId = Find(port, "Window", part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
+                        Assert.AreEqual(ImageIdentity.Decode(xp.GetRawResource("IMAGE", xpId)).PixelSha1(),
+                            ImageIdentity.Decode(port.GetRawResource("IMAGE", portId)).PixelSha1(), "caption artwork changed for part " + part);
+                        foreach (var id in new[] { IDENTIFIER.SIZINGMARGINS, IDENTIFIER.CONTENTMARGINS, IDENTIFIER.CAPTIONMARGINS, IDENTIFIER.IMAGECOUNT })
+                            Assert.AreEqual(Find(xp, "Window", part, 0, id).GetValue(), Find(port, "Window", part, 0, id).GetValue(), "caption geometry changed: " + id);
+                    }
+                    Assert.AreNotEqual(Find(port, "Window", 1, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag,
+                        Find(port, "Window", 5, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag, "maximized caption reused rounded normal artwork");
+                    Assert.AreEqual(19, Find(port, "sysmetrics", 0, 0, IDENTIFIER.CAPTIONBARHEIGHT).GetValue());
+                    Assert.AreEqual(1, Find(port, "Window", 5, 0, IDENTIFIER.SIZINGTYPE).GetValue());
+                }
+            }
+            finally { Directory.Delete(dir, true); }
+        }
+
+        [TestMethod]
         public void ThemeFilePointsAtTheInstalledStyle()
         {
             string t = XpThemeFiles.BuildTheme("Tango Blue", "TangoLux", "TangoLux Blue.msstyles", XpThemeFiles.DefaultWallpaper);

@@ -160,8 +160,25 @@ namespace libmsstyle.Import
             if (packed == null) { why = $"\"{name}\" isn't shipped with the pack"; return null; }
             Directory.CreateDirectory(Path.Combine(styleDir, subdir));
             string target = Path.Combine(styleDir, subdir, name);
-            File.Copy(packed, target, true);
+            // the pack can be reached through the output folder itself (three levels up from a candidate under tmp),
+            // and File.Copy onto its own source fails with "used by another process"; identical bytes need no copy.
+            if (!string.Equals(Path.GetFullPath(packed), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase))
+            {
+                if (!File.Exists(target) || !SameFile(packed, target)) File.Copy(packed, target, true);
+            }
             return $@"%WinDir%\Resources\Themes\{styleFolder}\{subdir}\{name}" + (index != null ? "," + index : "");
+        }
+
+        private static bool SameFile(string a, string b)
+        {
+            var fa = new FileInfo(a);
+            var fb = new FileInfo(b);
+            if (fa.Length != fb.Length) return false;
+            var a0 = File.ReadAllBytes(a);
+            var b0 = File.ReadAllBytes(b);
+            if (a0.Length != b0.Length) return false;
+            for (int i = 0; i < a0.Length; ++i) if (a0[i] != b0[i]) return false;
+            return true;
         }
 
         private static string FindInPack(string dir, string name)

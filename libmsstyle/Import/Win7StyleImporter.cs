@@ -535,7 +535,9 @@ namespace libmsstyle.Import
             if (m_source.Platform == Platform.WinXP) CompositeXpComboButton();
             if (m_source.Platform == Platform.WinXP) DropXpComboPlate();
             if (m_source.Platform == Platform.WinXP) FrameXpCombo();
+            if (m_source.Platform == Platform.WinXP) FillXpEditField();
             if (m_source.Platform == Platform.WinXP) FitXpStartPanel();
+            if (m_source.Platform == Platform.WinXP) StretchXpMaxCaption();
         }
 
         /// <summary>
@@ -783,7 +785,7 @@ namespace libmsstyle.Import
                         Class = tc.ClassName, Part = partName, State = st.StateId,
                         Property = SemanticModel.PropertyName(prop.Header.nameID),
                         Action = "dropped-xp-combo-plate",
-                        Reason = "win10 paints this picture over the whole combo and its gradient rows land above the edit; part 4/5 carry the edge and fill the metadata is for",
+                        Reason = "the plate is graded, and win10 paints this picture over the whole combo so its gradient rows land above the edit; the edge and fill records carry its colours instead",
                         Result = "NONE",
                     });
                     RemovedRecords.Add($"{tc.ClassId}/0/{st.StateId}/{prop.Header.nameID}/{prop.Header.typeID}");
@@ -840,15 +842,22 @@ namespace libmsstyle.Import
             var face = (facePixel >> 24) == 0xFF
                 ? Color.FromArgb((int)((facePixel >> 16) & 0xFF), (int)((facePixel >> 8) & 0xFF), (int)(facePixel & 0xFF))
                 : Color.FromArgb(210, 217, 240);
+            // the source's COLOR_WINDOW, what xp fills a combo's editable field and list box with (stock luna 255,
+            // Elfin2 219); a style that names none keeps white.
+            var windowColor = Color.White;
+            if (m_source.ClassesByName.TryGetValue("sysmetrics", out var sysm)
+                && SemanticModel.FindEffective(m_source.Style, sysm, 0, 0, IDENTIFIER.WINDOW)?.GetValue() is Color wc)
+                windowColor = Color.FromArgb(255, wc.R, wc.G, wc.B);
             foreach (int partId in new[] { 0, 4, 5 })
             {
                 if (!tc.Parts.TryGetValue(partId, out var part)) continue;
                 string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
-                // xp fills the editable combo white (the edit covers it) and the readonly one with the
-                // plate's pale face; win10's border fill paints the same colour when the edit is absent.
-                var pairs = partId == 4 ? new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, Color.White) }
+                // xp fills the combo's field with COLOR_WINDOW (Elfin2's SysMetrics has 219, its .theme 219 - the xp
+                // address bar shows exactly that grey, not white) and the readonly one with the plate's pale face;
+                // win10's border fill paints the same colour when the edit is absent.
+                var pairs = partId == 4 ? new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, windowColor) }
                           : partId == 5 ? new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, face) }
-                          : new[] { (IDENTIFIER.BORDERCOLOR, edge) };
+                          : new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, windowColor) };
                 foreach (var st in part.States.Values)
                 {
                     foreach (var (ident, color) in pairs)
@@ -914,6 +923,85 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
+        /// xp only. An edit control's text area is COLOR_WINDOW on xp (the address bar's inner edit in Elfin2 shows the
+        /// same 219 as the combo's field, not the theme record's 206); win10 paints it from the Edit class's FILLCOLOR,
+        /// so the port fills that slot with the source's WINDOW colour - otherwise the text field inside a combo comes
+        /// out a different shade than the combo around it.
+        /// </summary>
+        private void FillXpEditField()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Edit", out var tc) || m_target.DuplicateClassNames.Contains("Edit")) return;
+            if (!m_source.ClassesByName.TryGetValue("sysmetrics", out var sysm)) return;
+            if (!(SemanticModel.FindEffective(m_source.Style, sysm, 0, 0, IDENTIFIER.WINDOW)?.GetValue() is Color wc)) return;
+            var window = Color.FromArgb(255, wc.R, wc.G, wc.B);
+            var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            foreach (var kvp in tc.Parts)
+            {
+                int partId = kvp.Key; var part = kvp.Value;
+                // 0 = the edit body, 5 = the combo's read-only body; parts 2/3 are win10-only records that still
+                // carry the template's (Luna) art - a white picture drawn over the text area, which is what left
+                // the address bar's inner field white inside Elfin2's grey combo. xp has no such art, so those
+                // parts become the same border fill as the body.
+                if (partId != 0 && partId != 2 && partId != 3 && partId != 5) continue;
+                string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
+                foreach (var st in part.States.Values)
+                {
+                    if (partId == 2 || partId == 3)
+                    {
+                        bool touched = false;
+                        for (int i = st.Properties.Count - 1; i >= 0; --i)
+                        {
+                            int nameId = st.Properties[i].Header.nameID;
+                            if (nameId != (int)IDENTIFIER.IMAGEFILE && (nameId < (int)IDENTIFIER.IMAGEFILE1 || nameId > (int)IDENTIFIER.IMAGEFILE7)) continue;
+                            RemovedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{nameId}/{st.Properties[i].Header.typeID}");
+                            st.Properties.RemoveAt(i);
+                            touched = true;
+                        }
+                        var bg = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.BGTYPE);
+                        if (bg == null)
+                        {
+                            bg = new StyleProperty(new PropertyHeader((int)IDENTIFIER.BGTYPE, (int)IDENTIFIER.ENUM) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
+                            st.Properties.Add(bg);
+                            AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)IDENTIFIER.BGTYPE}/{(int)IDENTIFIER.ENUM}");
+                        }
+                        bg.SetValue(1); // BORDERFILL: the body's colour paints the field, no picture
+                        MarkTouched(bg, $"{tc.ClassName}|{partName}|S{st.StateId}|BGTYPE");
+                        if (touched || bg.GetValue() is int bv && bv == 1)
+                        {
+                            m_report.Decisions.Add(new MergeDecision
+                            {
+                                Class = tc.ClassName, Part = partName, State = st.StateId, Property = "BGTYPE",
+                                Action = "applied-xp-edit-field",
+                                Reason = "the template's edit background picture is drawn over the text area in win10; xp has no art there and fills the field with COLOR_WINDOW, so the part is a border fill",
+                                Result = "BORDERFILL",
+                            });
+                            m_report.Count("applied-xp-edit-field");
+                        }
+                        var artFill = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.FILLCOLOR && p.Header.typeID == (int)IDENTIFIER.COLOR);
+                        if (artFill != null && !(artFill.GetValue() is Color ac && ac.R == window.R && ac.G == window.G && ac.B == window.B))
+                        {
+                            artFill.SetValue(window);
+                            MarkTouched(artFill, $"{tc.ClassName}|{partName}|S{st.StateId}|FILLCOLOR");
+                        }
+                    }
+                    var fill = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.FILLCOLOR && p.Header.typeID == (int)IDENTIFIER.COLOR);
+                    if (fill == null) continue;
+                    if (fill.GetValue() is Color cur && cur.R == window.R && cur.G == window.G && cur.B == window.B) continue;
+                    fill.SetValue(window);
+                    MarkTouched(fill, $"{tc.ClassName}|{partName}|S{st.StateId}|FILLCOLOR");
+                    m_report.Decisions.Add(new MergeDecision
+                    {
+                        Class = tc.ClassName, Part = partName, State = st.StateId, Property = "FILLCOLOR",
+                        Action = "applied-xp-edit-field",
+                        Reason = "xp paints an edit's text area with COLOR_WINDOW (the combo's inner edit matches its field); the theme's own fill is the frame colour",
+                        Result = $"{window.R},{window.G},{window.B}",
+                    });
+                    m_report.Count("applied-xp-edit-field");
+                }
+            }
+        }
+
+        /// <summary>
         /// xp only. ExplorerEx builds the classic start panel straight from the theme's StartPanel records:
         /// part 1 DEFAULTPANESIZE is the panel width, the other panes' DEFAULTPANESIZE must tile inside it,
         /// and part 6 (PLACELIST) CONTENTMARGINS place the places listview inside its pane (windows clip
@@ -928,6 +1016,7 @@ namespace libmsstyle.Import
         /// negative margin asks for: the theme paints a window-7 style sidebar with plain labels, and at 0 the
         /// 130px column wraps "My Computer".
         /// </summary>
+        /// <summary>
         private void FitXpStartPanel()
         {
             if (!m_target.ClassesByName.TryGetValue("StartPanel", out var tc)) return;
@@ -991,6 +1080,37 @@ namespace libmsstyle.Import
                     Result = $"{pm.Left},{pm.Top},{pm.Right},{pm.Bottom}",
                 });
                 m_report.Count("fitted-xp-startpanel");
+            }
+        }
+
+        /// <summary>
+        /// Win10's non-composited caption renderer needs stretched XP caption strips. Keep each part's
+        /// own artwork and geometry: normal captions can contain transparent rounded top edges which
+        /// must never replace the separate, edge-covering maximized artwork. Caption metrics stay XP's.
+        /// </summary>
+        private void StretchXpMaxCaption()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Window", out var tc) || m_target.DuplicateClassNames.Contains("Window")) return;
+            StyleState Part(int id) => tc.Parts.TryGetValue(id, out var p) && p.States.TryGetValue(0, out var s) ? s : null;
+            var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            StyleProperty Prop(StyleState st, IDENTIFIER id) => st.Properties.FirstOrDefault(x => x.Header.nameID == (int)id);
+            foreach (int id in new[] { 1, 2, 3, 5, 6 })
+            {
+                var st = Part(id);
+                if (st == null) continue;
+                var sizing = Prop(st, IDENTIFIER.SIZINGTYPE);
+                if (sizing == null || !(sizing.GetValue() is int sc) || sc == 1) continue;
+                sizing.SetValue(1);
+                string nm = tnames.TryGetValue(id, out var pn2) ? pn2 : "P" + id;
+                MarkTouched(sizing, $"{tc.ClassName}|{nm}|S0|SIZINGTYPE");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName, Part = nm, State = 0, Property = "SIZINGTYPE",
+                    Action = "applied-caption-stretch",
+                    Reason = "xp tiles this caption part; win10's caption renderer draws a tiled part as one sprite and leaves the bar's fill visible, so the art is stretched instead",
+                    Result = "STRETCH",
+                });
+                m_report.Count("applied-caption-stretch");
             }
         }
 
