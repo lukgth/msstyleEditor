@@ -46,6 +46,20 @@ namespace libmsstyle.Import
             return copied;
         }
 
+        /// <summary>
+        /// The shellstyle folder a style folder ships (Shell\&lt;color&gt;\shellstyle.dll), or null when it has none.
+        /// The folder is named after the color variant and a template's name is not always "NormalColor", so the
+        /// name is read from the folder instead of assumed.
+        /// </summary>
+        public static string FindShellFolder(string styleDir)
+        {
+            string shell = Path.Combine(styleDir, "Shell");
+            if (!Directory.Exists(shell)) return null;
+            foreach (var dir in Directory.GetDirectories(shell))
+                if (File.Exists(Path.Combine(dir, "shellstyle.dll"))) return dir;
+            return null;
+        }
+
         private static bool IsCultureName(string name)
         {
             try

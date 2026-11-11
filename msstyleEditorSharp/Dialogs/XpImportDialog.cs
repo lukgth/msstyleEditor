@@ -129,30 +129,51 @@ namespace msstyleEditor
             string destStyle = Path.Combine(destDir, themeFile);
             string stamp = DateTime.Now.ToString("yyyyMMddHHmmss");
 
-            // one elevated cmd script: move the installed folder aside (renaming works even when the applied style's
-            // files are memory-mapped and can't be overwritten), copy the new folder and the .theme.
+            // One elevated cmd script. Copying over an applied style fails (uxtheme has its .msstyles mapped), so the old
+            // folder goes first; the previous version renamed it aside and then deleted it with a "for /d" glob that also
+            // matched the folder it had just copied. Every step's failure is propagated: the old script ended "exit /b 0"
+            // no matter what, so a failed copy still reported success here.
             string scriptPath = Path.Combine(Path.GetTempPath(), $"xp-install-{stamp}.cmd");
             string script =
                 "@echo off\r\n" +
-                $"if exist \"{destDir}\" ren \"{destDir}\" \"{styleFolder}.old-{stamp}\"\r\n" +
+                $"if exist \"{destDir}\" rmdir /s /q \"{destDir}\" || exit /b 2\r\n" +
+                // 0-7 are robocopy success codes; 8 and above are real failures.
                 $"robocopy \"{r.StyleFolder}\" \"{destDir}\" /E /R:2 /W:1 /NJH /NJS /NP\r\n" +
-                $"copy /Y \"{r.ThemePath}\" \"{destTheme}\"\r\n" +
-                // older renamed installs pile up because the applied one's files stay mapped; try to drop the unlocked ones.
-                $"for /d %%D in (\"{themes}\\{styleFolder}.old-*\") do @rmdir /s /q \"%%D\" 2>nul\r\n" +
+                "if errorlevel 8 exit /b 3\r\n" +
+                $"copy /Y \"{r.ThemePath}\" \"{destTheme}\" >nul || exit /b 4\r\n" +
                 "exit /b 0\r\n";
+            int code = -1;
             try
             {
                 File.WriteAllText(scriptPath, script);
                 using (var p = Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{scriptPath}\"") { Verb = "runas", UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden }))
+                {
                     p.WaitForExit();
+                    code = p.ExitCode;
+                }
             }
             catch (System.ComponentModel.Win32Exception)
             {
-                return; // elevation declined
+                // the elevation prompt was declined: say so instead of reporting a silent "install" that copied nothing.
+                MessageBox.Show(this, "Install cancelled: Windows refused the elevation prompt, so nothing was copied to " + themes + ".",
+                    "Install", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
             finally
             {
                 try { File.Delete(scriptPath); } catch (IOException) { }
+            }
+
+            if (code != 0)
+            {
+                string why = code == 2
+                    ? "the previously installed folder couldn't be removed (if this theme is applied right now, Windows locks its files: switch to another theme and install again)"
+                    : code == 3 ? "robocopy couldn't copy the style folder"
+                    : code == 4 ? "the .theme couldn't be copied"
+                    : "the elevated command failed (exit code " + code + ")";
+                MessageBox.Show(this, "Install failed: " + why + ". Nothing was changed under " + themes + " except what the script had already done.",
+                    "Install", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
 
             if (!File.Exists(destTheme) || !File.Exists(destStyle) || !FilesMatch(r.StylePath, destStyle))
@@ -164,6 +185,15 @@ namespace msstyleEditor
             if (!FilesMatch(r.ThemePath, destTheme))
             {
                 MessageBox.Show(this, $"Copying {Path.GetFileName(r.ThemePath)} to {themes} failed.", "Install", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            // robocopy's exit code alone doesn't say the whole folder arrived: every file the pack carries has to be there
+            // with the same bytes, or an applied theme will draw half its bitmaps from a previous install.
+            string missing = FirstMissingFile(r.StyleFolder, destDir);
+            if (missing != null)
+            {
+                MessageBox.Show(this, $"The install is incomplete: {missing}. Switch to another theme and install again.",
+                    "Install", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -227,6 +257,26 @@ namespace msstyleEditor
             if (!File.Exists(b)) return false;
             var fa = new FileInfo(a); var fb = new FileInfo(b);
             return fa.Length == fb.Length && File.ReadAllBytes(a).SequenceEqual(File.ReadAllBytes(b));
+        }
+
+        /// <summary>the first file of the source folder that isn't in the installed copy with the same bytes, null when
+        /// the copy is complete. A failed robocopy can still leave the .msstyles behind, so the style check alone can't
+        /// tell whether the shell bitmaps and .mui folders arrived.</summary>
+        private static string FirstMissingFile(string sourceDir, string destDir)
+        {
+            try
+            {
+                foreach (var f in Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories))
+                {
+                    string rel = f.Substring(sourceDir.Length).TrimStart('\\', '/');
+                    string copy = Path.Combine(destDir, rel);
+                    if (!File.Exists(copy)) return rel;
+                    if (!FilesMatch(f, copy)) return rel + " (different contents)";
+                }
+            }
+            catch (IOException ex) { return "can't verify the copy: " + ex.Message; }
+            catch (UnauthorizedAccessException ex) { return "can't verify the copy: " + ex.Message; }
+            return null;
         }
     }
 }

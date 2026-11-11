@@ -52,6 +52,12 @@ namespace libmsstyle.Import
         public Dictionary<string, StyleClass> ClassesByName { get; } = new Dictionary<string, StyleClass>(StringComparer.OrdinalIgnoreCase);
         /// <summary>class names that appear more than once in the CMAP. Lookups by name are ambiguous for these.</summary>
         public HashSet<string> DuplicateClassNames { get; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// The style's [globals] Charset (TMT_CHARSET, 403). XP has no per-font charset: themeldr
+        /// parser.cpp keeps this one value and stamps it into every LOGFONT it builds, so every font
+        /// imported out of this style carries it. DEFAULT_CHARSET when the style has no such record.
+        /// </summary>
+        public int FontCharset { get; }
 
         private readonly Dictionary<string, ImageInfo> m_imageCache = new Dictionary<string, ImageInfo>();
 
@@ -70,11 +76,10 @@ namespace libmsstyle.Import
                 ClassesByName[cls.ClassName] = cls;
             }
 
+            FontCharset = ReadFontCharset(style);
+
             foreach (var cls in style.Classes.Values.OrderBy(c => c.ClassId))
             {
-                if (DuplicateClassNames.Contains(cls.ClassName) && ClassesByName[cls.ClassName] != cls)
-                    continue;
-
                 var partNames = PartNames(cls.ClassName, Platform);
                 foreach (var part in cls.Parts.Values.OrderBy(p => p.PartId))
                 {
@@ -127,7 +132,7 @@ namespace libmsstyle.Import
                             }
 
                             Entries.Add(e);
-                            ByKey[e.Key] = e;
+                            if (!ByKey.ContainsKey(e.Key)) ByKey[e.Key] = e;
                         }
                     }
                 }
@@ -249,6 +254,39 @@ namespace libmsstyle.Import
         {
             if (!cls.Parts.TryGetValue(part, out var p) || !p.States.TryGetValue(state, out var s)) return null;
             return s.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
+        }
+
+        /// <summary>
+        /// The [globals] Charset record (TMT_CHARSET, 403) as an int, DEFAULT_CHARSET when the style
+        /// has none. XP only accepts it in [globals] before the first font, so that is the only place
+        /// it is looked for here too.
+        /// </summary>
+        private static int ReadFontCharset(VisualStyle style)
+        {
+            var globals = style.Classes.Values.FirstOrDefault(c => string.Equals(c.ClassName, "globals", StringComparison.OrdinalIgnoreCase));
+            if (globals == null) return 1;
+            var prop = FindLocal(globals, 0, 0, IDENTIFIER.CHARSET);
+            if (prop == null) return 1;
+            try
+            {
+                return Convert.ToInt32(prop.GetValue(), CultureInfo.InvariantCulture);
+            }
+            catch (Exception)
+            {
+                return 1;
+            }
+        }
+
+        /// <summary>
+        /// The text a FONT property's string should be written as: the source text, plus the style's
+        /// charset when it isn't DEFAULT_CHARSET, so the imported font keeps the charset XP applied
+        /// (themeldr ParseFontValue stamps _uCharSet into every LOGFONT it builds).
+        /// </summary>
+        public string ResolveFontText(StyleProperty prop)
+        {
+            string text = ResolveString(prop.Header.shortFlag);
+            if (text == null || FontCharset == 1) return text;
+            return text.Trim() + ", Charset:" + FontCharset.ToString(CultureInfo.InvariantCulture);
         }
 
         /// <summary>first string id whose text matches exactly, then ignoring case. -1 if none.</summary>

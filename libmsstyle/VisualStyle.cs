@@ -776,6 +776,7 @@ namespace libmsstyle
         void LoadXp(byte[] themesIniData)
         {
             m_platform = Platform.WinXP;
+            m_xpThemesIni = themesIniData;
             var colorNames = XpNameList("COLORNAMES");
             var sizeNames = XpNameList("SIZENAMES");
             // what XP loads (packthem's tables); THEMES_INI only for styles that lack them.
@@ -851,7 +852,12 @@ namespace libmsstyle
                 throw new Exception($"Could not load INI resource '{iniName}'!");
             }
 
-            XpStyleIniParser.ParseSchemeIni(iniData, m_classes, m_xpDiagnostics);
+            // parser.cpp applies the container's [Subst] table and [ColorScheme] hue/color table while
+            // reading the scheme INI; without them every substituted value and every non-blue scheme
+            // comes out as the blue one.
+            var substitutions = XpStyleIniParser.SubstTableFor(m_xpThemesIni, iniName);
+            var colorSubstitution = XpColorSubstitution.FromThemesIni(m_xpThemesIni, scheme.InternalName);
+            XpStyleIniParser.ParseSchemeIni(iniData, m_classes, m_xpDiagnostics, substitutions, colorSubstitution);
 
             var fonts = new Dictionary<int, string>();
             var fontIds = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -937,6 +943,8 @@ namespace libmsstyle
         private XpSize m_xpSize;
         /// <summary>XP only: THEMES_INI [Documentation] DisplayName.</summary>
         public string XpThemeDisplayName { get; private set; }
+        /// <summary>XP only: THEMES_INI, the container holding the [Subst] and [ColorScheme] tables.</summary>
+        private byte[] m_xpThemesIni;
 
         /// <summary>XP only: stores a png under a fresh style-local IMAGE id (the importer re-cuts strips this way).</summary>
         internal int AddXpImage(byte[] png)

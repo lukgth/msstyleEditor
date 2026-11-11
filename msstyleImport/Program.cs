@@ -23,11 +23,20 @@ namespace msstyleImport
                     case "schemes": return args.Length == 2 ? Schemes(args[1]) : Usage();
                     case "noop": return NoOp(args.Skip(1).ToArray());
                     case "inventory": return args.Length == 3 ? Inventory(args[1], args[2]) : Usage();
-                    case "apply-theme": return args.Length >= 2 ? ApplyTheme(args[1], args.Length > 2 && args[2] == "--style-only") : Usage();
+                    case "apply-theme":
+                        {
+                            int code = ApplyTheme(args.Skip(1).ToArray(), out bool badUsage);
+                            return badUsage ? Usage() : code;
+                        }
                     case "dumpres": return args.Length == 4 ? DumpResource(args[1], args[2], args[3]) : Usage();
                     case "reslist": return args.Length == 2 ? ListResources(args[1]) : Usage();
                     default: return Usage();
                 }
+            }
+            catch (UsageError ex)
+            {
+                Console.Error.WriteLine("error: " + ex.Message);
+                return Usage();
             }
             catch (Exception ex)
             {
@@ -55,14 +64,16 @@ namespace msstyleImport
                        [--wallpaper <path>] [--write]
                        [--task-band] [--prefer-source Class|Part|Prop]... [--exclude Class|Part|Prop]...
                        [--image-tolerance N]
-      the task pane stays on the left (win10's layout); --task-band moves it to xp's full-width band across the top.
+      the task pane placement follows the xp shellstyle's own markup (top/bottom band or left/right sidebar);
+      --task-band forces xp's full-width top band for sources whose markup has no placement.
       the wallpaper is the one the xp pack's .theme files name next to the source (copied into the style folder);
       --wallpaper overrides it, and %WinDir%\Web\Wallpaper\Bliss.bmp is used when the pack ships none.
       one output per color scheme (all schemes unless --scheme is given):
         <out-dir>\<Label>\<Label>.msstyles + Shell\ (the template's, with the source shellstyle's bitmaps),
         <out-dir>\<Label>.theme, reports in <out-dir>\reports\. <Label> is <Name>, or <Name> <scheme> when the
         style has several schemes. Copy <out-dir>\<Label> to %WINDIR%\Resources\Themes and open the .theme.
-      dry run (reports only) unless --write is given.
+      dry run (reports only) unless --write is given: nothing is written into <out-dir>, the reports go to a
+      temporary folder and their paths are printed.
   msstyleImport schemes <xp.msstyles>
       lists the color schemes of an xp style.
   msstyleImport noop --template <style> --out <copy.msstyles>
@@ -73,21 +84,43 @@ namespace msstyleImport
       raw bytes of one PE resource (integer ids as #12), as a size line and a base64 line (debug helper).
   msstyleImport inventory <style> <out.tsv>
       flat dump: classes, resources, string tables, every property by name.
-  msstyleImport apply-theme <installed .theme> [--style-only]
+  msstyleImport apply-theme <installed .theme> [--style-only | --appearance-only]
       applies an installed theme without any UI: the visual style through uxtheme's SetSystemVisualStyle, then the
       .theme's colors, desktop picture, metrics, cursors, sounds and default icons. --style-only stops after the visual
       style (fast; for iterating on a port, existing windows keep their colors until the next full apply). prints one line per section.
+      --appearance-only applies explicit default icons and Light/Dark app/system modes only; all other shell settings stay unchanged.
       exit 0 when the style was accepted, 1 when it was rejected (the lines say why).
       this does write the machine's current theme/colors: that is the point, and it's what deskn.cpl does.");
             return 2;
         }
 
-        static int ApplyTheme(string themePath, bool styleOnly = false)
+        /// <summary>apply-theme takes exactly one .theme and at most one selective apply option; anything else is a usage error
+        /// (return true so Main reports exit 2 instead of applying something the caller didn't ask for).</summary>
+        static int ApplyTheme(string[] args, out bool usageError)
         {
-            var r = XpThemeApply.Apply(themePath, styleOnly);
+            usageError = false;
+            string themePath = null;
+            bool styleOnly = false, appearanceOnly = false;
+            foreach (var a in args)
+            {
+                if (a == "--style-only")
+                {
+                    if (styleOnly || appearanceOnly) { usageError = true; return 2; }
+                    styleOnly = true;
+                }
+                else if (a == "--appearance-only")
+                {
+                    if (styleOnly || appearanceOnly) { usageError = true; return 2; }
+                    appearanceOnly = true;
+                }
+                else if (a.StartsWith("--") || themePath != null) { usageError = true; return 2; }
+                else themePath = a;
+            }
+            if (themePath == null) { usageError = true; return 2; }
+            var r = appearanceOnly ? XpThemeApply.ApplyAppearanceExtras(themePath) : XpThemeApply.Apply(themePath, styleOnly);
             foreach (var n in r.Notes) Console.WriteLine("ok   " + n);
+            // once on stdout: printing warnings to stderr as well made every warning look like two.
             foreach (var w in r.Warnings) Console.WriteLine("warn " + w);
-            foreach (var w in r.Warnings) Console.Error.WriteLine("warning: " + w);
             return r.Ok ? 0 : 1;
         }
 
@@ -115,16 +148,29 @@ namespace msstyleImport
             return 0;
         }
 
-        static Dictionary<string, List<string>> ParseArgs(string[] args)
+        /// <summary>usage errors (unknown flag, missing value, flag given twice) exit 2; only real failures exit 3.</summary>
+        private sealed class UsageError : Exception
+        {
+            public UsageError(string message) : base(message) { }
+        }
+
+        /// <summary>Parses --options; only the names a command declares are accepted, so a mistyped or foreign flag
+        /// fails loudly instead of being silently ignored.</summary>
+        static Dictionary<string, List<string>> ParseArgs(string[] args, string[] flags, string[] repeated, string[] values)
         {
             var d = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < args.Length; ++i)
             {
-                if (!args[i].StartsWith("--")) throw new ArgumentException($"unexpected argument \"{args[i]}\"");
+                if (!args[i].StartsWith("--") || args[i].Length == 2) throw new UsageError($"unexpected argument \"{args[i]}\"");
                 string k = args[i].Substring(2);
+                bool isFlag = flags.Contains(k, StringComparer.OrdinalIgnoreCase);
+                bool isValue = values.Contains(k, StringComparer.OrdinalIgnoreCase)
+                    || repeated.Contains(k, StringComparer.OrdinalIgnoreCase);
+                if (!isFlag && !isValue) throw new UsageError($"unknown option --{k}");
                 if (!d.TryGetValue(k, out var l)) d[k] = l = new List<string>();
-                if (k == "write" || k == "task-band") continue;
-                if (i + 1 >= args.Length) throw new ArgumentException($"--{k} needs a value");
+                else if (l.Count > 0 && !repeated.Contains(k, StringComparer.OrdinalIgnoreCase)) throw new UsageError($"--{k} is given twice");
+                if (isFlag) continue;
+                if (i + 1 >= args.Length) throw new UsageError($"--{k} needs a value");
                 l.Add(args[++i]);
             }
             return d;
@@ -139,7 +185,8 @@ namespace msstyleImport
 
         static int Import(string[] args)
         {
-            var a = ParseArgs(args);
+            var a = ParseArgs(args, new[] { "write", "task-band" }, new[] { "prefer-source", "exclude" },
+                new[] { "source", "template", "base", "companion", "out", "report", "image-tolerance" });
             var opt = new Win7ImportOptions
             {
                 SourcePath = One(a, "source"),
@@ -152,7 +199,11 @@ namespace msstyleImport
                 Exclude = a.TryGetValue("exclude", out var ex) ? ex : new List<string>(),
             };
             if (!opt.DryRun) opt.OutputPath = One(a, "out");
-            if (a.ContainsKey("image-tolerance")) opt.ImageTolerance = int.Parse(One(a, "image-tolerance"));
+            if (a.ContainsKey("image-tolerance"))
+            {
+                if (!int.TryParse(One(a, "image-tolerance"), out int tolerance)) throw new UsageError("--image-tolerance needs a number");
+                opt.ImageTolerance = tolerance;
+            }
             string prefix = One(a, "report");
 
             var report = Win7StyleImporter.Run(opt);
@@ -163,13 +214,18 @@ namespace msstyleImport
 
         static void PrintReport(ImportReport report, IEnumerable<string> files)
         {
+            if (report == null) { Console.WriteLine("status: no report (the import stopped before it could be built)"); return; }
             Console.WriteLine($"status: {report.Status}");
-            Console.WriteLine(report.StatusText);
+            Console.WriteLine(report.StatusText ?? "");
             foreach (var kv in report.Counts.OrderBy(k => k.Key)) Console.WriteLine($"  {kv.Key}: {kv.Value}");
-            foreach (var e in report.Errors) Console.WriteLine("error: " + e);
-            Console.WriteLine($"{report.Warnings.Count} warnings, {report.Validation.Checks.Count} validation checks passed, {report.Validation.Errors.Count} failed");
+            // the "validation: " copies are printed under the validation summary; counting them here printed every
+            // validation problem twice.
+            foreach (var e in report.ErrorsWithoutValidation) Console.WriteLine("error: " + e);
+            var validation = report.Validation;
+            Console.WriteLine($"{report.WarningsWithoutValidation.Count} warnings, {validation?.Checks.Count ?? 0} validation checks passed, {validation?.Errors.Count ?? 0} failed");
             if (report.Output != null) Console.WriteLine("candidate: " + report.Output);
-            foreach (var f in files) Console.WriteLine("report: " + f);
+            if (files == null) return;
+            foreach (var f in files.Where(f => f != null)) Console.WriteLine("report: " + f);
         }
 
         static int Schemes(string path)
@@ -184,7 +240,8 @@ namespace msstyleImport
         /// </summary>
         static int ImportXp(string[] args)
         {
-            var a = ParseArgs(args);
+            var a = ParseArgs(args, new[] { "write", "task-band" }, new[] { "scheme", "prefer-source", "exclude" },
+                new[] { "source", "template", "companion", "out-dir", "name", "base", "base-scheme", "shellstyle", "wallpaper", "image-tolerance" });
             var o = new XpThemeImportOptions
             {
                 SourcePath = One(a, "source"),
@@ -202,7 +259,11 @@ namespace msstyleImport
                 PreferSource = a.TryGetValue("prefer-source", out var ps) ? ps : new List<string>(),
                 Exclude = a.TryGetValue("exclude", out var ex) ? ex : new List<string>(),
             };
-            if (a.ContainsKey("image-tolerance")) o.ImageTolerance = int.Parse(One(a, "image-tolerance"));
+            if (a.ContainsKey("image-tolerance"))
+            {
+                if (!int.TryParse(One(a, "image-tolerance"), out int tolerance)) throw new UsageError("--image-tolerance needs a number");
+                o.ImageTolerance = tolerance;
+            }
 
             var results = XpThemeImport.Run(o, (scheme, file) => Console.WriteLine($"== {scheme} -> {file}"));
             foreach (var r in results)
@@ -214,12 +275,15 @@ namespace msstyleImport
             if (written.Count > 0)
                 Console.WriteLine($"install: copy \"{written[0].StyleFolder}\" to %WINDIR%\\Resources\\Themes\\{Path.GetFileName(written[0].StyleFolder)} and the .theme files next to it, then open one of: "
                     + string.Join(", ", written.Select(r => "\"" + r.ThemePath + "\"")));
+            // a scheme whose port or assembly threw is recorded in its report instead of ending the run, so the
+            // crash has to be read back out of the reports to keep exit 3 meaning "crashed".
+            if (results.Any(r => r.Report?.Errors.Any(e => e.StartsWith("import aborted:") || e.StartsWith("assembly aborted:")) == true)) return 3;
             return results.All(r => r.Ok) ? 0 : 1;
         }
 
         static int NoOp(string[] args)
         {
-            var a = ParseArgs(args);
+            var a = ParseArgs(args, new string[0], new string[0], new[] { "template", "out" });
             string template = One(a, "template"), output = One(a, "out");
             using (var style = new VisualStyle())
             {

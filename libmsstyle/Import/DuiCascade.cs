@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
+using libmsstyle.Import.Dui;
 
 namespace libmsstyle.Import
 {
@@ -14,7 +15,13 @@ namespace libmsstyle.Import
         public string Class { get; private set; }
         /// <summary>conditions: id atom, or a state flag with its required value (mousefocused, selected, keyfocused).</summary>
         public string Id { get; private set; }
-        public IReadOnlyDictionary<string, bool> Flags { get; private set; }
+
+        /// <summary>
+        /// every non-id condition of the selector, in source order. xp's sheet.cpp matches any property/value pair
+        /// (_CreatePropValPairNode) and counts all of them for specificity (_ComputeSpecif), so conditions this
+        /// resolver doesn't model are kept rather than dropping the rule.
+        /// </summary>
+        public IReadOnlyList<XpUifileSyntax.Condition> Conditions { get; private set; }
         public IReadOnlyDictionary<string, string> Decls { get; private set; }
         public int Order { get; private set; }
 
@@ -22,28 +29,21 @@ namespace libmsstyle.Import
         /// directui sheet.cpp _ComputeSpecif: (id conditions &lt;&lt; 24) | (all conditions &lt;&lt; 16) | rule order;
         /// the highest matching rule wins (MakeImmutable sorts descending).
         /// </summary>
-        public uint Specificity => ((Id != null ? 1u : 0u) << 24) | ((uint)(Flags.Count + (Id != null ? 1 : 0)) << 16) | (ushort)Order;
+        public uint Specificity => ((Id != null ? 1u : 0u) << 24) | ((uint)(Conditions.Count + (Id != null ? 1 : 0)) << 16) | (ushort)Order;
 
-        internal static DuiRule Parse(string selector, Dictionary<string, string> decls, int order)
+        internal static DuiRule From(XpUifileSyntax.Selector selector, Dictionary<string, string> decls, int order)
         {
-            var m = Regex.Match(selector, @"^([a-z0-9_]+)((?:\[[^\]]*\])*)$");
-            if (!m.Success) return null;
+            if (selector == null) return null;
             string id = null;
-            var flags = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-            foreach (Match c in Regex.Matches(m.Groups[2].Value, @"\[([^\]=]+)(?:=([^\]]*))?\]"))
+            var conditions = selector.StateConditions.ToList();
+            var idc = selector.IdCondition;
+            if (idc != null)
             {
-                string name = c.Groups[1].Value.Trim(), val = c.Groups[2].Success ? c.Groups[2].Value.Trim() : null;
-                if (name == "id")
-                {
-                    var a = Regex.Match(val ?? "", @"^atom\((\w+)\)$");
-                    if (!a.Success) return null;
-                    id = a.Groups[1].Value.ToLowerInvariant();
-                }
-                else if (val == null || val == "true") flags[name] = true;
-                else if (val == "false") flags[name] = false;
-                else return null; // a condition this resolver doesn't model; never guess a match.
+                // [id=atom(x)] keys the rule to an element id; anything else is kept as its raw text, which no node's
+                // atom id equals, so the rule stays in the list (and in the counts) without matching.
+                id = (idc.Atom ?? idc.Text ?? "").ToLowerInvariant();
             }
-            return new DuiRule { Class = m.Groups[1].Value, Id = id, Flags = flags, Decls = decls, Order = order };
+            return new DuiRule { Class = selector.Class.ToLowerInvariant(), Id = id, Conditions = conditions, Decls = decls, Order = order };
         }
     }
 
@@ -72,8 +72,26 @@ namespace libmsstyle.Import
             public Node Parent;
             public string Sheet;  // own SheetProp, null = parent's
             public bool MouseFocused, Selected, KeyFocused;
-            /// <summary>the expando or below; values inherited from above it are the pane's.</summary>
-            public bool InSection;
+            /// <summary>xp's other state properties a rule can condition on (button.cpp Pressed/Captured, element.cpp
+            /// Enabled, scrollbar.cpp Vertical, expando Expanded). Enabled defaults to true like EnabledProp.</summary>
+            public bool Pressed, Captured, Enabled = true, Vertical, Expanded;
+
+            /// <summary>the state a rule condition names, or null when this node doesn't have that property.</summary>
+            public bool? State(string name)
+            {
+                switch (name.ToLowerInvariant())
+                {
+                    case "mousefocused": return MouseFocused;
+                    case "selected": return Selected;
+                    case "keyfocused": return KeyFocused;
+                    case "pressed": return Pressed;
+                    case "captured": return Captured;
+                    case "enabled": return Enabled;
+                    case "vertical": return Vertical;
+                    case "expanded": return Expanded;
+                    default: return null;
+                }
+            }
         }
 
         private static readonly HashSet<string> Inherited = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -116,17 +134,24 @@ namespace libmsstyle.Import
         {
             if (!string.Equals(r.Class, n.Class, StringComparison.OrdinalIgnoreCase)) return false;
             if (r.Id != null && !string.Equals(r.Id, n.Id, StringComparison.OrdinalIgnoreCase)) return false;
-            foreach (var f in r.Flags)
+            foreach (var c in r.Conditions)
             {
-                bool v;
-                switch (f.Key.ToLowerInvariant())
+                // sheet.cpp GetSheetValue: a condition is a property/value pair, compared for equality (or
+                // inequality for PALOGOP_NotEqual). `class` is the one property of the element this tree knows
+                // besides its states (scrollbar_win32.uix: `repeatbutton [class="Page"][pressed]`).
+                if (string.Equals(c.Name, "class", StringComparison.OrdinalIgnoreCase))
                 {
-                    case "mousefocused": v = n.MouseFocused; break;
-                    case "selected": v = n.Selected; break;
-                    case "keyfocused": v = n.KeyFocused; break;
-                    default: return false; // unmodelled state: the rule isn't assumed to apply.
+                    bool same = c.Text != null && string.Equals(c.Text.Trim().Trim('"', '\''), n.Class, StringComparison.OrdinalIgnoreCase);
+                    if (same == c.Negated) return false;
+                    continue;
                 }
-                if (v != f.Value) return false;
+                // Only the states this tree models can be decided; a condition on anything else is not assumed to
+                // hold, so the rule stays out rather than guessing.
+                bool? v = n.State(c.Name);
+                if (v == null) return false;
+                bool want = c.Value == null
+                    || (c.Value.Kind == XpUifileSyntax.ValueKind.Ident && c.Value.Text.Equals("true", StringComparison.OrdinalIgnoreCase));
+                if (v.Value != (c.Negated ? !want : want)) return false;
             }
             return true;
         }
@@ -153,18 +178,23 @@ namespace libmsstyle.Import
             var scroller = new Node { Class = "scrollviewer", Id = "scroller", Parent = view, Sheet = "taskpane" };
             s.Pane = new Node { Class = "element", Id = "sectionlist", Parent = scroller };
             Node N(string c, string id, Node parent, string sheet = null, bool mf = false)
-                => new Node { Class = c, Id = id, Parent = parent, Sheet = sheet, Selected = open, MouseFocused = mf, InSection = true };
+                => new Node { Class = c, Id = id, Parent = parent, Sheet = sheet, Selected = open, MouseFocused = mf };
             s.Expando = N("expando", null, s.Pane, main ? "mainsectionss" : "sectionss");
+            s.Expando.Expanded = open;
             Node top = s.Expando;
             if (main) top = s.Wrapper = N("element", null, s.Expando);
             s.Header = N("button", "header", top, mf: hot);
             s.Title = N("element", "title", s.Header, mf: hot);
             s.Arrow = N("element", "arrow", s.Header, mf: hot);
             s.Clipper = N("clipper", null, s.Expando);
+            s.Clipper.Expanded = open;
             Node listParent = s.Clipper;
             if (main) listParent = s.Watermark = N("element", "watermark", s.Clipper);
             s.TaskList = N("tasklist", "tasklist", listParent);
-            s.Task = N("actiontask", null, s.TaskList, main ? "mainsectiontaskss" : "sectiontaskss");
+            // the pane's rows are destination tasks ("Other Places" links, duiview.cpp:744 DestinationTask::Create);
+            // action tasks (duiview.cpp:707) are the command links of a folder's own task pane, a different element
+            // class, and are styled by actiontask rules the shellstyle keeps apart from destinationtask.
+            s.Task = N("destinationtask", null, s.TaskList, main ? "mainsectiontaskss" : "sectiontaskss");
             s.TaskButton = N("button", null, s.Task, mf: hot);
             s.TaskTitle = N("element", "title", s.TaskButton, mf: hot);
             return s;

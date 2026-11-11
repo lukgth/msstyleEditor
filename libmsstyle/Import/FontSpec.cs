@@ -26,6 +26,12 @@ namespace libmsstyle.Import
         public bool Strikeout { get; private set; }
         /// <summary>LOGFONT quality: 0 default, 3 nonantialiased, 4 antialiased, 5 cleartype, 6 cleartype-natural.</summary>
         public int Quality { get; private set; }
+        /// <summary>LOGFONT lfCharSet. XP has no per-font charset: themeldr parser.cpp keeps one
+        /// [globals] Charset (_uCharSet, DEFAULT_CHARSET when absent) and stamps it into every LOGFONT
+        /// (ParseFontValue), so the importer puts the style's value here. It only shows up in
+        /// <see cref="ToString"/> when it isn't DEFAULT_CHARSET, which keeps every ordinary font string
+        /// byte-identical to what uxtheme expects.</summary>
+        public int Charset { get; set; } = 1;
         /// <summary>null when uxtheme would accept the string; otherwise why it wouldn't.</summary>
         public string Error { get; private set; }
         /// <summary>accepted by uxtheme but almost certainly not what the author meant (size 0, ignored styles...).</summary>
@@ -84,6 +90,9 @@ namespace libmsstyle.Import
                 else if (tok.Equals("underline", StringComparison.OrdinalIgnoreCase)) f.Underline = true;
                 else if (tok.Equals("strikeout", StringComparison.OrdinalIgnoreCase)) f.Strikeout = true;
                 else if (Qualities.TryGetValue(tok, out int q)) f.Quality = q;
+                else if (tok.StartsWith("charset:", StringComparison.OrdinalIgnoreCase)
+                    && int.TryParse(tok.Substring("charset:".Length), NumberStyles.Integer, CultureInfo.InvariantCulture, out int cs))
+                    f.Charset = cs;
                 else
                 {
                     f.Error = $"unknown font style \"{tok}\"; uxtheme refuses to load the whole theme over it";
@@ -121,11 +130,12 @@ namespace libmsstyle.Import
             return o != null && Error == null && o.Error == null
                 && string.Equals(Face, o.Face, StringComparison.OrdinalIgnoreCase)
                 && Points == o.Points && Bold == o.Bold && Italic == o.Italic
-                && Underline == o.Underline && Strikeout == o.Strikeout && Quality == o.Quality;
+                && Underline == o.Underline && Strikeout == o.Strikeout && Quality == o.Quality
+                && Charset == o.Charset;
         }
 
         public override bool Equals(object obj) => Equals(obj as FontSpec);
-        public override int GetHashCode() => (Face ?? "").ToLowerInvariant().GetHashCode() ^ Points;
+        public override int GetHashCode() => (Face ?? "").ToLowerInvariant().GetHashCode() ^ Points ^ (Charset << 24);
 
         public override string ToString()
         {
@@ -136,6 +146,9 @@ namespace libmsstyle.Import
             if (Strikeout) parts.Add("Strikeout");
             var q = Qualities.FirstOrDefault(kv => kv.Value == Quality).Key;
             if (q != null) parts.Add(q == "quality:cleartype" ? "Quality:ClearType" : q);
+            // only a non-default charset is written out: a plain "Tahoma, 8" has to stay byte
+            // identical to what XP wrote, since uxtheme reads these strings back.
+            if (Charset != 1) parts.Add("Charset:" + Charset.ToString(CultureInfo.InvariantCulture));
             return string.Join(", ", parts);
         }
     }

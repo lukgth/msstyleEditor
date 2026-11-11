@@ -66,11 +66,41 @@ namespace libmsstyle.Import
             return best;
         }
 
+        /// <summary>
+        /// The lines of an .theme, decoded the way xp reads one: a BOM decides, and without one the file is ANSI in the
+        /// system codepage (xp's <c>SHSetIniStringW</c> writes plain ANSI and only adds a UTF-7 <c>[Section.W]</c> shadow
+        /// for values that aren't 7-bit clean, shlwapi/inistr.cpp:249-290). <see cref="File.ReadAllLines(string)"/>
+        /// assumes UTF-8 with a replacement fallback, which turns a German pack's
+        /// <c>C:\Dokumente und Einstellungen\Müller\…</c> into U+FFFD and makes every path test fail.
+        /// </summary>
+        internal static string[] ReadThemeLines(string path)
+        {
+            return File.ReadAllLines(path, DetectThemeEncoding(path));
+        }
+
+        /// <summary>the encoding a BOM names (this porter's own output is UTF-8 with one), the ANSI codepage otherwise.</summary>
+        private static Encoding DetectThemeEncoding(string path)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    int b0 = fs.ReadByte(), b1 = fs.ReadByte(), b2 = fs.ReadByte();
+                    if (b0 == 0xEF && b1 == 0xBB && b2 == 0xBF) return Encoding.UTF8;
+                    if (b0 == 0xFF && b1 == 0xFE) return Encoding.Unicode;
+                    if (b0 == 0xFE && b1 == 0xFF) return Encoding.BigEndianUnicode;
+                    return Encoding.Default;
+                }
+            }
+            catch (IOException) { return Encoding.Default; }
+            catch (UnauthorizedAccessException) { return Encoding.Default; }
+        }
+
         private static Desktop ReadThemeFile(string path)
         {
             var d = new Desktop { ThemePath = path };
             string section = "";
-            foreach (var raw in File.ReadAllLines(path))
+            foreach (var raw in ReadThemeLines(path))
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line[0] == ';' || line[0] == '#') continue;
@@ -104,8 +134,10 @@ namespace libmsstyle.Import
             if (string.IsNullOrEmpty(raw)) return null;
             string v = raw.Trim().Trim('"');
             if (v.Length == 0) return null;
-            // xp theme packs spell it as an absolute path that assumed the machine the pack was made on.
-            string expanded = Environment.ExpandEnvironmentVariables(v.Replace("%ResourceDir%", "%SystemRoot%"));
+            // xp theme packs spell it as an absolute path that assumed the machine the pack was made on; %ThemeDir% is
+            // the .theme's folder, and xp omits the separator after %WinDir% ("%WinDir%resources\Themes\...").
+            string themeDir = themePath == null ? null : Path.GetDirectoryName(Path.GetFullPath(themePath));
+            string expanded = XpThemeExtras.ExpandTokens(v, themeDir);
             var candidates = new List<string>();
             if (Path.IsPathRooted(expanded)) candidates.Add(expanded);
             string styleParent = Path.GetDirectoryName(styleDir);
@@ -131,15 +163,34 @@ namespace libmsstyle.Import
                     foreach (var f in Directory.EnumerateFiles(root, Path.GetFileName(v), SearchOption.AllDirectories))
                         return Path.GetFullPath(f);
                 }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
+                // a subfolder the walk can't read is skipped: the picture may still be found under another root.
+                catch (IOException) { continue; }
+                catch (UnauthorizedAccessException) { continue; }
             }
             return null;
         }
 
 
-        /// <summary>[Control Panel\Colors] key names, in sysmetrics order (TMT_SCROLLBAR 1601 .. TMT_MENUBAR 1631).</summary>
-        private static readonly string[] ColorNames =
+        /// <summary>[Control Panel\Cursors] slot names, in the order xp's theme files spell them
+        /// (themeui/themefile.cpp:19 s_pszCursorArray plus the win10-only slots a pack may still fill).</summary>
+        internal static readonly string[] CursorKeys =
+        {
+            "Arrow", "Help", "AppStarting", "Wait", "NWPen", "No", "Crosshair", "IBeam", "UpArrow", "Hand", "Link",
+            "SizeAll", "SizeNS", "SizeWE", "SizeNWSE", "SizeNESW", "SizeVertical", "SizeHorizontal", "Person", "Pin",
+            "ScrollWE", "ScrollNS", "ScrollNW", "ScrollNE", "ScrollSE", "ScrollSW",
+        };
+
+        /// <summary>the six <c>[Metrics]</c> font descriptors xp reads on top of the two blobs
+        /// (themeui/themefile.cpp:174-185 <c>_LoadCustomFonts</c>), in the order it reads them. Each is a
+        /// <c>{Face, Npt, charset}</c> string, sometimes behind an <c>@dll,-id</c> indirection.</summary>
+        internal static readonly string[] MetricFontKeys =
+        {
+            "CaptionFont", "SmCaptionFont", "MenuFont", "StatusFont", "MessageFont", "IconFont",
+        };
+
+        /// <summary>[Control Panel\Colors] key names, in sysmetrics order (TMT_SCROLLBAR 1601 .. TMT_MENUBAR 1631).
+        /// The applier writes the same table, so this is the only copy.</summary>
+        internal static readonly string[] SysColorNames =
         {
             "Scrollbar", "Background", "ActiveTitle", "InactiveTitle", "Menu", "Window", "WindowFrame", "MenuText",
             "WindowText", "TitleText", "ActiveBorder", "InactiveBorder", "AppWorkspace", "Hilight", "HilightText",
@@ -161,8 +212,8 @@ namespace libmsstyle.Import
             foreach (var p in state.Properties)
             {
                 int i = p.Header.nameID - (int)IDENTIFIER.FIRSTCOLOR;
-                if (p.Header.typeID == (int)IDENTIFIER.COLOR && i >= 0 && i < ColorNames.Length && p.GetValue() is Color c)
-                    d[ColorNames[i]] = c;
+                if (p.Header.typeID == (int)IDENTIFIER.COLOR && i >= 0 && i < SysColorNames.Length && p.GetValue() is Color c)
+                    d[SysColorNames[i]] = c;
             }
             return d;
         }
@@ -175,19 +226,24 @@ namespace libmsstyle.Import
         /// <param name="colorStyle">the style's color variant name ([VisualStyles] ColorStyle; windows loads Shell\&lt;it&gt;).</param>
         /// <param name="fit">how xp fitted that picture; null keeps this generator's default (fill).</param>
         /// <param name="extras">system metrics, cursors, icons, screensaver, sounds from the xp pack; null = none.</param>
+        /// <param name="sizeName">the written style's normal size variant name (VMAP size column), so [VisualStyles] Size
+        /// resolves; xp packs call it NormalSize, but a template may name it differently.</param>
         public static string BuildTheme(string displayName, string styleFolder, string styleFile, string wallpaper, IDictionary<string, Color> colors = null,
-            string colorStyle = "NormalColor", Desktop fit = null, XpThemeExtras extras = null)
+            string colorStyle = "NormalColor", Desktop fit = null, XpThemeExtras extras = null, string sizeName = "NormalSize")
         {
             foreach (var v in new[] { displayName, styleFolder, styleFile, wallpaper, colorStyle })
             {
                 if (string.IsNullOrEmpty(v) || v.IndexOfAny(new[] { '\r', '\n' }) >= 0)
                     throw new ArgumentException("theme values must be single, non-empty lines");
             }
-            // xp's WallpaperStyle/ TileWallpaper carried over into the pair win10 reads (Win10 stores the same idea
-            // under WallpaperStyle + PicturePosition). null fit = this generator's default, fill.
+            // xp's three states (theme.idl BKDGT_CENTER/TILE/STRECH) map onto win10's WallpaperStyle, which is the value
+            // that decides: 0 centered, 2 stretched, 10 fill. TileWallpaper=1 forces tiling whatever WallpaperStyle says.
+            // PicturePosition is inert on win10, so it is written as the matching DWPOS number instead of a second,
+            // contradictory claim: a centered picture said "fill" (4) and a tiled one "fit" (3) next to a
+            // WallpaperStyle that said otherwise. null fit = this generator's default, fill.
             bool tile = fit?.TileWallpaper ?? false;
             int wallStyle = fit == null ? 10 : tile ? 0 : fit.WallpaperStyle == 2 ? 2 : 0;
-            int picturePosition = fit == null ? 2 : tile ? 3 : fit.WallpaperStyle == 2 ? 2 : 4;
+            int picturePosition = tile ? 1 : wallStyle == 2 ? 2 : wallStyle == 10 ? 4 : 0;
             var iconOverrides = new Dictionary<string, List<(string Key, string Value)>>(StringComparer.OrdinalIgnoreCase);
             if (extras != null)
                 foreach (var i in extras.Icons)
@@ -196,7 +252,6 @@ namespace libmsstyle.Import
                     if (!iconOverrides.TryGetValue(key, out var list)) iconOverrides[key] = list = new List<(string, string)>();
                     list.Add((i.Key, i.Value));
                 }
-            var writtenIcons = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             string Canon(string section) => (section ?? "").Trim().Trim('[', ']');
             var sb = new StringBuilder();
             void L(string s = "") => sb.Append(s).Append("\r\n");
@@ -206,38 +261,13 @@ namespace libmsstyle.Import
             L("DisplayName=" + displayName);
             L("SetLogonBackground=0");
             L();
-            // a shipped picture replaces the win10 default in the same section; a section without one keeps the defaults.
-            void IconSection(string comment, string section, params (string Key, string Value)[] defaults)
+            // Only resolved source icons are emitted; never replace missing XP artwork with Win10 imageres icons.
+            foreach (var icon in iconOverrides)
             {
-                string name = Canon(section);
-                var lines = defaults.Select(d => (d.Key, d.Value)).ToList();
-                if (iconOverrides.TryGetValue(name, out var ov))
-                {
-                    foreach (var o in ov)
-                    {
-                        int at = lines.FindIndex(l => l.Key.Equals(o.Key, StringComparison.OrdinalIgnoreCase));
-                        if (at >= 0) lines[at] = (lines[at].Key, o.Value);
-                        else lines.Add(o);
-                    }
-                }
-                writtenIcons.Add(name);
-                if (!string.IsNullOrEmpty(comment)) L("; " + comment);
-                L("[" + name + "]");
-                foreach (var l in lines) L(l.Key + "=" + l.Value);
+                L("[" + icon.Key + "]");
+                foreach (var entry in icon.Value) L(entry.Key + "=" + entry.Value);
                 L();
             }
-            IconSection("Computer - SHIDI_SERVER", @"[CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\DefaultIcon]", ("DefaultValue", @"%SystemRoot%\System32\imageres.dll,-109"));
-            IconSection("UsersFiles - SHIDI_USERFILES", @"[CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\DefaultIcon]", ("DefaultValue", @"%SystemRoot%\System32\imageres.dll,-123"));
-            IconSection("Network - SHIDI_MYNETWORK", @"[CLSID\{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}\DefaultIcon]", ("DefaultValue", @"%SystemRoot%\System32\imageres.dll,-25"));
-            // xp also themed My Documents and My Network Places; win10 has names for them, so these only appear when
-            // the pack shipped pictures for them.
-            const string myDocs = @"CLSID\{450D8FBA-AD25-11D0-98A8-0800361B1103}\DefaultIcon";
-            if (iconOverrides.ContainsKey(myDocs)) IconSection("My Documents - SHIDI_PERSONAL", myDocs, Array.Empty<(string, string)>());
-            const string myNet = @"CLSID\{208D2C60-3AEA-1069-A2D7-08002B30309D}\DefaultIcon";
-            if (iconOverrides.ContainsKey(myNet)) IconSection("My Network Places - SHIDI_NETWORK", myNet, Array.Empty<(string, string)>());
-            IconSection("Recycle Bin - SHIDI_RECYCLERFULL SHIDI_RECYCLER", @"[CLSID\{645FF040-5081-101B-9F08-00AA002F954E}\DefaultIcon]", ("Full", @"%SystemRoot%\System32\imageres.dll,-54"), ("Empty", @"%SystemRoot%\System32\imageres.dll,-55"));
-            foreach (var kv in iconOverrides.Where(k => !writtenIcons.Contains(k.Key)))
-                IconSection(null, kv.Key, Array.Empty<(string, string)>());
 
             L(@"[Control Panel\Cursors]");
             if (extras != null && extras.Cursors.Count > 0)
@@ -249,8 +279,9 @@ namespace libmsstyle.Import
             }
             else
             {
-                foreach (var c in new[] { "AppStarting", "Arrow", "Crosshair", "Hand", "Help", "IBeam", "No", "NWPen", "SizeAll", "SizeNESW", "SizeNS", "SizeNWSE", "SizeWE", "UpArrow", "Wait" })
-                    L(c + "=");
+                // the same slot list the applier writes, so a pack that ships cursors and one that doesn't produce the
+                // same section (the old 15-key list was a subset of the 26 the reader knows).
+                foreach (var c in CursorKeys) L(c + "=");
                 L("DefaultValue=Windows Default");
                 L("DefaultValue.MUI=@themeui.dll,-2043");
             }
@@ -258,7 +289,7 @@ namespace libmsstyle.Import
             if (colors != null && colors.Count > 0)
             {
                 L(@"[Control Panel\Colors]");
-                foreach (var name in ColorNames.Where(colors.ContainsKey))
+                foreach (var name in SysColorNames.Where(colors.ContainsKey))
                     L($"{name}={colors[name].R} {colors[name].G} {colors[name].B}");
                 L();
             }
@@ -269,20 +300,36 @@ namespace libmsstyle.Import
             L("PicturePosition=" + picturePosition);
             L("Pattern=");
             L();
-            if (extras != null && extras.Metrics.Count > 0)
+            // [Metrics]: the two blobs plus the six font descriptors. The descriptors are read straight from the source
+            // .theme because a pack that names its fonts that way (classic.theme's "@themeui.dll,-2037"…"-2042") has
+            // nothing else to carry them: dropping them loses the fonts the style's own records don't mention.
+            var metricLines = new List<(string Key, string Value)>();
+            if (extras != null) metricLines.AddRange(extras.Metrics.Select(m => (m.Key, m.Value)));
+            if (fit?.ThemePath != null)
+            {
+                var source = ThemeIni.Read(fit.ThemePath);
+                foreach (var key in MetricFontKeys)
+                {
+                    string v = source.Get("Metrics", key);
+                    if (string.IsNullOrWhiteSpace(v)) continue;
+                    if (metricLines.Any(l => l.Key.Equals(key, StringComparison.OrdinalIgnoreCase))) continue;
+                    metricLines.Add((key, v.Trim()));
+                }
+            }
+            if (metricLines.Count > 0)
             {
                 L("[Metrics]");
-                foreach (var m in extras.Metrics) L(m.Key + "=" + m.Value);
+                foreach (var m in metricLines) L(m.Key + "=" + m.Value);
                 L();
             }
             L("[VisualStyles]");
             L($@"Path=%ResourceDir%\Themes\{styleFolder}\{styleFile}");
             L("ColorStyle=" + colorStyle);
-            L("Size=NormalSize");
+            L("Size=" + (string.IsNullOrWhiteSpace(sizeName) ? "NormalSize" : sizeName.Trim()));
             L("AutoColorization=0");
             L("ColorizationColor=0XC40078D7");
             L("AppMode=Light");
-            L("SystemMode=Dark");
+            L("SystemMode=Light");
             L("VisualStyleVersion=10");
             L();
             L("[boot]");

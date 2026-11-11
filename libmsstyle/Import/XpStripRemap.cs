@@ -49,7 +49,9 @@ namespace libmsstyle.Import
             return new Geometry
             {
                 Count = count?.GetValue() is int n && n > 0 ? n : 1,
-                Horizontal = layout?.GetValue() is int l && l == 1,
+                // a missing IMAGELAYOUT means horizontal to xp's loader and vertical to win10's; a source or base
+                // strip without the record must be cut the way xp cut it, not the way the template's loader would.
+                Horizontal = layout?.GetValue() is int l ? l == 1 : s.Platform == Platform.WinXP,
             };
         }
 
@@ -84,8 +86,8 @@ namespace libmsstyle.Import
                     foreach (var bs in bp.States.Values)
                     {
                         var images = bs.Properties.Where(p => StripIds.Contains(p.Header.nameID)).ToList();
-                        var m = images.Count == 0 ? null : LearnMap(images, tc, donor, bs.StateId,
-                            GeometryOf(m_base, bc, donor, bs.StateId), GeometryOf(m_target, tc, donor, bs.StateId), new HashSet<int>());
+                        var m = images.Count == 0 ? null : LearnMap(WithGlyph(bs, images), tc, donor, bs.StateId,
+                            GeometryOf(m_base, bc, donor, bs.StateId), GeometryOf(m_target, tc, donor, bs.StateId));
                         if (m != null) learned[(bc.ClassName.ToLowerInvariant(), donor, bs.StateId)] = m;
                     }
                 }
@@ -107,14 +109,29 @@ namespace libmsstyle.Import
                         // nothing, so the template didn't re-cut anything here (Luna10 drops IMAGELAYOUT on the
                         // single-picture ExplorerBar headers). Treating it as a re-cut refused those parts and
                         // kept the template's own art over the source's (Pure's NORMALGROUPHEAD/SPECIALGROUPHEAD).
-                        if (bg.Count == 1 && tg.Count == 1) continue;
-                        if (bg.Count == tg.Count && bg.Horizontal == tg.Horizontal) continue;
+                        if ((bg.Count == 1 && tg.Count == 1) || (bg.Count == tg.Count && bg.Horizontal == tg.Horizontal))
+                        {
+                            if (sc != null && sc.Parts.TryGetValue(bp.PartId, out var samePart)
+                                && samePart.States.TryGetValue(bs.StateId, out var sameState))
+                            {
+                                var sg = GeometryOf(m_source, sc, bp.PartId, bs.StateId);
+                                if (sg.Count != tg.Count)
+                                {
+                                    string sameLabel = $"{bc.ClassName} part {bp.PartId} state {bs.StateId}";
+                                    int[] sourceMap = sg.Count == 1 ? new int[tg.Count]
+                                        : SemanticMap(bc.ClassName, bp.PartId, sg.Count, tg.Count);
+                                    var ownImages = sameState.Properties.Where(p => StripIds.Contains(p.Header.nameID)).ToList();
+                                    if (sourceMap == null || !Recut(m_source, sc, bp.PartId, sameState,
+                                        WithGlyph(sameState, ownImages), sg, tg, sourceMap, p => false, sameLabel))
+                                        KeepTemplate(bc.ClassName, bp.PartId, sameLabel, $"source {sg} has no semantic mapping to {tg}");
+                                }
+                            }
+                            continue;
+                        }
                         string label = $"{bc.ClassName} part {bp.PartId} state {bs.StateId}";
 
-                        var guessed = new SortedSet<int>();
-                        int[] map = LearnMap(images, tc, bp.PartId, bs.StateId, bg, tg, guessed);
-                        if (map != null && guessed.Count > 0)
-                            m_report.Notes.Add($"{label}: template frames {string.Join(",", guessed.Select(j => j + 1))} aren't stock xp art (states xp didn't have); they show the closest stock frame.");
+                        int[] map = SemanticMap(bc.ClassName, bp.PartId, bg.Count, tg.Count)
+                            ?? LearnMap(WithGlyph(bs, images), tc, bp.PartId, bs.StateId, bg, tg);
                         var donorKey = mapDonors.Keys.FirstOrDefault(k => k.Item2 == bp.PartId && string.Equals(k.Item1, bc.ClassName, StringComparison.OrdinalIgnoreCase));
                         if (map == null && donorKey.Item1 != null
                             && learned.TryGetValue((bc.ClassName.ToLowerInvariant(), mapDonors[donorKey], bs.StateId), out var donorMap) && donorMap.Length == tg.Count)
@@ -125,7 +142,7 @@ namespace libmsstyle.Import
                         if (map == null && sc != null && IsGripper(bc.ClassName, bp.PartId)
                             && sc.Parts.TryGetValue(bp.PartId, out var gripPart) && gripPart.States.TryGetValue(bs.StateId, out var gripState)
                             && !SamePictures(gripState, images)
-                            && RefitOwnFrames(m_source, sc, bp.PartId, bs.StateId, tg, out var refit))
+                            && RefitOwnFrames(m_source, sc, tc, bp.PartId, bs.StateId, tg, out var refit))
                         {
                             m_report.Notes.Add($"{label}: template redrew the resize grip; the source's own {refit} alignment frames are retained at their native size and expanded into {tg} frames (top alignments reflected vertically).");
                             m_report.Count("xp-strip-refit");
@@ -133,46 +150,106 @@ namespace libmsstyle.Import
                         }
                         if (map == null)
                         {
-                            m_report.Notes.Add($"{label}: template re-cut the strip from {bg} to {tg} frames with art that isn't stock xp; the template's strip stays.");
-                            m_report.Count("xp-strip-not-remapped");
+                            KeepTemplate(bc.ClassName, bp.PartId, label, $"no semantic or consistent stock-art mapping from {bg} to {tg}");
                             continue;
                         }
 
-                        // a source that kept stock's pictures (stock luna itself) takes the same template strips as the
-                        // stock cut, or it would "change" every strip it re-cuts. Compared before the stock is re-cut.
+                        // the source's pictures, and which of them are still stock xp's. Compared before the stock
+                        // is re-cut: a stock picture may adopt the template's strip, a source-only one may not.
                         StyleState ss = null;
-                        bool sourceIsStock = sc != null && sc.Parts.TryGetValue(bp.PartId, out var sp) && sp.States.TryGetValue(bs.StateId, out ss)
-                            && SamePictures(ss, WithGlyph(bs, images));
+                        var simages = new List<StyleProperty>();
+                        var stockProps = new HashSet<StyleProperty>();
+                        if (sc != null && sc.Parts.TryGetValue(bp.PartId, out var sp) && sp.States.TryGetValue(bs.StateId, out ss))
+                        {
+                            simages = ss.Properties.Where(p => StripIds.Contains(p.Header.nameID)).ToList();
+                            foreach (var prop in WithGlyph(ss, simages))
+                            {
+                                var bprop = bs.Properties.FirstOrDefault(x => x.Header.nameID == prop.Header.nameID);
+                                if (bprop == null) continue;
+                                var a = Decode(m_base, bprop);
+                                var b = Decode(m_source, prop);
+                                if (a != null && b != null && a.PixelSha1() == b.PixelSha1()) stockProps.Add(prop);
+                            }
+                        }
 
                         // an image glyph is cut with the part's IMAGECOUNT too: it goes along with the same map
                         // (Toolbar SPLITBUTTONDROPDOWN, the back/forward arrows), or its frames stop lining up.
-                        Recut(m_base, bc, bp.PartId, bs, WithGlyph(bs, images), bg, tg, map, guessed);
-                        if (ss != null)
+                        if (!Recut(m_base, bc, bp.PartId, bs, WithGlyph(bs, images), bg, tg, map, p => true, label))
+                        {
+                            KeepTemplate(bc.ClassName, bp.PartId, label, $"stock frames cannot fill the template's {tg} mapping");
+                            continue;
+                        }
+                        bool remapped = true;
+                        if (ss != null && simages.Count > 0)
                         {
                             var sg = GeometryOf(m_source, sc, bp.PartId, bs.StateId);
-                            var simages = ss.Properties.Where(p => StripIds.Contains(p.Header.nameID)).ToList();
-                            if (simages.Count > 0 && sg.Count == bg.Count)
+                            if (sg.Count == bg.Count)
                             {
                                 // same frames as stock, maybe laid out the other way (GSM's thumbs are 4 side by side):
                                 // frame i means the same state, so the stock map applies to the source's own cut.
-                                Recut(m_source, sc, bp.PartId, ss, WithGlyph(ss, simages), sg, tg, map, sourceIsStock ? guessed : null);
+                                remapped = Recut(m_source, sc, bp.PartId, ss, WithGlyph(ss, simages), sg, tg, map, stockProps.Contains, label);
                             }
-                            else if (simages.Count > 0 && sg.Count == 1)
+                            else if (sg.Count == tg.Count && SemanticMap(bc.ClassName, bp.PartId, bg.Count, tg.Count) != null)
+                            {
+                                // A known modern-state strip (notably PUSHBUTTON's sixth animating state)
+                                // already has the target's semantic order; never interpret it as stock's cut.
+                                remapped = Recut(m_source, sc, bp.PartId, ss, WithGlyph(ss, simages), sg, tg,
+                                    Enumerable.Range(0, tg.Count).ToArray(), p => false, label);
+                            }
+                            else if (sg.Count == 1)
                             {
                                 // one frame draws every state on xp; each template frame shows it.
-                                Recut(m_source, sc, bp.PartId, ss, WithGlyph(ss, simages), sg, tg, new int[tg.Count]);
-                                m_report.Notes.Add($"{label}: source draws every state with one frame; repeated into the template's {tg} frames.");
+                                remapped = Recut(m_source, sc, bp.PartId, ss, WithGlyph(ss, simages), sg, tg, new int[tg.Count], p => false, label);
+                                if (remapped)
+                                    m_report.Notes.Add($"{label}: source draws every state with one frame; repeated into the template's {tg} frames.");
                             }
-                            else if (simages.Count > 0)
-                            {
-                                m_report.Warnings.Add($"{label}: source cuts this strip into {sg} frames, stock xp into {bg}; the template's {tg} frame mapping doesn't apply, source strip left as is.");
-                            }
+                            else
+                                remapped = false;
+                        }
+                        if (!remapped)
+                        {
+                            KeepTemplate(bc.ClassName, bp.PartId, label, $"source frame count/layout has no semantic mapping to {tg}");
+                            continue;
                         }
                         m_report.Notes.Add($"{label}: strip re-cut from {bg} to {tg} frames the way the template did it (frames {string.Join(",", map.Select(i => i + 1))}).");
                         m_report.Count("xp-strip-remapped");
                     }
                 }
             }
+        }
+
+        private void KeepTemplate(string cls, int part, string label, string reason)
+        {
+            var sourceNames = SemanticModel.PartNames(cls, m_base.Platform);
+            int targetPart = part;
+            if (sourceNames.TryGetValue(part, out var name))
+            {
+                var targetName = SemanticModel.PartNames(cls, m_target.Platform)
+                    .FirstOrDefault(p => string.Equals(p.Value, name, StringComparison.OrdinalIgnoreCase));
+                if (targetName.Value != null) targetPart = targetName.Key;
+            }
+            m_report.UnmappedStripParts.Add(cls + "|" + targetPart);
+            m_report.Warnings.Add($"{label}: {reason}; this part's strip geometry and images are locked to the template.");
+            m_report.Count("xp-strip-not-remapped");
+        }
+
+        // These are state contracts, not visual guesses. HOVER means the pointer is elsewhere on
+        // the scrollbar, unlike HOT (the pointer is on this particular thumb/arrow).
+        private static int[] SemanticMap(string cls, int part, int sourceCount, int targetCount)
+        {
+            int separator = cls.LastIndexOf("::", StringComparison.Ordinal);
+            if (separator >= 0) cls = cls.Substring(separator + 2);
+            if (string.Equals(cls, "Button", StringComparison.OrdinalIgnoreCase) && part == 1
+                && sourceCount == 5 && targetCount == 6)
+                return new[] { 0, 1, 2, 3, 4, 4 }; // DEFAULTED_ANIMATING uses DEFAULTED on XP
+            if (string.Equals(cls, "ScrollBar", StringComparison.OrdinalIgnoreCase))
+            {
+                if (part == 1 && sourceCount == 16 && targetCount == 20)
+                    return Enumerable.Range(0, 16).Concat(new[] { 0, 4, 8, 12 }).ToArray();
+                if (part >= 2 && part <= 9 && sourceCount == 4 && targetCount == 5)
+                    return new[] { 0, 1, 2, 3, 0 };
+            }
+            return null;
         }
 
         /// <summary>Both native resize-grip consumers use right/left alignment frames on XP.</summary>
@@ -187,7 +264,7 @@ namespace libmsstyle.Import
         /// The latter use the same full motif in the template; only the top variants need reflection.
         /// Stock source art is deliberately not refitted, preserving the template's stock adaptations.
         /// </summary>
-        private bool RefitOwnFrames(VisualStyle srcStyle, StyleClass sc, int part, int state, Geometry tg, out string sourceCut)
+        private bool RefitOwnFrames(VisualStyle srcStyle, StyleClass sc, StyleClass tc, int part, int state, Geometry tg, out string sourceCut)
         {
             sourceCut = null;
             if (sc == null || !sc.Parts.TryGetValue(part, out var sp) || !sp.States.TryGetValue(state, out var ss)) return false;
@@ -204,7 +281,7 @@ namespace libmsstyle.Import
                 var outImg = new ArgbImage(tg.Horizontal ? w * tg.Count : w, tg.Horizontal ? h : h * tg.Count);
                 for (int j = 0; j < tg.Count; ++j)
                 {
-                    bool left = (j & 1) != 0, top = (j & 2) != 0;
+                    bool left = MirroredLeft(tc, part, j), top = MirroredTop(tc, part, j);
                     var frame = frames[left && frames.Length > 1 ? 1 : 0];
                     int ox = tg.Horizontal ? j * w : 0, oy = tg.Horizontal ? 0 : j * h;
                     for (int y = 0; y < h; ++y)
@@ -216,6 +293,42 @@ namespace libmsstyle.Import
             Upsert(ss, sc, part, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, tg.Count);
             Upsert(ss, sc, part, IDENTIFIER.IMAGELAYOUT, IDENTIFIER.ENUM, tg.Horizontal ? 1 : 0);
             return true;
+        }
+
+        /// <summary>
+        /// whether the template's frame j is the left-aligned variant, read from the alignment states win10 gives
+        /// the part (SIZEBOX RIGHTALIGN/LEFTALIGN/...); the gripper layouts follow right, left, top-right, top-left,
+        /// then the half variants, so parity is the fallback when the port names its states generically (Status
+        /// GRIPPER has a single Common state).
+        /// </summary>
+        private static bool MirroredLeft(StyleClass tc, int part, int j)
+        {
+            var name = StateName(tc, part, j);
+            if (name != null)
+            {
+                if (name.IndexOf("LEFT", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (name.IndexOf("RIGHT", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            }
+            return (j & 1) != 0;
+        }
+
+        private static bool MirroredTop(StyleClass tc, int part, int j)
+        {
+            var name = StateName(tc, part, j);
+            if (name != null)
+            {
+                if (name.IndexOf("TOP", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (name.IndexOf("BOTTOM", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            }
+            return (j & 2) != 0;
+        }
+
+        /// <summary>name of the win10 state a strip frame belongs to (frame 0 = state 1, since state 0 is Common).</summary>
+        private static string StateName(StyleClass tc, int part, int frame)
+        {
+            if (tc == null || !tc.Parts.TryGetValue(part, out var tp)) return null;
+            if (!tp.States.TryGetValue(frame + 1, out var st)) return null;
+            return string.IsNullOrEmpty(st.StateName) ? null : st.StateName;
         }
 
         private static List<StyleProperty> WithGlyph(StyleState state, List<StyleProperty> images)
@@ -239,81 +352,90 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// template frame j shows stock frame map[j]. A stock frame is a candidate for j when it matches in every image of
-        /// the state that can be compared (background and glyph strips alike). Single images are ambiguous: stock
-        /// ScrollBar ARROWBTN backgrounds look the same for every direction, its glyphs the same for normal/hot/pressed;
-        /// only both together say that win10's down-hover frame is xp's down frame. Among candidates j itself wins.
+        /// Recover only frame correspondences supported by every comparable stock image.
+        /// Redrawn frames and contradictory background/glyph mappings are not nearest-frame
+        /// candidates: only an explicit state contract can supply those mappings.
         /// </summary>
-        private int[] LearnMap(List<StyleProperty> baseImages, StyleClass tc, int part, int state, Geometry bg, Geometry tg, ISet<int> guessed)
+        private int[] LearnMap(List<StyleProperty> baseImages, StyleClass tc, int part, int state, Geometry bg, Geometry tg)
         {
-            HashSet<int>[] candidates = null;
+            HashSet<int>[] intersection = null;
             foreach (var bprop in baseImages)
             {
                 var tprop = SemanticModel.FindEffective(m_target, tc, part, state, (IDENTIFIER)bprop.Header.nameID);
                 if (tprop == null) continue;
                 var bimg = Decode(m_base, bprop);
                 var timg = Decode(m_target, tprop);
-                if (bimg == null || timg == null) continue;
+                if (bimg == null || timg == null) return null;
                 var bf = Frames(bimg, bg);
                 var tf = Frames(timg, tg);
-                if (bf.Length == 0 || tf.Length == 0) continue;
-                // Luna10 also resized some strips (Header HEADERITEM 18x18 -> 18x20 frames): compare stock frames
-                // scaled to the template's frame size; Recut scales the stock strip the same way.
+                if (bf.Length == 0 || tf.Length == 0) return null;
                 if (bf[0].Width != tf[0].Width || bf[0].Height != tf[0].Height)
                     bf = bf.Select(f => Scale(f, tf[0].Width, tf[0].Height)).ToArray();
-
-                var sets = new HashSet<int>[tf.Length];
-                int matched = 0;
+                if (intersection == null) intersection = new HashSet<int>[tf.Length];
+                if (intersection.Length != tf.Length) return null;
                 for (int j = 0; j < tf.Length; ++j)
                 {
-                    sets[j] = new HashSet<int>(Enumerable.Range(0, bf.Length).Where(i => MeanDiff(bf[i], tf[j]) <= MaxFrameDiff));
-                    if (sets[j].Count > 0) ++matched;
-                }
-                // states win10 added that xp never drew (Button CHECKBOX's four "excluded" frames, 17-20): when at least
-                // three quarters of the frames are stock xp's, a frame without a match takes its closest stock frame.
-                if (matched == 0 || matched * 4 < tf.Length * 3) continue; // this image isn't a re-cut of stock art
-                for (int j = 0; j < tf.Length; ++j)
-                {
-                    if (sets[j].Count > 0) continue;
-                    int best = Enumerable.Range(0, bf.Length).OrderBy(i => MeanDiff(bf[i], tf[j])).First();
-                    sets[j].Add(best);
-                    guessed.Add(j);
-                }
-                if (candidates == null) candidates = sets;
-                else
-                {
-                    var narrowed = candidates.Select((c, j) => new HashSet<int>(c.Intersect(sets[j]))).ToArray();
-                    if (narrowed.All(c => c.Count > 0)) candidates = narrowed;
+                    var candidates = new HashSet<int>(Enumerable.Range(0, bf.Length)
+                        .Where(i => MeanDiff(bf[i], tf[j]) <= MaxFrameDiff));
+                    if (intersection[j] == null) intersection[j] = candidates;
+                    else intersection[j].IntersectWith(candidates);
+                    if (intersection[j].Count == 0) return null;
                 }
             }
-            return candidates?.Select((c, j) => c.Contains(j) ? j : c.Min()).ToArray();
+            if (intersection == null) return null;
+            var map = new int[intersection.Length];
+            for (int j = 0; j < map.Length; ++j)
+                map[j] = intersection[j].Contains(j) ? j
+                    : intersection[j].Count == 1 ? intersection[j].Single() : -1;
+            if (map.Any(i => i < 0)) return null;
+            return map;
         }
 
-        /// <param name="fromTemplate">
-        /// stock re-cut only (non-null): where the template has the strip in the new cut, the re-cut stock becomes the
-        /// template's strip, so the importer sees a stock strip the template left alone and lets the source's art
-        /// replace it. Rebuilt from stock frames it differed in the frames win10 added (Button CHECKBOX's four
-        /// "excluded" states) and in Luna10's rescaled dpi slots (25px -> 20px), and Luna10's white boxes stayed under GSM.
+        /// <param name="adoptFromTemplate">
+        /// true for a picture that is still stock xp's: where the template has the strip in the new cut, the re-cut
+        /// stock becomes the template's strip, so the importer sees a stock strip the template left alone and lets
+        /// the source's art replace it. Rebuilt from stock frames it differed in the frames win10 added (Button
+        /// CHECKBOX's four "excluded" states) and in Luna10's rescaled dpi slots (25px -> 20px), and Luna10's white
+        /// boxes stayed under GSM. A source picture that is its own art never adopts the template's frames.
         /// </param>
-        private void Recut(VisualStyle style, StyleClass cls, int part, StyleState state, List<StyleProperty> images, Geometry from, Geometry to, int[] map, ICollection<int> fromTemplate = null)
+        /// <returns>false (with no change made) when one of the pictures doesn't have enough frames for the map.</returns>
+        private bool Recut(VisualStyle style, StyleClass cls, int part, StyleState state, List<StyleProperty> images, Geometry from, Geometry to, int[] map, Func<StyleProperty, bool> adoptFromTemplate, string label)
         {
+            if (map.Length == 0) return false;
+            int max = map.Max();
+
+            // decode/validate first: a strip with fewer frames than the map references would throw halfway through,
+            // leaving a half re-cut state behind. Skip the condition instead.
+            var work = new List<(StyleProperty Prop, ArgbImage[] Frames)>();
+            foreach (var prop in images)
+            {
+                var img = Decode(style, prop);
+                if (img == null) return false;
+                var frames = Frames(img, from);
+                if (frames.Length == 0) return false;
+                if (max >= frames.Length)
+                {
+                    m_report.Warnings.Add($"{label}: {prop.Header.nameID} has {frames.Length} frames, which can't fill the template's {map.Length}-frame mapping (frame {max + 1} is missing); the strip was left as is.");
+                    return false;
+                }
+                work.Add((prop, frames));
+            }
+            if (work.Count == 0) return false;
+
             // the template's frame size for this state, from its first image (null: keep the source's size).
             Size? targetFrame = null;
             var tc = m_target.Classes.Values.FirstOrDefault(c => string.Equals(c.ClassName, cls.ClassName, StringComparison.OrdinalIgnoreCase));
             if (tc != null)
-                foreach (var prop in images)
+                foreach (var prop in work)
                 {
-                    var tprop = SemanticModel.FindEffective(m_target, tc, part, state.StateId, (IDENTIFIER)prop.Header.nameID);
+                    var tprop = SemanticModel.FindEffective(m_target, tc, part, state.StateId, (IDENTIFIER)prop.Prop.Header.nameID);
                     var timg = tprop == null ? null : Decode(m_target, tprop);
                     var tf = timg == null ? null : Frames(timg, to);
                     if (tf != null && tf.Length > 0) { targetFrame = new Size(tf[0].Width, tf[0].Height); break; }
                 }
-            foreach (var prop in images)
+            foreach (var (prop, decoded) in work)
             {
-                var img = Decode(style, prop);
-                if (img == null) continue;
-                var frames = Frames(img, from);
-                if (frames.Length == 0) continue;
+                var frames = decoded;
                 // only the stock strip is resized to the template's frames (so it can become the template's strip).
                 // the source keeps its own frame size: uxtheme stretches it by SIZINGMARGINS as xp did, while
                 // resizing duplicated the middle row/column, the one an arrow glyph sits on (Flarn's fat scroll arrows).
@@ -321,7 +443,7 @@ namespace libmsstyle.Import
                     frames = frames.Select(f => Scale(f, ts.Width, ts.Height)).ToArray();
                 int w = frames[0].Width, h = frames[0].Height;
                 ArgbImage adopt = null;
-                if (fromTemplate != null && tc != null)
+                if (adoptFromTemplate != null && adoptFromTemplate(prop) && tc != null)
                 {
                     var tprop = SemanticModel.FindEffective(m_target, tc, part, state.StateId, (IDENTIFIER)prop.Header.nameID);
                     var timg = tprop == null ? null : Decode(m_target, tprop);
@@ -339,6 +461,7 @@ namespace libmsstyle.Import
             }
             Upsert(state, cls, part, IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, to.Count);
             Upsert(state, cls, part, IDENTIFIER.IMAGELAYOUT, IDENTIFIER.ENUM, to.Horizontal ? 1 : 0);
+            return true;
         }
 
         private static void Upsert(StyleState state, StyleClass cls, int part, IDENTIFIER name, IDENTIFIER type, int value)

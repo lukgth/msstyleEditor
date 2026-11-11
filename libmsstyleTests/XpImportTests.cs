@@ -254,7 +254,7 @@ namespace libmsstyleTests
         }
 
         [TestMethod]
-        public void StockLunaOntoTheLunaPortChangesNothing()
+        public void StockLunaKeepsUnrelatedTemplateRecordsAndSynthesizesDwm()
         {
             if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
             var r = Win7StyleImporter.Run(new Win7ImportOptions
@@ -269,9 +269,25 @@ namespace libmsstyleTests
                 DryRun = true,
             });
             Assert.AreEqual(ImportStatus.ReadyForVmTest, r.Status, string.Join("\n", r.Errors));
+            // Stock Luna's intentional structural and DWM conversions remain explicit;
+            // no other decision is allowed to change a template record.
             var changes = r.Decisions.Where(d => d.Action.StartsWith("applied") || d.Action.StartsWith("added") || d.Action.StartsWith("copied") || d.Action.StartsWith("removed")).ToList();
-            Assert.AreEqual(0, changes.Count, string.Join("\n", changes.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}: {d.Action}")));
-            Assert.IsTrue(r.Validation.Checks.Any(c => c.Contains("VARIANT/NORMAL is byte-identical")));
+            var dwm = changes.Where(d => d.Class == "DWMWindow").ToList();
+            Assert.IsTrue(dwm.Any(d => d.Action == "applied-xp-frame-atlas"));
+            Assert.IsTrue(dwm.Any(d => d.Action == "applied-xp-frame-property"));
+            Assert.IsTrue(dwm.All(d => d.Action == "applied-xp-frame-atlas" || d.Action == "applied-xp-frame-property"));
+            Assert.IsTrue(r.Dwm.Parts.Any(p => p.Method == "xp-frame"));
+            Assert.IsTrue(r.Dwm.Parts.Any(p => p.Method == "xp-button"));
+            Assert.IsTrue(r.Dwm.Parts.All(p => p.NewRect == p.TargetRect), "XP synthesis must not relocate any imported or kept sprite");
+            Assert.IsTrue(r.Validation.Checks.Any(c => c.Contains("DWMWindow sprites verified pixel-for-pixel")), string.Join("\n", r.Validation.Checks));
+            changes.RemoveAll(d => d.Class == "DWMWindow");
+            var structural = new[] { "Rebar|BAND|0|BGTYPE", "Rebar|BAND|0|IMAGEFILE", "Rebar|BAND|0|IMAGECOUNT", "Rebar|BAND|0|SIZINGTYPE", "Rebar|BAND|0|SIZINGMARGINS",
+                                     "Menu|BARBACKGROUND|0|BGTYPE", "Menu|BARBACKGROUND|0|IMAGEFILE", "Menu|BARBACKGROUND|0|IMAGECOUNT", "Menu|BARBACKGROUND|0|SIZINGTYPE", "Menu|BARBACKGROUND|0|SIZINGMARGINS" };
+            var unexpected = changes.Where(d => !structural.Contains($"{d.Class}|{d.Part}|{d.State}|{d.Property}")).ToList();
+            Assert.AreEqual(0, unexpected.Count, string.Join("\n", unexpected.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}: {d.Action}")));
+            CollectionAssert.AreEquivalent(structural, changes.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}").ToArray());
+            // DWM artwork is synthesized separately; these remain the generic structural changes.
+            Assert.IsTrue(r.Validation.Checks.Any(c => c.Contains("template resources are byte-identical")), string.Join("\n", r.Validation.Checks));
             // the port re-cut Toolbar BUTTON from 6 to 8 frames with stock frames; that mapping must be learned.
             Assert.IsTrue(r.Notes.Any(n => n.StartsWith("Toolbar part 1 state 0: strip re-cut from 6 vertical to 8 vertical")), string.Join("\n", r.Notes));
         }
@@ -342,17 +358,23 @@ namespace libmsstyleTests
             var bg = r.Decisions.Where(d => d.Class == "TrayNotifyHoriz::TrayNotify" && d.Part == "BACKGROUND" && (d.Property == "IMAGEFILE" || d.Property == "SIZINGMARGINS")).ToList();
             Assert.AreEqual(2, bg.Count);
             Assert.IsTrue(bg.All(d => d.Result != null), string.Join("\n", bg.Select(d => $"{d.Property}: {d.Action}")));
-            // measured against TangoLux on xp: the address box draws its combo image (Luna10's Combobox had no BGTYPE),
-            // the task pane padding is the shellstyle's 7rp, and headers lose stock luna's 2px border (top and left:
-            // xp places the title at borderthickness + padding, TangoLux 0 + 10 against luna's 2 + 10).
+            // The address box draws its own combo image; pane padding follows shellstyle.
+            // Explicit source header CONTENTMARGINS takes precedence over shellstyle inset deltas.
             Assert.IsTrue(r.Decisions.Any(d => d.Class == "Combobox" && d.Part == "Common Properties" && d.State == 0 && d.Property == "BGTYPE" && d.Action == "added"));
             Assert.AreEqual("(l7,t7,r7,b7)", r.Decisions.Single(d => d.Class == "ExplorerBar" && d.Part == "Common Properties" && d.Property == "CONTENTMARGINS" && d.Action == "applied-shellstyle").Result);
-            Assert.AreEqual("(l10,t0,r3,b0)", r.Decisions.Single(d => d.Class == "ExplorerBar" && d.Part == "SPECIALGROUPHEAD" && d.Property == "CONTENTMARGINS" && d.Action == "applied-shellstyle").Result);
+            using (var xp = new VisualStyle())
+            {
+                xp.Load(TangoLux);
+                var explicitMargin = Find(xp, "ExplorerBar", 12, 0, IDENTIFIER.CONTENTMARGINS);
+                var header = r.Decisions.Where(d => d.Class == "ExplorerBar" && d.Part == "SPECIALGROUPHEAD" && d.Property == "CONTENTMARGINS").ToList();
+                Assert.IsTrue(header.Count > 0);
+                Assert.IsTrue(header.All(d => d.Result == (explicitMargin == null ? "(l10,t0,r3,b0)" : SemanticModel.FormatValue(explicitMargin))));
+            }
             // xp tiled the progress chunk art; Luna10 set STRETCH for its own pill. Now that the source's picture and
             // margins are in the part, xp's TILE goes with them or the 18x18 hatch smears across the whole bar.
             var chunk = r.Decisions.Single(d => d.Class == "Progress" && d.Part == "CHUNK" && d.State == 0 && d.Property == "SIZINGTYPE");
             Assert.AreEqual("applied-xp-sizingtype", chunk.Action);
-            Assert.AreEqual("TILE", chunk.Result);
+            Assert.AreEqual("2", chunk.Result); // final raw SIZINGTYPE value (TILE), not the intermediate display label
         }
 
         [TestMethod]
@@ -414,6 +436,95 @@ namespace libmsstyleTests
                                         Assert.AreEqual(original.Pixels[sourceIndex], image.Pixels[(state * h + y) * w + x], cls + " " + slot + " state " + (state + 1));
                                     }
                         }
+                    }
+                }
+            }
+            finally { Directory.Delete(dir, true); }
+        }
+
+        [TestMethod]
+        public void CustomStartPanelKeepsSourcePaneSizesAndArtwork()
+        {
+            string source = Environment.GetEnvironmentVariable("MSSTYLE_XP_SEVENVG");
+            if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
+            if (source == null || !File.Exists(source)) Assert.Inconclusive("set MSSTYLE_XP_SEVENVG to SevenVG RTM.msstyles");
+            string dir = Path.Combine(Path.GetTempPath(), "msstyle-start-test-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string output = Path.Combine(dir, "SevenVG.msstyles");
+                var report = Win7StyleImporter.Run(new Win7ImportOptions
+                {
+                    SourcePath = source, SourcePlatform = Platform.WinXP, SourceScheme = "NormalColor",
+                    BaseScheme = "NormalColor", TemplatePath = Luna10, OutputPath = output, DryRun = false,
+                });
+                Assert.AreEqual(ImportStatus.ReadyForVmTest, report.Status, string.Join("\n", report.Errors));
+                using (var xp = new VisualStyle())
+                using (var port = new VisualStyle())
+                {
+                    xp.Load(source); port.Load(output);
+                    foreach (int part in new[] { 0, 1, 2, 4, 6, 8 })
+                        Assert.AreEqual(Find(xp, "StartPanel", part, 0, IDENTIFIER.DEFAULTPANESIZE).GetValue(),
+                            Find(port, "StartPanel", part, 0, IDENTIFIER.DEFAULTPANESIZE).GetValue(), "pane dimensions changed for " + part);
+                    foreach (var size in report.FinalStartPanelSizes.Where(s => s.Class == "StartPanel"))
+                        Assert.AreEqual(SemanticModel.FormatValue(Find(port, "StartPanel", size.PartId, 0, IDENTIFIER.DEFAULTPANESIZE)), size.Value,
+                            "reported pane size is not the final output for " + size.PartId);
+                    foreach (var decision in report.Decisions.Where(d => d.Class == "StartPanel" && d.Property == "DEFAULTPANESIZE"))
+                    {
+                        var size = report.FinalStartPanelSizes.SingleOrDefault(s => s.Class == "StartPanel" && s.Part == decision.Part);
+                        if (size != null) Assert.AreEqual(size.Value, decision.Result, "intermediate decision result leaked into the report");
+                    }
+                    foreach (int part in new[] { 1, 2, 4, 6, 8, 9, 10 })
+                    {
+                        int xpId = Find(xp, "StartPanel", part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
+                        int portId = Find(port, "StartPanel", part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
+                        Assert.AreEqual(ImageIdentity.Decode(xp.GetRawResource("IMAGE", xpId)).PixelSha1(),
+                            ImageIdentity.Decode(port.GetRawResource("IMAGE", portId)).PixelSha1(), "Start artwork changed for " + part);
+                    }
+                    var user = (Margins)Find(port, "StartPanel", 1, 0, IDENTIFIER.DEFAULTPANESIZE).GetValue();
+                    var programs = (Margins)Find(port, "StartPanel", 4, 0, IDENTIFIER.DEFAULTPANESIZE).GetValue();
+                    var places = (Margins)Find(port, "StartPanel", 6, 0, IDENTIFIER.DEFAULTPANESIZE).GetValue();
+                    Assert.AreEqual(places.Right - places.Left, (user.Right - user.Left) - (programs.Right - programs.Left),
+                        "the actual places column must retain its declared width");
+                }
+            }
+            finally { Directory.Delete(dir, true); }
+        }
+
+        [TestMethod]
+        public void PropagatedRebarBackdropsKeepSourceRowsAndValidMargins()
+        {
+            string source = Environment.GetEnvironmentVariable("MSSTYLE_XP_SEVENVG");
+            if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
+            if (source == null || !File.Exists(source)) Assert.Inconclusive("set MSSTYLE_XP_SEVENVG to SevenVG RTM.msstyles");
+            string dir = Path.Combine(Path.GetTempPath(), "msstyle-band-test-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string output = Path.Combine(dir, "SevenVG.msstyles");
+                var report = Win7StyleImporter.Run(new Win7ImportOptions
+                {
+                    SourcePath = source, SourcePlatform = Platform.WinXP, SourceScheme = "NormalColor",
+                    BaseScheme = "NormalColor", TemplatePath = Luna10, OutputPath = output, DryRun = false,
+                });
+                Assert.AreEqual(ImportStatus.ReadyForVmTest, report.Status, string.Join("\n", report.Errors));
+                using (var xp = new VisualStyle())
+                using (var port = new VisualStyle())
+                {
+                    xp.Load(source); port.Load(output);
+                    var strip = ImageIdentity.Decode(xp.GetRawResource("IMAGE", Find(xp, "Rebar", 0, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag));
+                    var margins = (Margins)Find(xp, "Rebar", 0, 0, IDENTIFIER.SIZINGMARGINS).GetValue();
+                    foreach (string cls in new[] { "CommandModule", "CPLCommandModule::CommandModule" })
+                    {
+                        var image = ImageIdentity.Decode(port.GetRawResource("IMAGE", Find(port, cls, 1, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag));
+                        var actual = (Margins)Find(port, cls, 1, 0, IDENTIFIER.SIZINGMARGINS).GetValue();
+                        Assert.AreEqual(margins, actual, cls + " inherited template margins instead of source geometry");
+                        Assert.IsTrue(actual.Left + actual.Right < image.Width && actual.Top + actual.Bottom < image.Height,
+                            cls + " has no stretchable center");
+                        Assert.AreEqual(strip.Height, image.Height, cls + " resampled the source gradient");
+                        for (int y = 0; y < image.Height; ++y)
+                            for (int x = 0; x < image.Width; ++x)
+                                Assert.AreEqual(strip.Pixels[y], image.Pixels[y * image.Width + x], cls + " source row " + y);
                     }
                 }
             }

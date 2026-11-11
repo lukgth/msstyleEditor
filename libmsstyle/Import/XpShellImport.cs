@@ -1,9 +1,10 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using libmsstyle.Import.Dui;
 
 namespace libmsstyle.Import
 {
@@ -142,6 +143,72 @@ namespace libmsstyle.Import
             ControlPanelPage();
             DetailsText();
             RebarBand();
+            MenuBarTexture();
+        }
+
+        /// <summary>
+        /// The folder window's menu bar. XP has no Menu class at all: the File/Edit/View bar is a band inside the
+        /// rebar, so the rebar's own background picture (Rebar part 0 IMAGEFILE) ran behind the menu text. Windows 10
+        /// draws the menu bar from Menu part 7 BARBACKGROUND, which the template fills with a flat BORDERFILL, so the
+        /// strip came out as one solid MENUBAR color with no texture. Give that record the rebar's picture and
+        /// geometry; the fill stays underneath as the fallback for a picture that can't be drawn.
+        /// </summary>
+        private void MenuBarTexture()
+        {
+            const string menuClass = "Menu", rebarClass = "Rebar";
+            if (!m_imp.Target.ClassesByName.TryGetValue(menuClass, out var menu) || m_imp.Target.DuplicateClassNames.Contains(menuClass)) return;
+            if (!m_imp.Target.ClassesByName.TryGetValue(rebarClass, out var rebar) || m_imp.Target.DuplicateClassNames.Contains(rebarClass)) return;
+            if (!rebar.Parts.TryGetValue(0, out var bgPart) || !bgPart.States.TryGetValue(0, out var bgSt)) return;
+            if (!(bgSt.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE)?.GetValue() is int imageId)) return;
+            if (!menu.Parts.TryGetValue(7, out var barPart) || !barPart.States.TryGetValue(0, out var barSt)) return;
+
+            StyleProperty P(StyleState st, IDENTIFIER name) => st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
+            // only when the bar is still the template's flat fill; a source that themes the menu bar itself is left alone.
+            if (!(P(barSt, IDENTIFIER.BGTYPE)?.GetValue() is int bt) || bt != 1) return;
+            if (P(barSt, IDENTIFIER.IMAGEFILE) != null) return;
+
+            void Copy(IDENTIFIER name, object value, IDENTIFIER type)
+            {
+                var dst = ClassProp(menu, 7, barSt, name, type);
+                if (value is Margins mg) dst.SetValue(new Margins(mg.Left, mg.Top, mg.Right, mg.Bottom));
+                else if (value is int i) dst.SetValue(i);
+                else dst.SetValue(value);
+                ClassChanged(menu, dst, 7, 0, "menu bar texture (xp's menu bar is a rebar band, so the rebar picture showed behind it)");
+            }
+            Copy(IDENTIFIER.BGTYPE, 0, IDENTIFIER.ENUM);
+            Copy(IDENTIFIER.IMAGEFILE, imageId, IDENTIFIER.FILENAME);
+            Copy(IDENTIFIER.IMAGECOUNT, 1, IDENTIFIER.INT);
+            foreach (var name in new[] { IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGTYPE })
+            {
+                var src = P(bgSt, name);
+                if (src != null) Copy(name, src.GetValue(), (IDENTIFIER)src.Header.typeID);
+            }
+            // Preserve the picture's own margins; only refit if they leave no stretchable center.
+            if (P(bgSt, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins rm && m_imp.Decoded(m_imp.Target, "IMAGE", imageId) is ArgbImage pic)
+                Copy(IDENTIFIER.SIZINGMARGINS, FitMargins(rm, pic.Width, pic.Height), IDENTIFIER.MARGINS);
+        }
+
+        /// <summary>
+        /// nine-slice margins that fit inside a picture: the sides of one axis are scaled down together when they
+        /// don't leave a body, so the picture still draws as a frame instead of collapsing.
+        /// </summary>
+        private static Margins FitMargins(Margins m, int width, int height)
+        {
+            int l, r, t, b;
+            FitAxis(Math.Max(0, m.Left), Math.Max(0, m.Right), width, out l, out r);
+            FitAxis(Math.Max(0, m.Top), Math.Max(0, m.Bottom), height, out t, out b);
+            return new Margins(l, t, r, b);
+        }
+
+        /// <summary>one axis of <see cref="FitMargins"/>: the pair scaled to leave at least one pixel of body.</summary>
+        private static void FitAxis(int first, int second, int extent, out int a, out int b)
+        {
+            if (first + second < extent) { a = first; b = second; return; }
+            if (first + second <= 0) { a = 0; b = 0; return; }
+            // keep the ratio, leave at least one pixel of body.
+            int room = Math.Max(0, extent - 1);
+            a = (int)((long)first * room / (first + second));
+            b = Math.Max(0, room - a);
         }
 
         // xp's category view (cpview.uix CategoryView, CategoryViewSS) and the win10 record that draws the same thing
@@ -159,7 +226,7 @@ namespace libmsstyle.Import
         // 7/0 and 7/1 the metadata rows.
         private const string DetailsSheet = "NameSpaceItemInfoList";
         private const string PreviewClass = "PreviewPane";
-        private static readonly (int Part, int State)[] DetailsParts = { (5, 0), (6, 0), (7, 0), (7, 1) };
+        private static readonly (int Part, int State)[] DetailsParts = { (5, 0), (6, 0), (7, 2), (7, 1) };
 
         /// <summary>
         /// The Control Panel's "Pick a category" page. xp drew it from the shellstyle (CategoryViewSS view background,
@@ -264,7 +331,7 @@ namespace libmsstyle.Import
             if (src == null || SameBytes(src, m_base.GetBitmap(CplWatermarkId))) return;
             var st = ClassState(cls, CplContent, 1);
             var glyph = st?.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.GLYPHIMAGEFILE);
-            if (glyph == null) { m_imp.Report.Warnings.Add($"shellstyle: the template's {CplClass} content background has no glyph; the Control Panel watermark stays."); return; }
+            if (glyph == null) { m_imp.Report.Warnings.Add($"shellstyle: the source's Control Panel watermark (bitmap {CplWatermarkId}) is dropped: the template's {CplClass} content background has no glyph record to put it in."); return; }
             byte[] png = ImageConverter.ConvertXpDibToPremultipliedPng(src, Color.FromArgb(255, 0, 0));
             int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
             if ((glyph.Header.shortFlag & 0xFFFF) == id) return;
@@ -294,12 +361,8 @@ namespace libmsstyle.Import
             if (!(bgSt.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.IMAGEFILE)?.GetValue() is int imageId)) return;
 
             StyleProperty P(StyleState st, IDENTIFIER name) => st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
-            bool seeThrough;
-            {
-                object tr = P(bandSt, IDENTIFIER.TRANSPARENT_)?.GetValue();
-                seeThrough = tr is bool tb ? tb : tr is int ti && ti != 0;
-            }
-            if (!seeThrough) return;
+            // xp's band draws nothing of its own, so the rebar picture shows through it; the template's part 3 carries no
+            // TRANSPARENT record at all (only the grippers and chevrons are marked), so "no fill of its own" is the test.
             if (P(bandSt, IDENTIFIER.FILLCOLOR) != null || P(bandSt, IDENTIFIER.FILLCOLORHINT) != null) return;
             if (!(P(bandSt, IDENTIFIER.BGTYPE)?.GetValue() is int bt && bt == 2)) return;
 
@@ -315,22 +378,29 @@ namespace libmsstyle.Import
             Copy(IDENTIFIER.BGTYPE, 0, IDENTIFIER.ENUM);
             Copy(IDENTIFIER.IMAGEFILE, imageId, IDENTIFIER.FILENAME);
             Copy(IDENTIFIER.IMAGECOUNT, 1, IDENTIFIER.INT);
-            foreach (var name in new[] { IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGTYPE, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.TRANSPARENT_, IDENTIFIER.TRANSPARENTCOLOR })
+            // IMAGELAYOUT/SIZINGTYPE/TRANSPARENT_/TRANSPARENTCOLOR describe the picture itself, so they come over as they
+            // are; SIZINGMARGINS does not: it describes the rebar band's own box, and the band is taller than the picture.
+            foreach (var name in new[] { IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGTYPE, IDENTIFIER.TRANSPARENT_, IDENTIFIER.TRANSPARENTCOLOR })
             {
                 var src = P(bgSt, name);
                 if (src == null) continue;
                 Copy(name, src.GetValue(), (IDENTIFIER)src.Header.typeID);
             }
+            if (P(bgSt, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins rm && m_imp.Decoded(m_imp.Target, "IMAGE", imageId) is ArgbImage pic)
+                Copy(IDENTIFIER.SIZINGMARGINS, FitMargins(rm, pic.Width, pic.Height), IDENTIFIER.MARGINS);
         }
 
         private void DetailsText()
         {
             if (!m_imp.Target.ClassesByName.TryGetValue(PreviewClass, out var cls) || m_imp.Target.DuplicateClassNames.Contains(PreviewClass)) return;
-            var c = XpShellStyle.ParseColor(m_src.Get(DetailsSheet, "NameSpaceItemInfo", "foreground"));
-            if (c == null) return;
-            if (SameColor(c, XpShellStyle.ParseColor(m_base.Get(DetailsSheet, "NameSpaceItemInfo", "foreground")))) return;
             foreach (var (part, state) in DetailsParts)
-                ClassColor(cls, part, state, IDENTIFIER.TEXTCOLOR, c.Value, "details section text (NameSpaceItemInfo foreground)");
+            {
+                string atom = part == 5 ? "InfoName" : part == 6 ? "InfoType" : null;
+                var node = new DuiCascade.Node { Sheet = DetailsSheet, Class = "NameSpaceItemInfo", Id = atom };
+                var c = XpShellStyle.ParseColor(m_srcDui.Resolve(node, "foreground"));
+                if (c == null || SameColor(c, XpShellStyle.ParseColor(m_baseDui.Resolve(node, "foreground")))) continue;
+                ClassColor(cls, part, state, IDENTIFIER.TEXTCOLOR, c.Value, "details text " + (atom ?? "NameSpaceItemInfo"));
+            }
         }
 
         // xp's special section icons (shstyle.h IDB_MUSIC_ICON_BMP 10, IDB_PICTURES_ICON_BMP 13, IDB_CPANEL_ICON_BMP 22) in
@@ -412,12 +482,13 @@ namespace libmsstyle.Import
 
         /// <summary>
         /// true when an xp shellstyle bitmap paints nothing. A 32bpp picture whose alpha channel is zero everywhere is
-        /// invisible on xp (duiview's GRAPHIC_AlphaConstPerPix sees a transparent picture); packs also blank out slots
-        /// they don't ship by filling them with one colour (Elfin2's folder watermarks are a white field with a
-        /// hairline diagonal, which xp keys away as white). Converting either of those with the per-pixel alpha rule
-        /// gives opaque white art, which is what put white slabs over the task pane headers.
+        /// invisible on xp (duiview's GRAPHIC_AlphaConstPerPix sees a transparent picture). With a colour key
+        /// (<paramref name="key"/>, the key the value actually configures) a picture that is one colour covering nearly
+        /// the whole bitmap is that key and so invisible too (Elfin2's blank slots are a white field with a hairline
+        /// diagonal, keyed away as white). Without a key nothing is keyed: a solid opaque picture is drawn in full, so a
+        /// pack's flat panel or header is real art and must not be read as an absent picture.
         /// </summary>
-        internal static bool DrawsNothing(byte[] dib)
+        internal static bool DrawsNothing(byte[] dib, Color? key = null)
         {
             if (dib == null || dib.Length < 40) return true;
             int header = BitConverter.ToInt32(dib, 0);
@@ -434,8 +505,9 @@ namespace libmsstyle.Import
                 return true;
             }
             hasAlpha:
-            // a white-out: one colour covering nearly the whole picture. xp draws folder art with a colour key, so a
-            // picture that is its own key colour is invisible.
+            // no colour key: the blend mode draws every pixel, so only the alpha test above can make it invisible.
+            if (!key.HasValue) return false;
+            int keyRgb = (key.Value.R << 16) | (key.Value.G << 8) | key.Value.B;
             int bytesPerPixel = bpp / 8;
             if (bytesPerPixel < 3) return false; // paletted art always shows something
             var counts = new Dictionary<int, int>();
@@ -445,12 +517,15 @@ namespace libmsstyle.Import
                 for (int x = 0; x < w; x += 1 + w / 64, ++total)
                 {
                     int o = header + y * stride + x * bytesPerPixel;
-                    int key = bpp == 32 ? ((dib[o] << 16) | (dib[o + 1] << 8) | dib[o + 2]) : ((dib[o] << 16) | (dib[o + 1] << 8) | dib[o + 2]);
-                    counts.TryGetValue(key, out int c);
-                    counts[key] = c + 1;
+                    int rgb = (dib[o] << 16) | (dib[o + 1] << 8) | dib[o + 2];
+                    counts.TryGetValue(rgb, out int c);
+                    counts[rgb] = c + 1;
                 }
             }
-            return total > 0 && counts.Values.Max() >= total * 99 / 100;
+            // the majority colour is the key: xp keys exactly that colour away, so the picture is invisible.
+            if (total == 0) return false;
+            int common = counts.OrderByDescending(kv => kv.Value).First().Key;
+            return common == keyRgb && counts[common] >= total * 99 / 100;
         }
 
         /// <summary>the template's picture behind a record, decoded; null when it can't be read.</summary>
@@ -596,17 +671,18 @@ namespace libmsstyle.Import
             if (XpShellStyle.ParseRcBmp(water.Src, out int wid, out Color? wkey, out bool wAuto))
             {
                 byte[] dib = m_src.GetBitmap(wid);
-                if (dib != null && !DrawsNothing(dib))
+                if (dib != null && wAuto) wkey = AutoKey(dib);
+                if (dib != null && !DrawsNothing(dib, wkey))
                 {
-                    var png = XpShellBitmap(dib, wkey, wAuto);
+                    var png = XpShellBitmap(dib, wkey, false);
                     bool sameAsStock = XpShellStyle.ParseRcBmp(water.Stock, out int sid, out var skey, out bool sAuto)
                         && (m_base.GetBitmap(sid) is byte[] sdib) && SameBytes(png, XpShellBitmap(sdib, skey, sAuto));
-                    if (!sameAsStock) Watermarks.All = AddWatermark(png, "task pane watermark");
+                    if (!sameAsStock) Watermarks.All = AddWatermark(png, "task pane");
                 }
             }
             // the per-folder pictures: only music and picture folders have pane layouts in the win10 templates.
-            Watermarks.Music = FolderWatermark(MusicWatermarkId, "music folder watermark");
-            Watermarks.Pictures = FolderWatermark(PicturesWatermarkId, "picture folder watermark");
+            Watermarks.Music = FolderWatermark(MusicWatermarkId, "music");
+            Watermarks.Pictures = FolderWatermark(PicturesWatermarkId, "picture");
         }
 
         /// <summary>a per-folder watermark picture (shellstyle bitmap), as a record; null where it's missing, blank or stock.</summary>
@@ -614,10 +690,11 @@ namespace libmsstyle.Import
         {
             byte[] dib = m_src.GetBitmap(id);
             if (dib == null || DrawsNothing(dib)) return null;
-            // xp's template drew these with a color key (the picture is white-backed art on the blue pane)
-            var png = XpShellBitmap(dib, Color.White, false);
+            // xp draws these opaque: duiview.cpp:611 makes the watermark with GRAPHIC_NoBlend, a plain SRCCOPY blit
+            // with no transparent colour, so a white pixel in the art is white on the pane and no pixel is a hole.
+            var png = XpShellBitmap(dib, null, false);
             byte[] stock = m_base.GetBitmap(id);
-            if (stock != null && SameBytes(png, XpShellBitmap(stock, Color.White, false))) return null;
+            if (stock != null && SameBytes(png, XpShellBitmap(stock, null, false))) return null;
             // fills the strip under the section's rows (the record's SIZINGTYPE is STRETCH)
             return AddWatermark(png, reason, 1);
         }
@@ -645,13 +722,13 @@ namespace libmsstyle.Import
         /// <summary>an XP shellstyle bitmap as the png win10 stores: the color key (or its automatic top-left pixel)
         /// see-through, per-pixel alpha where the DirectUI mode has none (mode 2).</summary>
         private byte[] XpShellBitmap(byte[] dib, Color? key, bool autoKey)
+            => ImageConverter.ConvertXpDibToPremultipliedPng(dib, autoKey ? AutoKey(dib) : key, key == null && !autoKey);
+
+        /// <summary>DUI's automatic colour key of an rcbmp without one: the picture's top-left pixel (value.cpp CreateGraphic).</summary>
+        private static Color AutoKey(byte[] dib)
         {
-            if (autoKey)
-            {
-                uint p0 = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null)).Pixels[0];
-                key = Color.FromArgb((int)((p0 >> 16) & 0xFF), (int)((p0 >> 8) & 0xFF), (int)(p0 & 0xFF));
-            }
-            return ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null);
+            uint p0 = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null)).Pixels[0];
+            return Color.FromArgb((int)((p0 >> 16) & 0xFF), (int)((p0 >> 8) & 0xFF), (int)(p0 & 0xFF));
         }
 
         /// <summary>
@@ -713,12 +790,12 @@ namespace libmsstyle.Import
             XpShellStyle.ParseRcBmp(v, out int id, out var key, out bool autoKey);
             var dib = m_src.GetBitmap(id);
             if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: task pane background bitmap {id} is missing; template kept."); return; }
-            if (DrawsNothing(dib)) return; // a blanked slot: xp painted nothing there, so the fill/gradient stays
             if (autoKey)
             {
                 uint p0 = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, null)).Pixels[0];
                 key = Color.FromArgb((int)((p0 >> 16) & 0xFF), (int)((p0 >> 8) & 0xFF), (int)(p0 & 0xFF));
             }
+            if (DrawsNothing(dib, key)) return; // a blanked slot: xp painted nothing there, so the fill/gradient stays
             // nine-grid pictures (rcbmp mode 5/6/7) are a frame: their borderthickness says which edges stay put and
             // which middle stretches, so they go in whole with those margins (stretch + SIZINGMARGINS is a nine-grid in
             // the theme records). The padding below would leave the frame's top-left corner in place and continue its
@@ -730,7 +807,15 @@ namespace libmsstyle.Import
             Margins sizing;
             int sizingType;
             var pic = ImageIdentity.Decode(ImageConverter.ConvertXpDibToPremultipliedPng(dib, key, key == null));
-            int w = Math.Max(pic.Width, PaneTileWidth), h = Math.Max(pic.Height, PaneTileHeight);
+            // A band spans the window, so it draws the source picture at its native size (Stretch across the band);
+            // padding it to the 210x1200 sidebar tile made SevenVG's 1039x70 section-list picture a 1039x1200 texture,
+            // which uxtheme rejects with ERROR_NOT_ENOUGH_MEMORY (same failure as the 420x2160 tile noted below).
+            // The sidebar keeps the 210-wide tile: a wider source picture is clipped by the 210rp pane anyway, so
+            // there is nothing to gain from carrying its full width (and everything to lose in texture memory).
+            var placement = LegacyPaneLayout.From(m_src?.Legacy?.MarkupText);
+            bool band = m_imp.Options.TaskBand || placement.IsBand;
+            int w = band ? pic.Width : PaneTileWidth;
+            int h = band ? pic.Height : Math.Max(pic.Height, PaneTileHeight);
             var padded = new ArgbImage(w, h);
             if (nineGrid)
             {
@@ -751,9 +836,13 @@ namespace libmsstyle.Import
                     for (int x = 0; x < w; ++x)
                         padded.Pixels[y * w + x] = pic.Pixels[Math.Min(y, pic.Height - 1) * pic.Width + Math.Min(x, pic.Width - 1)];
                 sizing = new Margins(0, 0, 0, 0);
-                sizingType = 2; // TILE
+                // a band picture was authored for a whole-width strip (SevenVG's 1039x70): stretch it with the
+                // window instead of tiling a 1039px slice across a wider one.
+                sizingType = band ? 1 : 2; // STRETCH / TILE
             }
             png = ImageIdentity.EncodePngVerified(padded);
+            if (band)
+                m_imp.Report.Notes.Add($"shellstyle: task pane background bitmap {id} drawn at its native {pic.Width}x{pic.Height} and stretched across the band (no sidebar tile).");
             if (!m_cls.Parts.TryGetValue(Background, out var p)) return;
             if (!p.States.TryGetValue(PaneState, out var st))
             {
@@ -842,50 +931,145 @@ namespace libmsstyle.Import
             Changed(prop, part, st.StateId, "applied-shellstyle", $"{what} {reason}");
         }
 
-        /// <summary>
-        /// the task pane fonts. win10 draws every header title with gtf(TextStyle, 3, 0) and every task link with
-        /// gtf(TextStyle, 6, 0/2) (its ExplorerBarStyle sheet; nothing else in the shell's UIFILEs reads those two
-        /// parts for long text, the rest are labels in the same role). xp's are the resolved fontface / fontsize /
-        /// fontweight / fontstyle of the header title and the task title (rcstr/rcint read the shellstyle's own string
-        /// table: SHADED's headers are its rcstr(1) "Swis721 Cn BT D-Type" at rcint(15) 7pt, bold). Where both
-        /// resolve to stock luna's font, the template's stays.
-        /// </summary>
+        /// <summary>Per-section fonts live in ExplorerBar, not shared TextStyle records used by unrelated UI.</summary>
+        public Dictionary<bool, (int Part, int State)> HeaderFontRecords { get; } = new Dictionary<bool, (int Part, int State)>();
+        public Dictionary<bool, (int Part, int State)> TaskFontRecords { get; } = new Dictionary<bool, (int Part, int State)>();
+        public Dictionary<string, string> AuxiliaryFontRecords { get; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         private void PaneFonts()
         {
-            var ts = m_imp.Target.ClassesByName.TryGetValue("TextStyle", out var c) ? c : null;
-            if (ts == null) return;
-            PaneFont(ts, 3, 0, x => x.Title, false, "header title");
-            PaneFont(ts, 6, 0, x => x.TaskTitle, false, "task link");
-            PaneFont(ts, 6, 2, x => x.TaskTitle, true, "task link (hover)");
+            foreach (bool main in new[] { false, true })
+            {
+                int head = main ? SpecialHead : NormalHead, task = main ? SpecialExpand : NormalExpand;
+                bool header = SourceProperty(head, IDENTIFIER.FONT) != null || PaneFont(head, 0, x => x.Title, main, false, "header title");
+                if (header) HeaderFontRecords[main] = (head, 0);
+                if (SourceProperty(head, IDENTIFIER.FONT) == null && PaneFont(head, 2, x => x.Title, main, true, "header title (hover)")) HeaderFontRecords[main] = (head, 0);
+                if (PaneFont(task, 0, x => x.TaskTitle, main, false, "task link")) TaskFontRecords[main] = (task, 0);
+                if (PaneFont(task, 2, x => x.TaskTitle, main, true, "task link (hover)")) TaskFontRecords[main] = (task, 0);
+            }
+            AuxiliaryFonts();
         }
 
-        private void PaneFont(StyleClass ts, int part, int state, Func<DuiCascade.Section, DuiCascade.Node> pick, bool hot, string what)
+        private bool PaneFont(int part, int state, Func<DuiCascade.Section, DuiCascade.Node> pick, bool main, bool hot, string what)
         {
-            var src = ResolvedFont(m_srcDui, m_src, pick, hot);
-            var stock = ResolvedFont(m_baseDui, m_base, pick, hot);
-            if (src == null || stock == null || src.Equals(stock)) return;
-            if (!ts.Parts.TryGetValue(part, out var p) || !p.States.TryGetValue(state, out var st)) return;
-            var prop = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.FONT);
-            if (prop == null) return;
-            if (!m_imp.PlaceFont(src.ToString(), out int id, out string error)) { m_imp.Report.Warnings.Add($"shellstyle: {what} font not ported: {error}"); return; }
-            if ((prop.Header.shortFlag & 0xFFFF) == id) return;
-            prop.SetValue(id);
-            string partName = SemanticModel.PartNames("TextStyle", Platform.Win10).TryGetValue(part, out var n) ? n : "Part " + part;
-            m_imp.MarkTouched(prop, $"TextStyle|{partName}|S{state}|FONT");
-            m_imp.Report.Decisions.Add(new MergeDecision
+            var src = ResolvedFont(m_srcDui, m_src, pick, hot, SysMetricFont, main);
+            var stock = ResolvedFont(m_baseDui, m_base, pick, hot, i => SysMetricFont(m_imp.Base, i), main);
+            if (src == null || (stock != null && src.Equals(stock))) return false;
+            return ClassFont(m_cls, part, state, src, what);
+        }
+
+        private bool ClassFont(StyleClass cls, int part, int state, FontSpec font, string what)
+        {
+            var st = ClassState(cls, part, state);
+            if (st == null) return false;
+            if (!m_imp.PlaceFont(font.ToString(), out int id, out string error))
             {
-                Class = "TextStyle", Part = partName, State = state, Property = "FONT", Action = "applied-shellstyle",
-                Reason = $"the task pane {what} font of the source shellstyle (win10 draws it with this TextStyle part)", Result = src.ToString(),
-            });
-            m_imp.Report.Count("applied-shellstyle");
+                m_imp.Report.Warnings.Add($"shellstyle: {what} font not ported: {error}");
+                return false;
+            }
+            var prop = ClassProp(cls, part, st, IDENTIFIER.FONT, IDENTIFIER.FONT);
+            if ((prop.Header.shortFlag & 0xFFFF) != id)
+            {
+                prop.SetValue(id);
+                ClassChanged(cls, prop, part, state, what + " font (gtf record)");
+            }
+            return true;
+        }
+
+        private void AuxiliaryFonts()
+        {
+            void Font(string sheet, string element, string atom, string targetClass, int part, int state = 0, bool hot = false)
+            {
+                if (!m_imp.Target.ClassesByName.TryGetValue(targetClass, out var cls) || !cls.Parts.ContainsKey(part)) return;
+                var node = new DuiCascade.Node { Sheet = sheet, Class = element, Id = atom, MouseFocused = hot };
+                var inherited = SemanticModel.FindEffective(m_imp.Target.Style, cls, part, state, IDENTIFIER.FONT);
+                var fallback = inherited == null ? null : FontSpec.Parse(m_imp.Target.ResolveString(inherited.Header.shortFlag));
+                var src = ResolvedNodeFont(m_srcDui, m_src, node, SysMetricFont, fallback);
+                var stock = ResolvedNodeFont(m_baseDui, m_base, node, i => SysMetricFont(m_imp.Base, i), fallback);
+                if (src == null || (stock != null && src.Equals(stock))) return;
+                if (ClassFont(cls, part, state, src, sheet + ": " + (atom ?? element)))
+                    AuxiliaryFontRecords[XpShellTranslator.FontKey(sheet, element, atom, hot)] = $"gtf({targetClass}, {part}, {state})";
+            }
+            Font(DetailsSheet, "NameSpaceItemInfo", "InfoName", PreviewClass, 5);
+            Font(DetailsSheet, "NameSpaceItemInfo", "InfoType", PreviewClass, 6);
+            Font(DetailsSheet, "NameSpaceItemInfo", null, PreviewClass, 7);
+            Font("DirectiveSS", "element", null, CplClass, CplTitle);
+            Font("BannerSS", "element", "title", CplClass, 4);
+            Font("CategoryListItemSS", "linkelement", null, CplClass, CplLink, 1);
+            Font("CategoryListItemSS", "linkelement", null, CplClass, CplLink, 2, true);
+            Font("CategoryTaskListItemSS", "linkelement", null, "ControlPanelStyle", 10, 1);
+            Font("CategoryTaskListItemSS", "linkelement", null, "ControlPanelStyle", 10, 2, true);
+            Font("main", "element", "blockadetitle", "ControlPanelStyle", 5);
+            Font("main", "element", "blockademessage", "ControlPanelStyle", 6);
+            Font("main", "element", "blockadecleartext", "ControlPanelStyle", 10, 1);
+            Font("main", "element", "blockadecleartext", "ControlPanelStyle", 10, 2, true);
+            Font("BarricadeSS", "element", "barricadetitle", "ControlPanelStyle", 5);
+            Font("BarricadeSS", "element", "barricademsg", "ControlPanelStyle", 6);
+        }
+
+        private static void RoutePaneFonts(DuiXmlDocument xml,
+            IReadOnlyDictionary<bool, (int Part, int State)> headers, IReadOnlyDictionary<bool, (int Part, int State)> tasks)
+        {
+            var sheet = xml.FindStyle("ExplorerBarStyle");
+            if (sheet == null) return;
+            foreach (bool main in new[] { false, true })
+            {
+                void Route(string name, int part, int state, bool hot)
+                {
+                    var block = xml.FindClassBlock(sheet, name);
+                    foreach (var button in block?.Descendants() ?? Enumerable.Empty<System.Xml.Linq.XElement>())
+                        if (button.Name.LocalName.Equals("button", StringComparison.OrdinalIgnoreCase))
+                            DuiXmlDocument.SetAttribute(button, "font", $"gtf(ExplorerBar, {part}, {(hot && DuiXmlDocument.AttributeIs(button.Parent, "MouseFocused", "true") ? 2 : state)})");
+                }
+                if (headers != null && headers.TryGetValue(main, out var header)) Route(main ? "name_special" : "name_normal", header.Part, header.State, true);
+                if (tasks != null && tasks.TryGetValue(main, out var task)) Route(main ? "label_special" : "label_normal", task.Part, task.State, true);
+            }
+        }
+
+        /// <summary>
+        /// the face a DirectUI <c>sysmetricstr(N)</c> resolves to, from the style's own sysmetrics font records: xp's
+        /// DUI parser turns it into the system font's name (parse.y YYSYSMETRICSTR -> Parser::_QuerySysMetricStr,
+        /// parser.cpp:1528-1584), and the indices are DirectUI's own (directuipp.h:144-151): 1 caption, 2 menu,
+        /// 3 message, 4 small caption, 5 status, 6 icon (SPI_GETICONMETRICS' lfFaceName). Anything else is L"" on xp.
+        /// </summary>
+        private string SysMetricFont(int index) => SysMetricFont(m_imp.Source, index);
+
+        private static string SysMetricFont(SemanticModel src, int index)
+        {
+            IDENTIFIER font;
+            switch (index)
+            {
+                case 1: font = IDENTIFIER.CAPTIONFONT; break;
+                case 2: font = IDENTIFIER.MENUFONT; break;
+                case 3: font = IDENTIFIER.MSGBOXFONT; break;
+                case 4: font = IDENTIFIER.SMALLCAPTIONFONT; break;
+                case 5: font = IDENTIFIER.STATUSFONT; break;
+                case 6: font = IDENTIFIER.ICONTITLEFONT; break;
+                default: return null;
+            }
+            if (src == null || !src.ClassesByName.TryGetValue("sysmetrics", out var cls)) return null;
+            var p = SemanticModel.FindEffective(src.Style, cls, 0, 0, font);
+            string text = p == null ? null : src.ResolveString(p.Header.shortFlag);
+            if (text == null && p?.GetValue() is string literal) text = literal;
+            if (text == null) return null;
+            var spec = FontSpec.Parse(text);
+            return spec.Error == null && spec.Face != null && spec.Face.Trim().Length > 0 ? spec.Face.Trim() : null;
         }
 
         /// <summary>DUI fontface/fontsize/fontweight/fontstyle resolved for one element, as a uxtheme font string.</summary>
-        private static FontSpec ResolvedFont(DuiCascade dui, XpShellStyle style, Func<DuiCascade.Section, DuiCascade.Node> pick, bool hot)
+        private static FontSpec ResolvedFont(DuiCascade dui, XpShellStyle style, Func<DuiCascade.Section, DuiCascade.Node> pick, bool hot, Func<int, string> sysMetricFont, bool main = false)
         {
-            var node = pick(DuiCascade.Build(false, hot));
-            string face = ResText(style, dui.Resolve(node, "fontface"));
-            string size = dui.Resolve(node, "fontsize"), weight = dui.Resolve(node, "fontweight"), fstyle = dui.Resolve(node, "fontstyle");
+            var node = pick(DuiCascade.Build(main, hot));
+            return ResolvedNodeFont(dui, style, node, sysMetricFont, null);
+        }
+
+        private static FontSpec ResolvedNodeFont(DuiCascade dui, XpShellStyle style, DuiCascade.Node node, Func<int, string> sysMetricFont, FontSpec fallback)
+        {
+            if (fallback != null && !fallback.IsSane) fallback = null;
+            string face = ResText(style, dui.Resolve(node, "fontface"), sysMetricFont) ?? fallback?.Face;
+            string size = dui.Resolve(node, "fontsize") ?? (fallback == null ? null : fallback.Points + "pt");
+            string weight = dui.Resolve(node, "fontweight") ?? (fallback?.Bold == true ? "bold" : null);
+            string fstyle = dui.Resolve(node, "fontstyle") ?? (fallback == null ? null : (fallback.Italic ? "italic " : "") + (fallback.Underline ? "underline" : ""));
             if (face == null || size == null) return null;
             // a face the author's tooling mangled into question marks (Lion OS X ships "????" in its string table):
             // CreateFont falls back to the system font for it, which isn't a font choice to carry over.
@@ -907,20 +1091,39 @@ namespace libmsstyle.Import
             return f.Error == null && f.IsSane ? f : null;
         }
 
-        /// <summary>a DUI string value: rcstr(n) from the shellstyle's string table, a quoted or bare literal otherwise.</summary>
-        private static string ResText(XpShellStyle style, string v)
+        /// <summary>
+        /// a DUI string value: rcstr(n) from the shellstyle's string table, sysmetricstr(N) through the style's
+        /// sysmetrics font records, a quoted or bare literal otherwise.
+        /// </summary>
+        private static string ResText(XpShellStyle style, string v, Func<int, string> sysMetricFont)
         {
             if (v == null) return null;
             var m = System.Text.RegularExpressions.Regex.Match(v.Trim(), @"^rcstr\((\d+)\)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
             if (m.Success) return style.ResString(int.Parse(m.Groups[1].Value));
-            if (v.Trim().StartsWith("sysmetricstr", StringComparison.OrdinalIgnoreCase)) return null; // a system font: not the shellstyle's.
+            var sm = System.Text.RegularExpressions.Regex.Match(v.Trim(), @"^sysmetricstr\(\s*(?:DSMS_)?([A-Za-z_]+|\d+)\s*\)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (sm.Success) return sysMetricFont(SysMetricIndex(sm.Groups[1].Value));
             return v.Trim().Trim('"', '\'');
+        }
+
+        /// <summary>a sysmetricstr argument as DirectUI's index: the DSMS_* name (directuipp.h:144-151) or a number; 0 when unknown.</summary>
+        private static int SysMetricIndex(string arg)
+        {
+            switch (arg.ToUpperInvariant())
+            {
+                case "DSMS_CAPTIONFONTFACE": return 1;
+                case "DSMS_MENUFONTFACE": return 2;
+                case "DSMS_MESSAGEFONTFACE": return 3;
+                case "DSMS_SMCAPTIONFONTFACE": return 4;
+                case "DSMS_STATUSFONTFACE": return 5;
+                case "DSMS_ICONFONTFACE": return 6;
+            }
+            return int.TryParse(arg, out int n) ? n : 0;
         }
 
         private void TaskListInset()
         {
-            var p = Find(NormalBg, 0, IDENTIFIER.CONTENTMARGINS);
-            if (p == null || !m_snapshot.TryGetValue(K(NormalBg, 0, IDENTIFIER.CONTENTMARGINS), out var orig) || !(orig.GetValue() is Margins t)) return;
+            // xp's padding belongs to the tasklist element, which both group kinds use, so both group backgrounds
+            // get it; the special group kept the template's inset while the normal one got the source's.
             var sp = XpShellStyle.ParseRect(m_srcDui.Resolve(DuiCascade.Build(false).TaskList, "padding"))
                      ?? XpShellStyle.ParseRect(m_src.GetAny("tasklist", "atom(tasklist)", "padding"));
             // no padding rule the cascade resolves: the source doesn't state it (its sheet puts it where DUI looks it
@@ -929,12 +1132,17 @@ namespace libmsstyle.Import
             if (sp == null) return;
             var b = XpShellStyle.ParseRect(m_baseDui.Resolve(DuiCascade.Build(false).TaskList, "padding"))
                     ?? XpShellStyle.ParseRect(m_base.GetAny("tasklist", "atom(tasklist)", "padding")) ?? sp;
-            var s = sp;
-            var m = new Margins(Math.Max(0, t.Left + s.Left - b.Left), Math.Max(0, t.Top + s.Top - b.Top), Math.Max(0, t.Right + s.Right - b.Right), Math.Max(0, t.Bottom + s.Bottom - b.Bottom));
-            if (p.GetValue() is Margins cur && cur.Left == m.Left && cur.Top == m.Top && cur.Right == m.Right && cur.Bottom == m.Bottom) return;
-            if (m.Left == t.Left && m.Top == t.Top && m.Right == t.Right && m.Bottom == t.Bottom) { Restore(p, NormalBg, 0, IDENTIFIER.CONTENTMARGINS, "task list padding"); return; }
-            p.SetValue(m);
-            Changed(p, NormalBg, 0, "applied-shellstyle", $"task list padding differs from stock luna by {s.Left - b.Left},{s.Top - b.Top},{s.Right - b.Right},{s.Bottom - b.Bottom}px (l,t,r,b)");
+            foreach (int bg in new[] { NormalBg, SpecialBg })
+            {
+                var p = Find(bg, 0, IDENTIFIER.CONTENTMARGINS);
+                if (p == null || !m_snapshot.TryGetValue(K(bg, 0, IDENTIFIER.CONTENTMARGINS), out var orig) || !(orig.GetValue() is Margins t)) continue;
+                var s = sp;
+                var m = new Margins(Math.Max(0, t.Left + s.Left - b.Left), Math.Max(0, t.Top + s.Top - b.Top), Math.Max(0, t.Right + s.Right - b.Right), Math.Max(0, t.Bottom + s.Bottom - b.Bottom));
+                if (p.GetValue() is Margins cur && cur.Left == m.Left && cur.Top == m.Top && cur.Right == m.Right && cur.Bottom == m.Bottom) continue;
+                if (m.Left == t.Left && m.Top == t.Top && m.Right == t.Right && m.Bottom == t.Bottom) { Restore(p, bg, 0, IDENTIFIER.CONTENTMARGINS, "task list padding"); continue; }
+                p.SetValue(m);
+                Changed(p, bg, 0, "applied-shellstyle", $"task list padding differs from stock luna by {s.Left - b.Left},{s.Top - b.Top},{s.Right - b.Right},{s.Bottom - b.Bottom}px (l,t,r,b)");
+            }
         }
 
         private void TextColor(int part, int state, (string Src, string Stock) v, string what)
@@ -1020,6 +1228,13 @@ namespace libmsstyle.Import
             m_imp.Report.Count(action);
         }
 
+        private StyleProperty SourceProperty(int part, IDENTIFIER name)
+        {
+            if (m_imp.Source == null || !m_imp.Source.ClassesByName.TryGetValue(Cls, out var cls)
+                || !cls.Parts.TryGetValue(part, out var p) || !p.States.TryGetValue(0, out var st)) return null;
+            return st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
+        }
+
         /// <summary>
         /// The group background (win10 dtb(ExplorerBar, 5/9) on the clipper): what xp showed behind the tasks (the first
         /// opaque fill of tasklist, watermark, clipper, expando and pane, background inheriting through), framed by the
@@ -1035,7 +1250,17 @@ namespace libmsstyle.Import
             if (img == null) return;
             var src = GroupLook(m_srcDui, main);
             var stock = GroupLook(m_baseDui, main);
-            if (src.Key == stock.Key) { Restore(img, part, 0, IDENTIFIER.IMAGEFILE, what + " background"); RestoreGeometry(part); return; }
+            if (src.Key == stock.Key)
+            {
+                // The shellstyle is unchanged, but the style may explicitly replace the stock group artwork.
+                // Generic merge has already imported that picture and its geometry; do not undo it here.
+                if (SourceProperty(part, IDENTIFIER.IMAGEFILE) == null)
+                {
+                    Restore(img, part, 0, IDENTIFIER.IMAGEFILE, what + " background");
+                    RestoreGeometry(part);
+                }
+                return;
+            }
             if (src.Fill == null && src.Pic == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} background \"{src.Key}\" isn't a picture, color or gradient the porter reads; template tile kept."); return; }
 
             if (src.Pic.HasValue)
@@ -1047,10 +1272,23 @@ namespace libmsstyle.Import
                 if (dib == null) { m_imp.Report.Warnings.Add($"shellstyle: {what} background bitmap {picId} is missing; template tile kept."); return; }
                 var pic = ImageIdentity.Decode(XpShellBitmap(dib, picKey, picAutoKey));
                 int top = 0;
-                while (top < pic.Height && Enumerable.Range(0, pic.Width).All(x => (pic.Pixels[top * pic.Width + x] >> 24) == 0)) ++top;
+                while (top < pic.Height)
+                {
+                    int x = 0;
+                    while (x < pic.Width && (pic.Pixels[top * pic.Width + x] >> 24) == 0) ++x;
+                    if (x < pic.Width) break;
+                    ++top;
+                }
                 if (top > 0 && top < pic.Height) pic = pic.Crop(new Rectangle(0, top, pic.Width, pic.Height - top));
                 PlaceImage(img, part, ImageIdentity.EncodePngVerified(pic), $"{what} background bitmap {picId}");
-                SetGeometry(part, new Margins(0, 0, 0, 0), "the group background is the source's picture, stretched as xp did");
+                // xp's nine-grid modes take the element's borderthickness as their margins (render.cpp:497-503, the same
+                // rule PaneBitmap applies to modes 5-7): the border pixels keep their authored size and only the middle
+                // stretches. A stretched frame would smear its bevel into wide bands across the group body.
+                int? picMode = src.Pic.Value.Mode;
+                bool picNineGrid = picMode.HasValue && picMode.Value >= 5 && picMode.Value <= 7
+                    && (src.Thickness.Left | src.Thickness.Top | src.Thickness.Right | src.Thickness.Bottom) != 0;
+                if (picNineGrid) SetGeometry(part, FitMargins(src.Thickness, pic.Width, pic.Height), "the group background is the source's nine-grid picture, its border kept at the authored size");
+                else SetGeometry(part, new Margins(0, 0, 0, 0), "the group background is the source's picture, stretched as xp did");
                 return;
             }
 
@@ -1077,11 +1315,11 @@ namespace libmsstyle.Import
         /// at the same x in and between groups): the group is see-through, a transparent tile, and win10's clipper
         /// shows its ExplorerBarBackground the same way. A re-drawn gradient would restart at each group's edge.
         /// </summary>
-        private (DuiFill? Fill, (int Id, Color? Key, bool AutoKey)? Pic, Color Border, Margins Thickness, string Key) GroupLook(DuiCascade dui, bool main)
+        private (DuiFill? Fill, (int Id, Color? Key, bool AutoKey, int? Mode)? Pic, Color Border, Margins Thickness, string Key) GroupLook(DuiCascade dui, bool main)
         {
             var s = DuiCascade.Build(main);
             var pane = XpShellStyle.ParseFill(dui.Resolve(s.Pane, "background"));
-            DuiFill? fill = DuiFill.Clear; (int, Color?, bool)? pic = null; string fillText = "transparent";
+            DuiFill? fill = DuiFill.Clear; (int, Color?, bool, int?)? pic = null; string fillText = "transparent";
             foreach (var node in new[] { s.TaskList, s.Watermark, s.Clipper, s.Expando })
             {
                 if (node == null) continue;
@@ -1092,7 +1330,7 @@ namespace libmsstyle.Import
                 {
                     // a bitmap (xp's groups: rcbmp(id, 6, key); CrystalBlue's 115/116) or something unparsable.
                     fill = null; fillText = v;
-                    if (XpShellStyle.ParseRcBmp(v, out int id, out var rcKey, out bool autoKey)) pic = (id, rcKey, autoKey);
+                    if (XpShellStyle.ParseRcBmp(v, out int id, out var rcKey, out bool autoKey)) pic = (id, rcKey, autoKey, XpShellStyle.RcBmpMode(v));
                     break;
                 }
                 if (!f.Value.Opaque) continue;
@@ -1248,10 +1486,13 @@ namespace libmsstyle.Import
 
         private void SetGeometry(int part, Margins sizing, string reason)
         {
+            // the record is created when the template has none: the porter decided the source's geometry applies,
+            // so leaving the part without it draws the picture with no nine-grid margins.
             foreach (var gid in new[] { IDENTIFIER.SIZINGMARGINS, IDENTIFIER.IMAGECOUNT })
             {
-                var gp = Find(part, 0, gid);
-                if (gp == null) continue;
+                var gst = ClassState(m_cls, part, 0);
+                if (gst == null) continue;
+                var gp = ClassProp(m_cls, part, gst, gid, gid == IDENTIFIER.IMAGECOUNT ? IDENTIFIER.INT : IDENTIFIER.MARGINS);
                 string want = gid == IDENTIFIER.IMAGECOUNT ? "1" : $"(l{sizing.Left},t{sizing.Top},r{sizing.Right},b{sizing.Bottom})";
                 if (SemanticModel.FormatValue(gp) == want) continue;
                 if (gid == IDENTIFIER.IMAGECOUNT) gp.SetValue(1); else gp.SetValue(new Margins(sizing.Left, sizing.Top, sizing.Right, sizing.Bottom));
@@ -1270,16 +1511,25 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// xp sizes the header button by its borderthickness + padding around the title; win10's UIFILE pads it
-        /// with gtmar(ExplorerBar, 8/12, 0, 3602). The port fitted that record to stock luna (borderthickness 2,
-        /// padding 0 top/bottom), so the source's difference from stock is added to the template's margins:
-        /// TangoLux's borderthickness 0 makes its headers 2px shorter, as on xp. Both are resolved on the header
-        /// button (neither inherits).
+        /// An explicit ExplorerBar 8/12 CONTENTMARGINS in the source style is authoritative. Only styles without
+        /// that record use the shellstyle delta against the template's stock-luna adaptation: XP sizes the header
+        /// from borderthickness + padding around its title, while Win10 reads gtmar(ExplorerBar, 8/12, 0, 3602).
         /// </summary>
         private void HeaderInset(int part, bool main, string what)
         {
             var p = Find(part, 0, IDENTIFIER.CONTENTMARGINS);
-            if (p == null || !m_snapshot.TryGetValue(K(part, 0, IDENTIFIER.CONTENTMARGINS), out var orig) || !(orig.GetValue() is Margins t)) return;
+            if (p == null) return;
+            var explicitMargins = SourceProperty(part, IDENTIFIER.CONTENTMARGINS);
+            if (explicitMargins?.GetValue() is Margins sourceMargins)
+            {
+                if (!(p.GetValue() is Margins current) || !SameRect(current, sourceMargins))
+                {
+                    p.SetValue(new Margins(sourceMargins.Left, sourceMargins.Top, sourceMargins.Right, sourceMargins.Bottom));
+                    Changed(p, part, 0, "applied-xp-header-margins", $"{what} header uses the source style's explicit CONTENTMARGINS; shellstyle inset deltas apply only when that record is absent");
+                }
+                return;
+            }
+            if (!m_snapshot.TryGetValue(K(part, 0, IDENTIFIER.CONTENTMARGINS), out var orig) || !(orig.GetValue() is Margins t)) return;
             // where the title text starts inside the header: the button's border and padding, then the title's own
             // padding (Lion OS X pads the title 10rp, not the button; Opus OS the button 1rp; luna the button 2 + 10).
             Margins Inset(DuiCascade d)
@@ -1360,6 +1610,27 @@ namespace libmsstyle.Import
             Changed(p, part, 0, "applied-shellstyle", "from the source shellstyle's " + from);
         }
 
+        /// <summary>the legacy declarations the translator may take from the source stylesheet. These are the ones
+        /// no record import or layout edit owns (state machine + pointer of the pane elements).</summary>
+        private static readonly HashSet<string> TranslatedProperties = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "animation", "alpha", "cursor",
+        };
+
+        /// <summary>resolves the source shellstyle's own resources for <see cref="XpShellTranslator"/>: rcstr/rcint
+        /// come from the source's string table; system metric strings are the OS's and not available here.</summary>
+        private sealed class ShellTranslatorResources : IXpShellResources
+        {
+            private readonly XpShellStyle m_style;
+            public ShellTranslatorResources(XpShellStyle style) { m_style = style; }
+            public string ResourceString(int id) { return m_style.ResString(id); }
+            public int? ResourceInt(int id) { int n; return int.TryParse(m_style.ResString(id), out n) ? n : (int?)null; }
+            public string SystemMetricString(int index) { return null; } // a system font, not the shellstyle's
+            // xp UIFILEs use the numeric handlemap of the scrollbar stylesheet (scrollbar_themed.uix defines
+            // SCROLLBARHTHEME 1); dtb(handlemap(1), part, state) is the target theme's ScrollBar class.
+            public string Handlemap(int index) { return index == 1 ? "ScrollBar" : null; }
+        }
+
         private static bool SameBytes(byte[] a, byte[] b) => a != null && b != null && a.SequenceEqual(b);
 
         /// <summary>a 32bpp bitmap of the same size as <paramref name="dib"/> with alpha zero everywhere: it draws
@@ -1405,7 +1676,9 @@ namespace libmsstyle.Import
                 // icons are zero-alpha bitmaps) must not arrive as visible white: win10's shell draws these bitmaps
                 // without xp's colour key, so the blank slot becomes a white slab in the task pane. A fully
                 // transparent bitmap of the same size keeps every reference valid and draws nothing.
-                replace[id] = DrawsNothing(s) ? BlankDib(s) : s;
+                // these are the folder watermarks and pane art, which xp drew with a white colour key (Elfin2's blank
+                // slots are a white field with a hairline); win10 draws them keyless, so a blank one must be blanked.
+                replace[id] = DrawsNothing(s, Color.White) ? BlankDib(s) : s;
             }
             if (dryRun || replace.Count == 0) return replace.Keys.ToList();
 
@@ -1447,10 +1720,20 @@ namespace libmsstyle.Import
         public static (List<string> notes, List<string> warnings) PatchShellStyleLayout(string win10ShellStyle, XpShellStyle source, XpShellStyle stock,
             IReadOnlyDictionary<bool, Margins> headerMargins, IReadOnlyDictionary<bool, (int Part, int State)> hoverRecords,
             (int Part, int State)? paneRecord, PaneWatermarkSet watermarks, bool dryRun, bool taskBand = true,
-            bool noSectionIcons = false)
+            bool noSectionIcons = false, IReadOnlyDictionary<bool, (int Part, int State)> headerFonts = null,
+            IReadOnlyDictionary<bool, (int Part, int State)> taskFonts = null, IReadOnlyDictionary<string, string> auxiliaryFonts = null)
         {
             var notes = new List<string>(); var warnings = new List<string>();
             DuiCascade src = new DuiCascade(source), bas = new DuiCascade(stock);
+
+            // xp's shellstyle carries the WebView element tree; its main scrollviewer says where the section list
+            // lived (top/bottom band or left/right sidebar), the section list says how xp arranged the sections, and
+            // the main expando says how wide one section was. The win10 layouts are separate resources, so the porter
+            // uses this to choose the matching layout instead of guessing from the template alone.
+            var sourcePane = LegacyPaneLayout.From(source?.Legacy?.MarkupText);
+            bool paneBand = taskBand || sourcePane.IsBand;
+            bool bandBottom = sourcePane.Placement == LegacyPanePlacement.Bottom;
+            bool dockRight = !paneBand && sourcePane.Placement == LegacyPanePlacement.Right;
 
             // -1: the sheet doesn't state the margin where the cascade looks (xp's rules sit under the section
             // sheets, e.g. expando { margin: rect(0,5,0,0) } in mainsectionss); reading it as 0 collapsed XtremeXP's
@@ -1512,21 +1795,21 @@ namespace libmsstyle.Import
             try
             {
                 // UIFILE 1: the stylesheets. Expando padding, and the alignment of the name buttons.
-                foreach (var (lang, text, utf16) in TextResources(mod, "UIFILE", 1))
+                foreach (var (lang, text, encoding) in TextResources(mod, "UIFILE", 1))
                 {
                     string t = text;
                     int sb = t.IndexOf("<style resid=\"ExplorerBarStyle\">", StringComparison.Ordinal);
                     int se = sb < 0 ? -1 : t.IndexOf("</style>", sb, StringComparison.Ordinal);
                     if (se < 0) { warnings.Add("shellstyle layout: the template's UIFILE 1 has no ExplorerBarStyle sheet; section spacing and title alignment stay."); break; }
                     string sheet = t.Substring(sb, se - sb);
-                    if (taskBand)
+                    if (paneBand)
                     {
                         // the ExplorerBarBackground element is 200rp wide for the left pane; the band spans the window.
                         int wi = sheet.IndexOf(" width=\"200rp\"", StringComparison.Ordinal);
                         if (wi >= 0)
                         {
                             sheet = sheet.Remove(wi, " width=\"200rp\"".Length);
-                            notes.Add("shellstyle layout: task pane is a band across the top (xp's My Computer layout), not the 200rp left pane; the ExplorerBarBackground width goes.");
+                            notes.Add("shellstyle layout: task pane is a band across the folder window (xp's WebView layout), not the 200rp left pane; the ExplorerBarBackground width goes.");
                         }
                         else warnings.Add("shellstyle layout: no width=\"200rp\" on the ExplorerBarBackground element; the band may not span the window.");
                     }
@@ -1570,7 +1853,17 @@ namespace libmsstyle.Import
                             var pm = System.Text.RegularExpressions.Regex.Match(newTag, @"\bpadding=""rect\(\s*[^,]+,\s*([^,]+),\s*[^,]+,\s*([^)]+)\)""");
                             string tb = pm.Success ? $"{pm.Groups[1].Value.Trim()}, {{0}}rp, {pm.Groups[2].Value.Trim()}" : "0, {0}rp, 0";
                             string pad = $"padding=\"rect({pl}rp, {string.Format(tb, pr)})\"";
-                            newTag = pm.Success ? newTag.Substring(0, pm.Index) + pad + newTag.Substring(pm.Index + pm.Length) : newTag + " " + pad;
+                            if (pm.Success)
+                                newTag = newTag.Substring(0, pm.Index) + pad + newTag.Substring(pm.Index + pm.Length);
+                            else
+                            {
+                                // the template's padding may be a themeable(gtmar(...)) value: replace that one attribute
+                                // instead of appending a second padding (which would make the sheet invalid XML).
+                                var any = System.Text.RegularExpressions.Regex.Match(newTag, @"\s+\bpadding=""[^""]*""");
+                                newTag = any.Success
+                                    ? newTag.Substring(0, any.Index) + " " + pad + newTag.Substring(any.Index + any.Length)
+                                    : newTag + " " + pad;
+                            }
                             notes.Add($"shellstyle layout: {(kv.Key == "name_special" ? "main" : "normal")} header title box padded {pl}rp left, {pr}rp right, centered where xp centers it (xp: header border, padding, title padding and arrow; win10: CONTENTMARGINS).");
                         }
                         sheet = sheet.Substring(0, bb) + newTag + sheet.Substring(be);
@@ -1623,7 +1916,37 @@ namespace libmsstyle.Import
                             notes.Add($"shellstyle layout: task rows (AJOSplitButton) hover with dtb(ExplorerBar, {tp}, {ts}), the source's task hover background, across the row.");
                         }
                     }
-                    if (t != text) updates.Add(("UIFILE", 1u, lang, Encode(t, utf16)));
+                    // The source's own stylesheet rules (legacy DUI CSS) translated into the template's DUIXML tree.
+                    // Only declarations the record import and the layout edits above don't own are taken: the state
+                    // machine of the pane (animation, alpha, cursor) is the theme's, not the template's, and differs
+                    // from stock in custom packs (Glitch expands with mediumfast, fades its clippers). Stock luna
+                    // differs nowhere, so it leaves the template byte for byte.
+                    if (source.Legacy != null && stock != null && stock.Legacy != null)
+                    {
+                        try
+                        {
+                            var xml = DuiXmlDocument.Parse(t);
+                            RoutePaneFonts(xml, headerFonts, taskFonts);
+                            var rep = XpShellTranslator.Translate(source.Legacy, stock.Legacy, xml, new ShellTranslatorResources(source), TranslatedProperties, auxiliaryFonts: auxiliaryFonts);
+                            if (rep.RulesTranslated > 0 || headerFonts?.Count > 0 || taskFonts?.Count > 0)
+                            {
+                                string translated = xml.ToXml();
+                                if (translated != t)
+                                {
+                                    t = translated;
+                                    notes.Add($"shellstyle layout: the source's stylesheet rules translated into UIFILE 1's DUIXML ({string.Join(", ", TranslatedProperties)}): {rep.ToString()}.");
+                                }
+                            }
+                            notes.Add("shellstyle translation coverage: " + rep.ToString());
+                            foreach (var note in rep.Notes) notes.Add("shellstyle translation: " + note);
+                            foreach (var warning in rep.Warnings) warnings.Add("shellstyle translation: " + warning);
+                        }
+                        catch (InvalidDataException e)
+                        {
+                            warnings.Add("shellstyle translation: the template's UIFILE 1 didn't parse as DUIXML; the source's stylesheet rules weren't translated (" + e.Message + ").");
+                        }
+                    }
+                    if (t != text) updates.Add(("UIFILE", 1u, lang, Encode(t, encoding)));
                 }
 
                 // SHELL32_UIFILE: the pane markup. A centered title's button fills its header; with a task hover
@@ -1639,19 +1962,21 @@ namespace libmsstyle.Import
                     const string list = "<element id=\"atom(tasklist)\" layoutpos=\"top\" layout=\"verticalflowlayout(0,0,0)\">";
                     const string item = "<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">";
                     const string pane = "class=\"ExplorerBarBackground\">";
-                    int files = 0, rowFiles = 0, bandFiles = 0, detailsOpen = 0, bandLayoutFiles = 0;
+                    int files = 0, rowFiles = 0, bandFiles = 0, rightFiles = 0, detailsOpen = 0, bandLayoutFiles = 0;
 
                     foreach (uint id in ResourceIds(mod, "SHELL32_UIFILE"))
-                        foreach (var (lang, text, utf16) in TextResources(mod, "SHELL32_UIFILE", id))
+                        foreach (var (lang, text, encoding) in TextResources(mod, "SHELL32_UIFILE", id))
                         {
                             string t = pattern == null ? text : pattern.Replace(text, "$1");
                             if (pattern != null && t != text) files++;
-                            // which picture this folder's pane gets: the theme-wide one (xp's sectionlist content
-                            // picture) on any folder, else the music/picture folders' own picture (xp's shellstyle
-                            // bitmaps 12/15), else none (a plain folder's pane had none).
-                            // only the theme-wide picture becomes a band; the per-folder pictures are the music/picture
-                            // task list's own background (patched below in the stylesheet), like xp's sectionlist content.
-                            PaneWatermarkRecord? layoutWatermark = watermarks?.All;
+                            // which picture this folder's pane gets: xp's shellstyle bitmaps 12 and 15 are the music and
+                            // picture folders' own task list pictures (IDB_*_LISTVIEW_BMP; the win10 layouts 4 and 5 are
+                            // their panes, "Music Tasks"/accname music_bg/photo_bg). Other folders get the theme-wide
+                            // sectionlist content picture, and a plain folder without either gets none.
+                            PaneWatermarkRecord? layoutWatermark =
+                                id == 4 && watermarks?.Music != null ? watermarks.Music
+                                : id == 5 && watermarks?.Pictures != null ? watermarks.Pictures
+                                : watermarks?.All;
                             {
                                 // the Details section's Expando starts Expanded="false"; Windows 10 then shows the section
                                 // closed (title row only) until the info module has an item, while xp drew the folder's own
@@ -1687,7 +2012,7 @@ namespace libmsstyle.Import
                                 if (r != t) rowFiles++;
                                 t = r;
                             }
-                            if (!taskBand && layoutWatermark.HasValue && t.Contains(pane))
+                            if (!paneBand && layoutWatermark.HasValue && t.Contains(pane))
                             {
                                 // the band is a child of the pane element (borderlayout): pinned to the pane's bottom,
                                 // inside its padding, so the picture gets xp's content box (the source's 12rp/1rp padding).
@@ -1709,13 +2034,43 @@ namespace libmsstyle.Import
                                     bandLayoutFiles++;
                                 }
                             }
-                            if (taskBand && t.Contains(pane))
+                            if (dockRight && t.Contains(pane))
                             {
-                                string r = BandLayout(t, t.Contains("content=\"System Tasks\""));
+                                string r = DockRight(t);
+                                if (r != t) rightFiles++;
+                                t = r;
+                            }
+                            if (paneBand && t.Contains(pane))
+                            {
+                                // Control Panel's own page (SHELL32_UIFILE 18) docks its task pane as a left sidebar,
+                                // not as a folder band. XP drew that pane from the same sectionlist background, so it
+                                // keeps the pane record's picture (state 1, stretched as xp's zero-margin rcbmp mode 5
+                                // did) instead of the flat window fill the sidebar had before the picture was imported.
+                                string r = BandLayout(t, t.Contains("content=\"System Tasks\""), bandBottom);
                                 if (r != t) bandLayoutFiles++;
                                 t = r;
                             }
-                            if (t != text) updates.Add(("SHELL32_UIFILE", id, lang, Encode(t, utf16)));
+                            if (source.Legacy != null && stock?.Legacy != null && t.IndexOf("<stylesheets>", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                try
+                                {
+                                    var xml = DuiXmlDocument.Parse(t);
+                                    var rep = XpShellTranslator.Translate(source.Legacy, stock.Legacy, xml,
+                                        new ShellTranslatorResources(source), TranslatedProperties, reportMissingTargets: false, auxiliaryFonts: auxiliaryFonts);
+                                    if (rep.RulesTranslated > 0)
+                                    {
+                                        t = xml.ToXml();
+                                        notes.Add($"shellstyle translation SHELL32_UIFILE {id}: {rep}");
+                                    }
+                                    foreach (var note in rep.Notes) notes.Add($"shellstyle translation SHELL32_UIFILE {id}: {note}");
+                                    foreach (var warning in rep.Warnings) warnings.Add($"shellstyle translation SHELL32_UIFILE {id}: {warning}");
+                                }
+                                catch (InvalidDataException e)
+                                {
+                                    warnings.Add($"shellstyle translation SHELL32_UIFILE {id}: {e.Message}");
+                                }
+                            }
+                            if (t != text) updates.Add(("SHELL32_UIFILE", id, lang, Encode(t, encoding)));
                         }
                     if (stretch.Count > 0)
                     {
@@ -1727,18 +2082,23 @@ namespace libmsstyle.Import
                         if (rowFiles == 0) warnings.Add("shellstyle layout: the template's task lists aren't verticalflowlayout(0,0,0) / flowlayout() rows; the hover background covers only the text.");
                         else notes.Add($"shellstyle layout: task rows stretched to the task list's width (hover covers the row as on xp), in {rowFiles} pane layouts.");
                     }
-                    if (!taskBand && watermarks?.All != null)
+                    if (!paneBand && (watermarks?.All != null || watermarks?.Music != null || watermarks?.Pictures != null))
                     {
                         if (bandFiles == 0) warnings.Add("shellstyle layout: no ExplorerBarBackground element in the template's SHELL32_UIFILE markup; the folder watermark isn't drawn.");
-                        else notes.Add($"shellstyle layout: folder watermark on a bottom band of the pane, in {bandFiles} pane layouts (theme-wide picture: {(watermarks?.All != null ? "yes" : "no")}, music/pictures pictures: {(watermarks?.Music != null ? "yes" : "no")}/{(watermarks?.Pictures != null ? "yes" : "no")}).");
+                        else notes.Add($"shellstyle layout: folder watermark on a bottom band of the pane in {bandFiles} folder layouts (theme-wide picture: {(watermarks?.All != null ? "yes" : "no")}, music folder picture on layout 4: {(watermarks?.Music != null ? "yes" : "no")}, picture folder picture on layout 5: {(watermarks?.Pictures != null ? "yes" : "no")}).");
                     }
-                    if (taskBand)
+                    if (paneBand)
                     {
-                        if (bandLayoutFiles == 0) warnings.Add("shellstyle layout: no left-docked sidebar with ExplorerBarBackground in the template's SHELL32_UIFILE markup; the pane stays on the left.");
-                        else notes.Add($"shellstyle layout: task pane moved to a band across the top (xp's WebView layout) in {bandLayoutFiles} folder layouts; the pane's other sections (Other Places, Details) are dropped, the folder's own tasks stay.");
+                        if (bandLayoutFiles == 0) warnings.Add($"shellstyle layout: the task band wasn't applied: no folder layout in the template's SHELL32_UIFILE markup has a left-docked sidebar with an ExplorerBarBackground element to turn into a {(bandBottom ? "bottom" : "top")} band; every pane stays a left sidebar.");
+                        else notes.Add($"shellstyle layout: task pane moved to a {(bandBottom ? "bottom" : "top")} band{(sourcePane.IsBand ? $" as in the xp shellstyle (section list {sourcePane.SectionListLayout ?? "layout kept"}{(sourcePane.BandHeight > 0 ? $", {sourcePane.BandHeight}px high" : "")})" : " (--task-band)")} in {bandLayoutFiles} folder layouts; the band layouts keep only the folder's own tasks, so Other Places and Details are dropped from those layouts only.");
+                    }
+                    else if (dockRight)
+                    {
+                        if (rightFiles == 0) warnings.Add("shellstyle layout: no left-docked sidebar with ExplorerBarBackground in the template's SHELL32_UIFILE markup; the right-docked pane stays left.");
+                        else notes.Add($"shellstyle layout: task pane docked right as in the xp shellstyle in {rightFiles} folder layouts.");
                     }
                     if (detailsOpen > 0)
-                        notes.Add($"shellstyle layout: details section open from the start (Expanded=\"true\") in {detailsOpen} pane layouts; win10 leaves it closed until the info module has an item, xp showed the folder's own name/type.");
+                        notes.Add($"shellstyle layout: details section open from the start (Expanded=\"true\") in {detailsOpen} sidebar layouts (the band layouts have no Details section); win10 leaves it closed until the info module has an item, xp showed the folder's own name/type.");
                     else
                         warnings.Add("shellstyle layout: no Details Expando (Expanded=\"false\") in the template's SHELL32_UIFILE markup; the details section stays closed until an item is selected.");
                 }
@@ -1754,15 +2114,29 @@ namespace libmsstyle.Import
             return (notes, warnings);
         }
 
+        /// <summary>Moves the win10 left sidebar to the right, for a source xp markup that docked its section list
+        /// <c>layoutpos=right</c>. The scrollviewer already has borders on both sides, so only the dock side changes.</summary>
+        private static string DockRight(string t)
+        {
+            int pane = t.IndexOf("class=\"ExplorerBarBackground\">", StringComparison.Ordinal);
+            if (pane < 0) return t;
+            int side = t.LastIndexOf("<element layoutpos=\"left\"", pane, StringComparison.Ordinal);
+            if (side < 0) return t;
+            int sideTag = t.IndexOf('>', side);
+            if (sideTag < 0) return t;
+            string tag = t.Substring(side, sideTag - side).Replace("layoutpos=\"left\"", "layoutpos=\"right\"");
+            return t.Substring(0, side) + tag + t.Substring(sideTag);
+        }
+
         /// <summary>
-        /// Turns one folder layout's left sidebar into xp's band across the top. Windows 10's folder template
+        /// Turns one folder layout's left sidebar into xp's band across the folder window. Windows 10's folder template
         /// (SHELL32_UIFILE, "FolderLayout") docks the pane with <c>&lt;element layoutpos="left"&gt;</c> around a
         /// 210rp scrollviewer, then stacks "System Tasks"/"File and Folder Tasks", "Other Places" and "Details" in it;
-        /// xp's My Computer/My Documents WebView draws the folder's own tasks as a full-width band under one header.
-        /// The sidebar becomes a <c>layoutpos="top"</c> element, its scrollviewer loses the fixed width, the folder tree
+        /// xp's WebView drew the folder's own tasks as a full-width band under one header. The sidebar becomes a
+        /// <c>layoutpos="top"</c> (or <c>bottom</c>) element, its scrollviewer loses the fixed width, the folder tree
         /// module goes (the band has no tree), and only the first Expando (the folder's task list) stays.
         /// </summary>
-        private static string BandLayout(string t, bool systemTasks)
+        private static string BandLayout(string t, bool systemTasks, bool bottom = false)
         {
             int pane = t.IndexOf("class=\"ExplorerBarBackground\">", StringComparison.Ordinal);
             if (pane < 0) return t;
@@ -1771,7 +2145,7 @@ namespace libmsstyle.Import
             int sideTag = t.IndexOf('>', side);
             if (sideTag < 0) return t;
             string tag = t.Substring(side, sideTag - side);
-            t = t.Substring(0, side) + tag.Replace("layoutpos=\"left\"", "layoutpos=\"top\"") + t.Substring(sideTag);
+            t = t.Substring(0, side) + tag.Replace("layoutpos=\"left\"", "layoutpos=\"" + (bottom ? "bottom" : "top") + "\"") + t.Substring(sideTag);
             int scroller = t.IndexOf("<scrollviewer", side, StringComparison.Ordinal);
             if (scroller >= 0)
             {
@@ -1833,7 +2207,11 @@ namespace libmsstyle.Import
             // "System Tasks" (My Computer). Windows 10 draws its three commands with a FolderBandModule, whose native
             // toolbar is vertical inside a task pane: the band showed them three rows tall. xp's band puts them side
             // by side in one row. The three commands are the same xp ran, so each becomes a NavigateButton in a row
-            // layout (shell targets: System Properties, Add or Remove Programs, Control Panel).
+            // layout (shell targets: System Properties, Add or Remove Programs, Control Panel). Their labels are read
+            // from shell32's string table at runtime (resstr, the idiom the template's own markup uses) under the ids
+            // xp's band used (shell32.rc IDS_TASK_MYCOMPUTER_SYSTEMPROPERTIES 31294, IDS_TASK_ARP 31327,
+            // IDS_TASK_CHANGESETTINGS 31312; win10's shell32 still resolves all three), so a localized shell shows
+            // localized labels instead of the English text this porter would otherwise bake in.
             int list = t.IndexOf("<element id=\"atom(tasklist)\"", pane2, StringComparison.Ordinal);
             if (list >= 0)
             {
@@ -1848,19 +2226,19 @@ namespace libmsstyle.Import
                         "\r\n\t\t\t\t\t\t\t<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">\r\n" +
                         "\t\t\t\t\t\t\t\t<NavigateButton layout=\"borderlayout()\" shellexecute=\"sysdm.cpl\">\r\n" +
                         "\t\t\t\t\t\t\t\t\t<Button class=\"icon\" layoutpos=\"left\" content=\"icon(253, sysmetric(49), sysmetric(50), library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
-                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"View system information\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"resstr(31294, library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
                         "\t\t\t\t\t\t\t\t</NavigateButton>\r\n" +
                         "\t\t\t\t\t\t\t</element>\r\n" +
                         "\t\t\t\t\t\t\t<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">\r\n" +
                         "\t\t\t\t\t\t\t\t<NavigateButton layout=\"borderlayout()\" shellexecute=\"appwiz.cpl\">\r\n" +
                         "\t\t\t\t\t\t\t\t\t<Button class=\"icon\" layoutpos=\"left\" content=\"icon(271, sysmetric(49), sysmetric(50), library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
-                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"Add or remove programs\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"resstr(31327, library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
                         "\t\t\t\t\t\t\t\t</NavigateButton>\r\n" +
                         "\t\t\t\t\t\t\t</element>\r\n" +
                         "\t\t\t\t\t\t\t<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">\r\n" +
                         "\t\t\t\t\t\t\t\t<NavigateButton layout=\"borderlayout()\" shellexecute=\"control.exe\">\r\n" +
                         "\t\t\t\t\t\t\t\t\t<Button class=\"icon\" layoutpos=\"left\" content=\"icon(137, sysmetric(49), sysmetric(50), library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
-                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"Change a setting\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
+                        "\t\t\t\t\t\t\t\t\t<Button class=\"label_normal\" layoutpos=\"left\" content=\"resstr(31312, library(shell32.dll))\" accessible=\"true\" accrole=\"pushbutton\"/>\r\n" +
                         "\t\t\t\t\t\t\t\t</NavigateButton>\r\n" +
                         "\t\t\t\t\t\t\t</element>";
                     t = t.Substring(0, list) + head + buttons + "\r\n\t\t\t\t\t\t" + tail + t.Substring(listEnd);
@@ -1901,8 +2279,11 @@ namespace libmsstyle.Import
             }
         }
 
-        private static byte[] Encode(string t, bool utf16)
-            => utf16 ? System.Text.Encoding.Unicode.GetPreamble().Concat(System.Text.Encoding.Unicode.GetBytes(t)).ToArray() : System.Text.Encoding.UTF8.GetBytes(t);
+        /// <summary>the markup back in the encoding it was read from: UTF-16 with its BOM, or the ANSI codepage.</summary>
+        private static byte[] Encode(string t, System.Text.Encoding encoding)
+            => encoding.CodePage == System.Text.Encoding.Unicode.CodePage
+                ? System.Text.Encoding.Unicode.GetPreamble().Concat(System.Text.Encoding.Unicode.GetBytes(t)).ToArray()
+                : encoding.GetBytes(t);
 
         private static List<uint> ResourceIds(IntPtr mod, string type)
         {
@@ -1921,13 +2302,17 @@ namespace libmsstyle.Import
             return ids;
         }
 
-        /// <summary>every language of one text resource: UTF-16 with a BOM, otherwise UTF-8/ANSI markup (Luna10's).</summary>
-        private static List<(ushort lang, string text, bool utf16)> TextResources(IntPtr mod, string type, uint id)
+        /// <summary>
+        /// every language of one text resource, with the encoding it is in: UTF-16 with a BOM, otherwise the ANSI
+        /// codepage (Luna10's markup is plain ANSI; decoding it as UTF-8 and writing it back as UTF-8 mangled any
+        /// non-ASCII text in it).
+        /// </summary>
+        private static List<(ushort lang, string text, System.Text.Encoding encoding)> TextResources(IntPtr mod, string type, uint id)
         {
             var langs = new List<ushort>();
             Win32Api.EnumResourceLanguagesEx(mod, type, "#" + id, (m, t, n, lang, l) => { langs.Add(lang); return true; },
                 IntPtr.Zero, Win32Api.EnumResourceFlags.RESOURCE_ENUM_LN, 0);
-            var list = new List<(ushort, string, bool)>();
+            var list = new List<(ushort, string, System.Text.Encoding)>();
             foreach (var lang in langs)
             {
                 IntPtr r = Win32Api.FindResourceEx(mod, type, id, lang);
@@ -1936,7 +2321,8 @@ namespace libmsstyle.Import
                 var buf = new byte[size];
                 Marshal.Copy(Win32Api.LockResource(Win32Api.LoadResource(mod, r)), buf, 0, (int)size);
                 bool utf16 = size >= 2 && buf[0] == 0xFF && buf[1] == 0xFE;
-                list.Add((lang, utf16 ? System.Text.Encoding.Unicode.GetString(buf, 2, buf.Length - 2) : System.Text.Encoding.UTF8.GetString(buf), utf16));
+                var encoding = utf16 ? System.Text.Encoding.Unicode : System.Text.Encoding.Default;
+                list.Add((lang, utf16 ? encoding.GetString(buf, 2, buf.Length - 2) : encoding.GetString(buf), encoding));
             }
             return list;
         }

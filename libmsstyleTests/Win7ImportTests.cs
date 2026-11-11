@@ -53,6 +53,8 @@ namespace libmsstyleTests
                 s.Save(output);
             }
             var v = StyleValidator.ValidateUnchanged(Aero11, output);
+            // no run blocked this report, so a clean validation passes; a blocked one never would, see
+            // OutputNextToAnInputIsRefused.
             Assert.IsTrue(v.Passed, string.Join("\n", v.Errors));
             CollectionAssert.AreEqual(Variant(Aero11), Variant(output));
         }
@@ -434,6 +436,8 @@ namespace libmsstyleTests
                 DryRun = false
             });
             Assert.AreEqual(ImportStatus.Blocked, r.Status);
+            // a blocked run never kept a candidate, so its validation can't read as passed even without errors.
+            Assert.IsFalse(r.Validation.Passed);
             Assert.IsTrue(r.Errors.Any(e => e.Contains("holds an input")), string.Join("\n", r.Errors));
             Assert.IsFalse(File.Exists(output));
         }

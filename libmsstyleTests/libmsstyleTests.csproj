@@ -68,8 +68,12 @@
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Drawing" />
+    <Reference Include="System.Xml.Linq" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="DuiTranslatorTests.cs" />
+    <Compile Include="FidelityTests.cs" />
+    <Compile Include="LegacyPaneMarkupTests.cs" />
     <Compile Include="BinaryComparison.cs" />
     <Compile Include="LoadSaveConsistency.cs" />
     <Compile Include="PropertyStreamTests.cs" />

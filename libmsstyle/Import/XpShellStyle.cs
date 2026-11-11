@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
@@ -45,40 +45,56 @@ namespace libmsstyle.Import
 
         private readonly IReadOnlyDictionary<string, Color> m_sysColors;
 
+        /// <summary>
+        /// the markup's text. A BOM (or UTF-16's zero high bytes) decides; otherwise the resource is ANSI in the system
+        /// codepage, which is what DirectUI reads it with (duiconvert.h:18 <c>DUI_CODEPAGE CP_ACP</c>). Decoding a
+        /// Russian or Greek pack as 1252 turned its rcstr() strings into mojibake.
+        /// </summary>
         private static string Decode(byte[] b)
         {
             if (b.Length >= 2 && b[0] == 0xFF && b[1] == 0xFE) return Encoding.Unicode.GetString(b, 2, b.Length - 2);
             if (b.Length >= 2 && b[1] == 0) return Encoding.Unicode.GetString(b);
-            return Encoding.GetEncoding(1252).GetString(b);
+            return Encoding.Default.GetString(b);
         }
 
-        internal static string NormalizeSelector(string s) => Regex.Replace(s.Trim().ToLowerInvariant(), @"\s+", " ").Replace(" [", "[").Replace("] [", "][");
+        internal static string NormalizeSelector(string s) { return Dui.XpUifileSyntax.NormalizeSelector(s).ToLowerInvariant(); }
+
+        /// <summary>the UIFILE text as decoded (for tools/tests that need the syntax tree).</summary>
+        public string UifileText { get; private set; }
+        /// <summary>the parsed stylesheet; diagnostics in <see cref="XpUifileSyntax.Document.Warnings"/>.</summary>
+        public Dui.XpUifileSyntax.Document Legacy { get; private set; }
 
         private void Parse(string text)
         {
-            foreach (Match style in Regex.Matches(text, @"<style\s+resid\s*=\s*""?([^\s>""]+)""?\s*>(.*?)</style>", RegexOptions.Singleline | RegexOptions.IgnoreCase))
+            UifileText = (UifileText == null ? "" : UifileText + "\n") + text;
+            var doc = Dui.XpUifileSyntax.Parse(text);
+            if (Legacy == null) Legacy = doc;
+            else
             {
-                if (!m_rules.TryGetValue(style.Groups[1].Value, out var rules))
-                    m_rules[style.Groups[1].Value] = rules = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
-                if (!m_ruleLists.TryGetValue(style.Groups[1].Value, out var list))
-                    m_ruleLists[style.Groups[1].Value] = list = new List<DuiRule>();
-                // block comments (Xp: /* *** TASK PANEL *** */ right before a rule) would otherwise become part of the
-                // selector text and DuiRule.Parse drops the rule (XtremeXP's sectionlist background was lost that way).
-                string body = Regex.Replace(style.Groups[2].Value, @"/\*.*?\*/", "", RegexOptions.Singleline);
-                foreach (Match rule in Regex.Matches(body, @"([^{}]+)\{([^}]*)\}"))
+                // the pane's element tree lives in whichever document carries resid=main (xp splits it: UIFILE 1's
+                // stylesheets, UIFILE 2's markup), so every document's markup is kept, not just the first one's.
+                if (!string.IsNullOrEmpty(doc.MarkupText)) Legacy.MarkupText = Legacy.MarkupText + "\n" + doc.MarkupText;
+                foreach (var sheet in doc.Sheets)
                 {
-                    string sel = NormalizeSelector(rule.Groups[1].Value);
+                    var have = Legacy.Find(sheet.Resid);
+                    if (have == null) { Legacy.Sheets.Add(sheet); continue; }
+                    foreach (var rule in sheet.Rules) { rule.Order = have.Rules.Count; have.Rules.Add(rule); }
+                }
+            }
+            foreach (var sheet in doc.Sheets)
+            {
+                if (!m_rules.TryGetValue(sheet.Resid, out var rules))
+                    m_rules[sheet.Resid] = rules = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+                if (!m_ruleLists.TryGetValue(sheet.Resid, out var list))
+                    m_ruleLists[sheet.Resid] = list = new List<DuiRule>();
+                foreach (var parsed in sheet.Rules)
+                {
+                    string sel = NormalizeSelector(parsed.Selector.Raw);
                     if (!rules.TryGetValue(sel, out var props)) rules[sel] = props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     var decls = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var decl in rule.Groups[2].Value.Split(';'))
-                    {
-                        int colon = decl.IndexOf(':');
-                        if (colon <= 0) continue;
-                        props[decl.Substring(0, colon).Trim()] = decl.Substring(colon + 1).Trim();
-                        decls[decl.Substring(0, colon).Trim()] = decl.Substring(colon + 1).Trim();
-                    }
-                    var parsed = DuiRule.Parse(sel, decls, list.Count);
-                    if (parsed != null) list.Add(parsed);
+                    foreach (var d in parsed.Declarations) { props[d.Property] = d.RawValue; decls[d.Property] = d.RawValue; }
+                    var rule = DuiRule.From(parsed.Selector, decls, list.Count);
+                    if (rule != null) list.Add(rule);
                 }
             }
         }
@@ -156,7 +172,7 @@ namespace libmsstyle.Import
                 {
                     if (!string.Equals(r.Class, cls, StringComparison.OrdinalIgnoreCase)) continue;
                     if (!string.Equals(r.Id, id, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (r.Flags.Count != 0) continue;
+                    if (r.Conditions.Count != 0) continue;
                     if (!r.Decls.ContainsKey(property)) continue;
                     if (best == null || r.Specificity > best.Specificity) best = r;
                 }
@@ -209,15 +225,52 @@ namespace libmsstyle.Import
             return named.IsKnownColor && !named.IsSystemColor ? named : (Color?)null;
         }
 
-        /// <summary>rect(l, t, r, b) with optional rp/px suffixes.</summary>
+        /// <summary>
+        /// rect(l, t, r, b) in pixels at 96 dpi, the dpi the porter lays the theme out at. DirectUI scales a length when
+        /// it parses it (parse.y <c>number: magnitude YYRP</c> -> <c>RelPixToPixel</c> = MulDiv(n, dpi, 96), and
+        /// <c>YYPT</c> -> <c>PointToPixel</c> = MulDiv(n, dpi, 72)), so rp is a relative pixel and a bare number is one
+        /// too, while pt is points. A member with any other suffix is not a length this reads: null, rather than
+        /// silently truncated to its digits.
+        /// </summary>
         public static Margins ParseRect(string v)
         {
             if (v == null) return null;
             var m = Regex.Match(v, @"^rect\s*\(([^)]*)\)$", RegexOptions.IgnoreCase);
             if (!m.Success) return null;
-            var n = SplitArgs(m.Groups[1].Value).Select(x => Regex.Match(x, @"^-?\d+")).ToList();
-            if (n.Count != 4 || n.Any(x => !x.Success)) return null;
-            return new Margins(int.Parse(n[0].Value), int.Parse(n[1].Value), int.Parse(n[2].Value), int.Parse(n[3].Value));
+            var args = SplitArgs(m.Groups[1].Value);
+            if (args.Count != 4) return null;
+            var n = new int[4];
+            for (int i = 0; i < 4; ++i)
+            {
+                if (!TryParseLength(args[i], out n[i])) return null;
+            }
+            return new Margins(n[0], n[1], n[2], n[3]);
+        }
+
+        /// <summary>one markup length ("12", "12rp", "12px", "9pt") in pixels at 96 dpi; false for anything else.</summary>
+        private static bool TryParseLength(string text, out int value)
+        {
+            value = 0;
+            if (string.IsNullOrEmpty(text)) return false;
+            text = text.Trim();
+            int end = 0;
+            if (end < text.Length && (text[end] == '-' || text[end] == '+')) end++;
+            int digits = end;
+            while (end < text.Length && char.IsDigit(text[end])) end++;
+            if (end == digits) return false;
+            if (!int.TryParse(text.Substring(0, end), NumberStyles.Integer, CultureInfo.InvariantCulture, out int n)) return false;
+            string unit = text.Substring(end).Trim();
+            if (unit.Length == 0 || unit.Equals("rp", StringComparison.OrdinalIgnoreCase) || unit.Equals("px", StringComparison.OrdinalIgnoreCase))
+            {
+                value = n; // relative pixels: MulDiv(n, 96, 96) at the dpi the porter lays the theme out at
+                return true;
+            }
+            if (unit.Equals("pt", StringComparison.OrdinalIgnoreCase))
+            {
+                value = (int)Math.Round(n * 96.0 / 72.0, MidpointRounding.AwayFromZero); // PointToPixel
+                return true;
+            }
+            return false;
         }
 
         /// <summary>

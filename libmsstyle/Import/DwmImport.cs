@@ -17,6 +17,10 @@ namespace libmsstyle.Import
     /// each rect is pointed at the source's sprite for the same win7 part. A template sprite that
     /// can't be traced or whose new geometry doesn't fit is copied over from the template atlas
     /// unchanged, so no frame/caption/button part is ever guessed.
+    /// XP instead has Window bitmap parts rather than a DWM atlas. Its explicit adapter rasterizes
+    /// matching frame faces and button/glyph layers into the existing target sprite slots, retaining
+    /// target atlas geometry and unrelated sprites. Shared target glyph/background contracts and
+    /// compositor placement/shadows are reported limitations, not claims of XP-native rendering.
     /// </summary>
     internal class DwmImport
     {
@@ -107,6 +111,11 @@ namespace libmsstyle.Import
                 report.Notes.Add("DWMWindow atlas excluded by rule; template frames kept.");
                 return;
             }
+            if (m_imp.Options.SourcePlatform == Platform.WinXP)
+            {
+                RunXp(t, ta);
+                return;
+            }
             if (ba == null || sa == null)
             {
                 report.Warnings.Add("DWMWindow not imported: base or source has no DWMWindow IMAGEATLAS. template frames kept.");
@@ -130,16 +139,6 @@ namespace libmsstyle.Import
                 report.Warnings.Add("DWMWindow not imported: the template atlas isn't the stock win7 atlas, so its rects can't be traced to win7 parts. template frames kept.");
                 return;
             }
-
-            // stock rect -> win7 part names owning it
-            var baseByRect = new Dictionary<string, List<string>>();
-            foreach (var p in b.Values)
-                foreach (var r in p.Rects)
-                {
-                    string k = r.StateId + ":" + RectOf(r);
-                    if (!baseByRect.TryGetValue(k, out var l)) baseByRect[k] = l = new List<string>();
-                    l.Add(p.Name);
-                }
 
             var plans = new List<RectPlan>();
             var srcOfPart = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -213,6 +212,513 @@ namespace libmsstyle.Import
                 if (changed)
                     report.Notes.Add($"DWMWindow {bp.Name}: source customized a win7-only part (no win10 consumer); dropped.");
             }
+        }
+        private sealed class XpFramePlan
+        {
+            public PartData Part;
+            public SemanticEntry Entry;
+            public Rectangle Rect;
+            public string SourcePart;
+            public ArgbImage Sprite;
+            public Margins[] Margins;
+            public bool Button;
+            public bool Glyph;
+            public string Note;
+        }
+
+        // Squeegee/no-shadow are compositor variants of the same frame, not XP maximized
+        // captions. Keeping their target slots and state counts avoids changing uDWM's packing.
+        private static string XpFramePart(string name)
+        {
+            bool small = name.StartsWith("SMALL", StringComparison.OrdinalIgnoreCase);
+            string n = small ? name.Substring(5) : name;
+            if (n.StartsWith("TOPFRAME", StringComparison.OrdinalIgnoreCase)) return small ? "SMALLCAPTION" : "CAPTION";
+            if (n.StartsWith("BOTTOMFRAME", StringComparison.OrdinalIgnoreCase)) return small ? "SMALLFRAMEBOTTOM" : "FRAMEBOTTOM";
+            if (n.StartsWith("LEFTFRAME", StringComparison.OrdinalIgnoreCase)) return small ? "SMALLFRAMELEFT" : "FRAMELEFT";
+            if (n.StartsWith("RIGHTFRAME", StringComparison.OrdinalIgnoreCase)) return small ? "SMALLFRAMERIGHT" : "FRAMERIGHT";
+            if (n.StartsWith("BUTTON", StringComparison.OrdinalIgnoreCase))
+            {
+                if (n.Contains("CLOSE")) return small ? "SMALLCLOSEBUTTON" : "CLOSEBUTTON";
+                if (n.Contains("MIN")) return "MINBUTTON";
+                if (n.Contains("MAX")) return "MAXBUTTON";
+                if (n.Contains("RESTORE")) return "RESTOREBUTTON";
+                if (n.Contains("HELP")) return "HELPBUTTON";
+                if (n.Contains("CAPTION")) return "MINBUTTON";
+            }
+            return null;
+        }
+
+        private void RunXp(Dictionary<string, PartData> targetParts, SemanticEntry atlasEntry)
+        {
+            var report = m_imp.Report;
+            var template = m_imp.Decoded(m_imp.Target, "STREAM", atlasEntry.ResourceId);
+            if (template == null)
+            {
+                report.Errors.Add("template DWMWindow atlas is missing or isn't a decodable png.");
+                return;
+            }
+            var window = m_imp.Source.Style.Classes.Values.FirstOrDefault(c => string.Equals(c.ClassName, "Window", StringComparison.OrdinalIgnoreCase));
+            var names = window == null ? null : SemanticModel.PartNames(window.ClassName, Platform.WinXP);
+            var plans = new List<XpFramePlan>();
+            foreach (var part in targetParts.Values.OrderBy(p => p.Id))
+                foreach (var entry in part.Rects)
+                {
+                    var plan = new XpFramePlan
+                    {
+                        Part = part, Entry = entry, Rect = RectOf(entry), SourcePart = XpFramePart(part.Name),
+                        Button = part.Name.IndexOf("BUTTON", StringComparison.OrdinalIgnoreCase) >= 0,
+                        Glyph = part.Name.IndexOf("GLYPH", StringComparison.OrdinalIgnoreCase) >= 0
+                    };
+                    plans.Add(plan);
+                    if (plan.Rect.Width <= 0 || plan.Rect.Height <= 0) continue;
+                    if (!InsideAtlas(template, plan.Rect))
+                    {
+                        report.Errors.Add($"DWMWindow {part.Name}: template rect {plan.Rect} is outside its atlas.");
+                        continue;
+                    }
+                    if (plan.SourcePart == null) { plan.Note = "no XP Window frame counterpart; template sprite retained"; continue; }
+                    if (KeyPattern.Matches(m_imp.Options.Exclude, Win7StyleImporter.DwmClass, part.Name, "ATLASRECT")
+                        || KeyPattern.Matches(m_imp.Options.Exclude, Win7StyleImporter.DwmClass, part.Name, "SIZINGMARGINS")
+                        || KeyPattern.Matches(m_imp.Options.Exclude, "Window", plan.SourcePart, "IMAGEFILE"))
+                    {
+                        plan.Note = "frame picture or its paired margins excluded by rule";
+                        continue;
+                    }
+                    int sourcePart = names == null ? -1 : names.Where(n => string.Equals(n.Value, plan.SourcePart, StringComparison.OrdinalIgnoreCase)).Select(n => n.Key).DefaultIfEmpty(-1).First();
+                    if (sourcePart < 0 || !window.Parts.ContainsKey(sourcePart))
+                    {
+                        plan.Note = "source has no Window " + plan.SourcePart;
+                        continue;
+                    }
+                    var targetClass = m_imp.Target.Style.Classes[entry.ClassId];
+                    int count = EffectiveCount(m_imp.Target.Style, targetClass, part.Id, entry.StateId);
+                    if (part.Name.IndexOf("BUTTON", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        BuildXpButton(plan, window, sourcePart, count);
+                        continue;
+                    }
+                    if (count != 2 || plan.Rect.Width < 3 || plan.Rect.Height / count < 3)
+                    {
+                        plan.Note = "target frame is not a nonempty active/inactive two-frame strip";
+                        continue;
+                    }
+                    var sprite = new ArgbImage(plan.Rect.Width, plan.Rect.Height);
+                    var margins = new Margins[count];
+                    bool complete = true;
+                    for (int i = 0; i < count; ++i)
+                    {
+                        int state = entry.StateId == 0 ? i + 1 : entry.StateId;
+                        var imageProp = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.IMAGEFILE);
+                        var source = imageProp?.GetValue() is int imageId ? m_imp.Decoded(m_imp.Source, "IMAGE", imageId & 0xFFFF) : null;
+                        int sourceCount = EffectiveCount(m_imp.Source.Style, window, sourcePart, state);
+                        bool horizontal = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int layout ? layout == 1 : true;
+                        int fw = source == null ? 0 : source.Width / (horizontal ? sourceCount : 1);
+                        int fh = source == null ? 0 : source.Height / (horizontal ? 1 : sourceCount);
+                        if (fw < 1 || fh < 1 || (sourceCount != 1 && sourceCount != 2))
+                        {
+                            complete = false;
+                            plan.Note = "source frame picture is missing or does not describe one frame or an active/inactive pair";
+                            break;
+                        }
+                        // XP states 1/2 select the first/second frame, even when IMAGEFILE is
+                        // explicitly overridden on that state. One-frame art is shared by both.
+                        int index = sourceCount == 1 ? 0 : Math.Min(state - 1, sourceCount - 1);
+                        var frame = source.Crop(new Rectangle(horizontal ? index * fw : 0, horizontal ? 0 : index * fh, fw, fh));
+                        ApplyXpColorKey(frame, window, sourcePart, state);
+                        bool tile = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.SIZINGTYPE)?.GetValue() is int sizing && sizing == 2;
+                        int top = i * plan.Rect.Height / count, bottom = (i + 1) * plan.Rect.Height / count;
+                        var rendered = SynthesizeXpFrameStrip(frame, 1, false, plan.Rect.Width, bottom - top, 1,
+                            EffectiveSizing(m_imp.Source.Style, window, sourcePart, state), tile, out margins[i]);
+                        if (rendered == null) { complete = false; plan.Note = "source frame cannot be nine-gridded into the target slot"; break; }
+                        sprite.Blit(rendered, 0, top);
+                    }
+                    if (complete) { plan.Sprite = sprite; plan.Margins = margins; }
+                }
+
+            // Reject overlaps to a fixed point: retaining one sprite can invalidate an alias
+            // that previously agreed with its synthesized pixels, but not its template pixels.
+            bool rejected;
+            do
+            {
+                var conflicts = new HashSet<XpFramePlan>();
+                // A face/glyph pair is one visual. A failed or excluded layer must not leave
+                // XP glyphs over a template face (or a transparent face with template glyphs).
+                foreach (var group in plans.Where(p => p.Button && p.SourcePart != null).GroupBy(p =>
+                    p.SourcePart == "CLOSEBUTTON" || p.SourcePart == "SMALLCLOSEBUTTON" ? p.SourcePart : "CAPTION"))
+                    if (group.Any(p => p.Sprite == null))
+                        foreach (var plan in group.Where(p => p.Sprite != null)) conflicts.Add(plan);
+                for (int i = 0; i < plans.Count; ++i)
+                    for (int j = i + 1; j < plans.Count; ++j)
+                    {
+                        var a = plans[i]; var b = plans[j];
+                        if ((a.Sprite == null && b.Sprite == null) || !InsideAtlas(template, a.Rect) || !InsideAtlas(template, b.Rect)) continue;
+                        var intersection = Rectangle.Intersect(a.Rect, b.Rect);
+                        if (intersection.Width <= 0 || intersection.Height <= 0) continue;
+                        var ai = a.Sprite ?? template; var bi = b.Sprite ?? template;
+                        var ar = a.Sprite == null ? intersection : new Rectangle(intersection.X - a.Rect.X, intersection.Y - a.Rect.Y, intersection.Width, intersection.Height);
+                        var br = b.Sprite == null ? intersection : new Rectangle(intersection.X - b.Rect.X, intersection.Y - b.Rect.Y, intersection.Width, intersection.Height);
+                        if (ai.RegionEquals(ar, bi, br)) continue;
+                        if (a.Sprite != null) conflicts.Add(a);
+                        if (b.Sprite != null) conflicts.Add(b);
+                    }
+                foreach (var plan in conflicts) { plan.Sprite = null; plan.Note = "target atlas overlap would change another consumer's pixels; template sprite retained"; }
+                rejected = conflicts.Count != 0;
+            } while (rejected);
+
+            var output = new ArgbImage(template.Width, template.Height, (uint[])template.Pixels.Clone());
+            foreach (var plan in plans.Where(p => p.Sprite != null)) output.Blit(plan.Sprite, plan.Rect.X, plan.Rect.Y);
+            foreach (var plan in plans)
+            {
+                if (!InsideAtlas(template, plan.Rect)) continue;
+                bool imported = plan.Sprite != null;
+                var expected = imported ? plan.Sprite : template.Crop(plan.Rect);
+                m_imp.SpriteChecks.Add(new SpriteExpectation { Part = plan.Part.Name, OutputRect = plan.Rect, Expected = expected });
+                m_rep.Parts.Add(new DwmPartMapping
+                {
+                    TargetPartId = plan.Part.Id, TargetPart = plan.Part.Name, SourcePart = imported ? "Window|" + plan.SourcePart : null,
+                    Method = imported ? (plan.Button ? "xp-button" : "xp-frame") : "fallback", TargetRect = plan.Rect.ToString(), NewRect = plan.Rect.ToString(),
+                    Note = imported ? (plan.Note ?? "XP active/inactive artwork nine-gridded into the unchanged target slot, with per-frame 1px edge padding and fitted source margins") : plan.Note
+                });
+                if (!imported)
+                {
+                    if (!m_rep.FallbackParts.Contains(plan.Part.Name)) m_rep.FallbackParts.Add(plan.Part.Name);
+                    if (plan.SourcePart != null) report.Warnings.Add($"DWMWindow {plan.Part.Name}: {plan.Note}.");
+                    continue;
+                }
+                var cls = m_imp.Target.Style.Classes[plan.Entry.ClassId];
+                PutXpProperty(cls, plan.Part, plan.Entry.StateId, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, plan.Margins[0]);
+                for (int i = 0; i < plan.Margins.Length; ++i)
+                {
+                    int state = plan.Entry.StateId == 0 ? i + 1 : plan.Entry.StateId;
+                    PutXpProperty(cls, plan.Part, state, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, plan.Margins[i]);
+                }
+                // All imported frame/face pixels already contain their authored color and alpha.
+                // Do not apply inherited glass tint or inactive attenuation on top of them.
+                foreach (int state in plan.Part.Entries.Select(e => e.StateId)
+                    .Concat(Enumerable.Range(0, plan.Button ? 5 : 3)).Distinct())
+                {
+                    PutXpProperty(cls, plan.Part, state, IDENTIFIER.OPACITY, IDENTIFIER.INT, 100);
+                    PutXpProperty(cls, plan.Part, state, IDENTIFIER.COLORIZATIONOPACITY, IDENTIFIER.INT, 0);
+                }
+                if (plan.SourcePart.EndsWith("CAPTION", StringComparison.Ordinal))
+                {
+                    // The pixels already contain XP's colors. Template glass opacity/tint/glow
+                    // must not wash out the inactive frame or recolor the source caption.
+                    foreach (int state in plan.Part.Entries.Select(e => e.StateId).Concat(new[] { 0, 1, 2 }).Distinct())
+                    {
+                        PutXpProperty(cls, plan.Part, state, IDENTIFIER.TEXTGLOWSIZE, IDENTIFIER.INT, 0);
+                        PutXpProperty(cls, plan.Part, state, IDENTIFIER.GLOWINTENSITY, IDENTIFIER.INT, 0);
+                        int xpState = state == 2 || state == 4 ? 2 : 1;
+                        int sourcePart = names.First(n => string.Equals(n.Value, plan.SourcePart, StringComparison.OrdinalIgnoreCase)).Key;
+                        var text = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, xpState, IDENTIFIER.TEXTCOLOR)
+                            ?? SemanticModel.FindEffective(m_imp.Source.Style, window, 0, 0, xpState == 2 ? IDENTIFIER.INACTIVECAPTIONTEXT : IDENTIFIER.CAPTIONTEXT);
+                        if (text?.GetValue() is Color color) PutXpProperty(cls, plan.Part, state, IDENTIFIER.TEXTCOLOR, IDENTIFIER.COLOR, color);
+                    }
+                }
+                report.Count(plan.Button ? "dwm-rect-xp-button" : "dwm-rect-xp-frame");
+            }
+            if (!plans.Any(p => p.Sprite != null))
+            {
+                report.Warnings.Add("DWMWindow XP frame synthesis imported no frames; see per-part fallback reasons.");
+                return;
+            }
+            var png = ImageIdentity.EncodePngVerified(output);
+            int id = m_imp.PlaceResource("STREAM", atlasEntry.ResourceId, png, ImageIdentity.Analyze(png));
+            atlasEntry.Property.SetValue(id);
+            m_imp.MarkTouched(atlasEntry.Property, $"DWMWindow|{atlasEntry.PartName}|S{atlasEntry.StateId}|{atlasEntry.PropertyName}");
+            m_imp.Decide(atlasEntry, "applied-xp-frame-atlas", "XP Window frame and caption-button artwork synthesized without relocating target sprites or changing their frame counts", null, null, atlasEntry, id.ToString());
+            m_rep.NewAtlasId = id;
+            m_rep.NewAtlasSize = $"{output.Width}x{output.Height}";
+            m_rep.SourceAtlasChanged = !Win7StyleImporter.NearlyEqual(template, output, 0);
+            m_rep.AtlasReencoded = true;
+            if (window != null && plans.Any(p => p.Button && !p.Glyph && p.Sprite != null && p.SourcePart == "MINBUTTON")) ReportSharedXpFaces(window, names);
+            report.Notes.Add("XP has no composited DWM atlas: frame and caption-button artwork is synthesized at the template's sprite dimensions. Native compositor caption/button placement, maximized frame selection and shadows remain template/OS behavior; this is not verified native 1:1 rendering.");
+        }
+
+        private void BuildXpButton(XpFramePlan plan, StyleClass window, int sourcePart, int targetCount)
+        {
+            if (targetCount != 4 || plan.Rect.Width < 3 || plan.Rect.Height / targetCount < 3)
+            {
+                plan.Note = "target button is not a nonempty normal/hot/pressed/disabled strip";
+                return;
+            }
+            var sprite = new ArgbImage(plan.Rect.Width, plan.Rect.Height);
+            var margins = new Margins[targetCount];
+            bool inactive = plan.Part.Name.IndexOf("INACTIVE", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool anyEmbedded = false;
+            for (int i = 0; i < targetCount; ++i)
+            {
+                int state = i + 1 + (inactive ? 4 : 0);
+                int count = EffectiveCount(m_imp.Source.Style, window, sourcePart, state);
+                int top = i * plan.Rect.Height / targetCount, height = (i + 1) * plan.Rect.Height / targetCount - top;
+                int glyphType = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.GLYPHTYPE)?.GetValue() is int sourceGlyphType ? sourceGlyphType : 0;
+                if (glyphType == 2)
+                {
+                    plan.Note = "source uses a font glyph, not bitmap artwork; no source pixels exist to transfer into the compositor atlas";
+                    return;
+                }
+                bool imageGlyph = glyphType == 1;
+                var glyphProperty = imageGlyph ? SelectXpGlyph(window, sourcePart, state, plan.Part.Name, plan.Rect.Width - 2, height - 2) : null;
+                var faceProperty = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.IMAGEFILE);
+                bool embedded = glyphProperty == null;
+                anyEmbedded |= embedded;
+                // A single painted XP button has no separate face. Put its complete artwork on
+                // the glyph layer, and make the corresponding background transparent.
+                var property = plan.Glyph ? glyphProperty ?? faceProperty : embedded ? null : faceProperty;
+                if (property == null && !plan.Glyph && embedded)
+                {
+                    margins[i] = new Margins(0, 0, 0, 0);
+                    continue;
+                }
+                if (!(property?.GetValue() is int imageId)) { plan.Note = "source caption-button picture is absent"; return; }
+                if (KeyPattern.Matches(m_imp.Options.Exclude, "Window", plan.SourcePart, SemanticModel.PropertyName(property.Header.nameID)))
+                {
+                    plan.Note = "source caption-button artwork excluded by rule";
+                    return;
+                }
+                var source = m_imp.Decoded(m_imp.Source, "IMAGE", imageId & 0xFFFF);
+                bool horizontal = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int layout ? layout == 1 : true;
+                var frame = CutXpButtonFrame(source, count, horizontal, i, inactive);
+                if (frame == null) { plan.Note = "source caption-button strip does not describe 1, 4 or 8 semantic states"; return; }
+                ApplyXpColorKey(frame, window, sourcePart, state, plan.Glyph && !embedded);
+                ArgbImage rendered;
+                if (plan.Glyph)
+                {
+                    rendered = PadXpGlyph(frame, plan.Rect.Width, height);
+                    margins[i] = new Margins(0, 0, 0, 0);
+                }
+                else
+                {
+                    bool tile = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.SIZINGTYPE)?.GetValue() is int sizing && sizing == 2;
+                    rendered = SynthesizeXpFrameStrip(frame, 1, false, plan.Rect.Width, height, 1,
+                        EffectiveSizing(m_imp.Source.Style, window, sourcePart, state), tile, out margins[i]);
+                }
+                sprite.Blit(rendered, 0, top);
+            }
+            plan.Sprite = sprite;
+            plan.Margins = margins;
+            plan.Note = plan.Glyph
+                ? (anyEmbedded ? "complete single-layer XP button fitted to the target glyph slot; source has no separate glyph layer" : "XP glyph size selected from its own image set, centered into target glyph slot; shared DWM glyph strip uses XP active states")
+                : (anyEmbedded ? "transparent background for a single-layer XP button carried by its glyph" : "XP button face: normal/hot/pressed/disabled, " + (inactive ? "inactive states 5-8" : "active states 1-4") + "; source nine-grid margins retained where they fit");
+            if (plan.Glyph) ReportInactiveGlyphDifference(window, sourcePart, plan.SourcePart);
+        }
+
+        private StyleProperty SelectXpGlyph(StyleClass window, int part, int state, string targetName, int width, int height)
+        {
+            int select = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int s ? s : 0;
+            if (select == 0) return SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, IDENTIFIER.GLYPHIMAGEFILE);
+            int dpi = targetName.Contains("192") ? 192 : targetName.Contains("144") ? 144 : targetName.Contains("120") ? 120 : 96;
+            StyleProperty selected = null;
+            int best = -1;
+            for (int i = 0; i < 5; ++i)
+            {
+                var property = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, (IDENTIFIER)((int)IDENTIFIER.IMAGEFILE1 + i));
+                if (!(property?.GetValue() is int id)) continue;
+                var picture = m_imp.Decoded(m_imp.Source, "IMAGE", id & 0xFFFF);
+                if (picture == null) continue;
+                int count = EffectiveCount(m_imp.Source.Style, window, part, state);
+                bool horizontal = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int layout ? layout == 1 : true;
+                int w = picture.Width / (horizontal ? count : 1), h = picture.Height / (horizontal ? 1 : count);
+                if (w < 1 || h < 1) continue;
+                if (selected == null) selected = property; // XP falls back to its first available size.
+                if (select == 2)
+                {
+                    int threshold = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, (IDENTIFIER)((int)IDENTIFIER.MINDPI1 + i))?.GetValue() is int d ? d : 96;
+                    if (threshold <= dpi && threshold >= best) { best = threshold; selected = property; }
+                }
+                else
+                {
+                    var minimum = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, (IDENTIFIER)((int)IDENTIFIER.MINSIZE1 + i))?.GetValue();
+                    int mw = minimum is Size size ? size.Width : w, mh = minimum is Size size2 ? size2.Height : h;
+                    int area = w * h;
+                    if (mw <= width && mh <= height && area >= best) { best = area; selected = property; }
+                }
+            }
+            return selected;
+        }
+
+        internal static ArgbImage CutXpButtonFrame(ArgbImage source, int count, bool horizontal, int stateIndex, bool inactive)
+        {
+            if (source == null || (count != 1 && count != 4 && count != 8) || stateIndex < 0 || stateIndex >= 4) return null;
+            int index = count == 1 ? 0 : stateIndex + (inactive && count == 8 ? 4 : 0);
+            int w = source.Width / (horizontal ? count : 1), h = source.Height / (horizontal ? 1 : count);
+            return w < 1 || h < 1 ? null : source.Crop(new Rectangle(horizontal ? index * w : 0, horizontal ? 0 : index * h, w, h));
+        }
+
+        internal static ArgbImage PadXpGlyph(ArgbImage glyph, int width, int height)
+        {
+            if (glyph == null || glyph.Width < 1 || glyph.Height < 1 || width < 3 || height < 3) return null;
+            int roomW = width - 2, roomH = height - 2;
+            int w = glyph.Width, h = glyph.Height;
+            if (w > roomW || h > roomH)
+            {
+                // Never stretch glyphs up: XP chooses native glyph sizes. Only shrink a glyph
+                // when the target atlas slot cannot contain the smallest authored size.
+                if ((long)w * roomH > (long)h * roomW) { h = Math.Max(1, (int)((long)h * roomW / w)); w = roomW; }
+                else { w = Math.Max(1, (int)((long)w * roomH / h)); h = roomH; }
+            }
+            int left = 1 + (roomW - w) / 2, top = 1 + (roomH - h) / 2;
+            var output = new ArgbImage(width, height);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    output.Pixels[(top + y) * width + left + x] = glyph.Pixels[(int)((long)y * glyph.Height / h) * glyph.Width + (int)((long)x * glyph.Width / w)];
+            // Duplicate edges of the interior, as for frame sprites, without introducing a
+            // second glyph or an opaque colored fringe in the compositor's inset pixels.
+            for (int y = 1; y < height - 1; ++y) { output.Pixels[y * width] = output.Pixels[y * width + 1]; output.Pixels[y * width + width - 1] = output.Pixels[y * width + width - 2]; }
+            Array.Copy(output.Pixels, width, output.Pixels, 0, width);
+            Array.Copy(output.Pixels, (height - 2) * width, output.Pixels, (height - 1) * width, width);
+            return output;
+        }
+
+        private readonly HashSet<string> m_inactiveGlyphNotes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private void ReportInactiveGlyphDifference(StyleClass window, int part, string name)
+        {
+            if (!m_inactiveGlyphNotes.Add(name)) return;
+            for (int i = 0; i < 4; ++i)
+            {
+                var property = SelectXpGlyph(window, part, i + 1, "96", 4096, 4096)
+                    ?? SemanticModel.FindEffective(m_imp.Source.Style, window, part, i + 1, IDENTIFIER.IMAGEFILE);
+                if (!(property?.GetValue() is int id)) continue;
+                var picture = m_imp.Decoded(m_imp.Source, "IMAGE", id & 0xFFFF);
+                int count = EffectiveCount(m_imp.Source.Style, window, part, i + 1);
+                bool horizontal = SemanticModel.FindEffective(m_imp.Source.Style, window, part, i + 1, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int layout ? layout == 1 : true;
+                var active = CutXpButtonFrame(picture, count, horizontal, i, false);
+                var inactive = CutXpButtonFrame(picture, count, horizontal, i, true);
+                if (active == null || inactive == null || Win7StyleImporter.NearlyEqual(active, inactive, 0)) continue;
+                m_imp.Report.Notes.Add($"DWMWindow Window|{name}: XP inactive glyph pixels differ from active pixels; the target exposes one shared four-state glyph strip, so it carries active glyphs while separate inactive background parts carry inactive faces.");
+                return;
+            }
+        }
+
+        private void ReportSharedXpFaces(StyleClass window, IReadOnlyDictionary<int, string> names)
+        {
+            int sharedPart = names.Where(n => n.Value == "MINBUTTON").Select(n => n.Key).DefaultIfEmpty(-1).First();
+            if (sharedPart < 0) return;
+            foreach (var other in names.Where(n => n.Value == "MAXBUTTON" || n.Value == "RESTOREBUTTON" || n.Value == "HELPBUTTON"))
+            {
+                if (!window.Parts.ContainsKey(other.Key)) continue;
+                for (int state = 1; state <= 8; ++state)
+                {
+                    var shared = XpFaceFrame(window, sharedPart, state);
+                    var picture = XpFaceFrame(window, other.Key, state);
+                    if (shared == null || picture == null || Win7StyleImporter.NearlyEqual(shared, picture, 0)) continue;
+                    m_imp.Report.Notes.Add($"DWMWindow Window|{other.Value}: source button face differs from MINBUTTON in state {state}; the target exposes one shared caption-button background, so its face uses MINBUTTON while its own glyph is imported separately.");
+                    break;
+                }
+            }
+        }
+
+        private ArgbImage XpFaceFrame(StyleClass window, int part, int state)
+        {
+            var property = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, IDENTIFIER.IMAGEFILE);
+            if (!(property?.GetValue() is int id)) return null;
+            int count = EffectiveCount(m_imp.Source.Style, window, part, state);
+            bool horizontal = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int layout ? layout == 1 : true;
+            return CutXpButtonFrame(m_imp.Decoded(m_imp.Source, "IMAGE", id & 0xFFFF), count, horizontal, (state - 1) % 4, state > 4);
+        }
+
+        private void ApplyXpColorKey(ArgbImage frame, StyleClass window, int part, int state, bool glyph = false)
+        {
+            if (!(SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, glyph ? IDENTIFIER.GLYPHTRANSPARENT : IDENTIFIER.TRANSPARENT_)?.GetValue() is bool transparent) || !transparent) return;
+            // Alpha art already carries transparency; XP's color key applies to opaque bitmaps.
+            if (frame.Pixels.Any(p => (p >> 24) != 255)) return;
+            var key = SemanticModel.FindEffective(m_imp.Source.Style, window, part, state, glyph ? IDENTIFIER.GLYPHTRANSPARENTCOLOR : IDENTIFIER.TRANSPARENTCOLOR)?.GetValue() is Color c ? c : Color.Magenta;
+            uint rgb = (uint)key.ToArgb() & 0xFFFFFF;
+            for (int i = 0; i < frame.Pixels.Length; ++i)
+                if ((frame.Pixels[i] & 0xFFFFFF) == rgb) frame.Pixels[i] = 0;
+        }
+
+        private void PutXpProperty(StyleClass cls, PartData part, int state, IDENTIFIER name, IDENTIFIER type, object value)
+        {
+            string propertyName = SemanticModel.PropertyName((int)name);
+            if (KeyPattern.Matches(m_imp.Options.Exclude, Win7StyleImporter.DwmClass, part.Name, propertyName)) return;
+            var targetPart = cls.Parts[part.Id];
+            if (!targetPart.States.TryGetValue(state, out var targetState))
+            {
+                targetState = new StyleState { StateId = state, StateName = "State " + state };
+                targetPart.States.Add(state, targetState);
+            }
+            var properties = targetState.Properties.Where(p => p.Header.nameID == (int)name && p.Header.typeID == (int)type).ToList();
+            if (properties.Count == 0)
+            {
+                var property = new StyleProperty(new PropertyHeader((int)name, (int)type) { classID = cls.ClassId, partID = part.Id, stateID = state });
+                targetState.Properties.Add(property);
+                properties.Add(property);
+                m_imp.AddedRecords.Add($"{cls.ClassId}/{part.Id}/{state}/{(int)name}/{(int)type}");
+            }
+            foreach (var property in properties)
+            {
+                if (Equals(property.GetValue(), value)) continue;
+                property.SetValue(value);
+                m_imp.MarkTouched(property, $"DWMWindow|{part.Name}|S{state}|{propertyName}");
+                m_imp.Report.Decisions.Add(new MergeDecision { Class = Win7StyleImporter.DwmClass, Part = part.Name, State = state,
+                    Property = propertyName, Action = "applied-xp-frame-property", Reason = "describes the synthesized XP frame rather than the template's glass sprite", Result = SemanticModel.FormatValue(property) });
+                m_imp.Report.Count("applied-xp-frame-property");
+            }
+        }
+
+        /// <summary>Rasterizes XP frame states into unchanged DWM packing. Each vertical target
+        /// frame includes a duplicated 1px border consumed by uDWM; margins describe its interior.
+        /// Integer division matches XP's strip cut (unused remainder rows/columns stay unused).
+        /// </summary>
+        internal static ArgbImage SynthesizeXpFrameStrip(ArgbImage source, int sourceCount, bool sourceHorizontal,
+            int targetWidth, int targetHeight, int targetCount, Margins sourceMargins, bool tile, out Margins outputMargins)
+        {
+            outputMargins = null;
+            if (source == null || sourceCount < 1 || sourceCount > 2 || targetCount < 1 || targetCount > 2
+                || targetWidth < 3 || targetHeight / targetCount < 3) return null;
+            int sw = source.Width / (sourceHorizontal ? sourceCount : 1), sh = source.Height / (sourceHorizontal ? 1 : sourceCount);
+            if (sw < 1 || sh < 1) return null;
+            var sm = FitXpMargins(sourceMargins, sw, sh);
+            outputMargins = FitXpMargins(sm, targetWidth - 2, targetHeight / targetCount - 2);
+            var result = new ArgbImage(targetWidth, targetHeight);
+            for (int frame = 0; frame < targetCount; ++frame)
+            {
+                int index = Math.Min(frame, sourceCount - 1);
+                int sx = sourceHorizontal ? index * sw : 0, sy = sourceHorizontal ? 0 : index * sh;
+                int top = frame * targetHeight / targetCount, bottom = (frame + 1) * targetHeight / targetCount;
+                int dw = targetWidth - 2, dh = bottom - top - 2;
+                for (int y = 0; y < bottom - top; ++y)
+                {
+                    int iy = Math.Max(0, Math.Min(dh - 1, y - 1));
+                    int py = MapXpAxis(iy, sh, sm.Top, sm.Bottom, dh, outputMargins.Top, outputMargins.Bottom, tile);
+                    for (int x = 0; x < targetWidth; ++x)
+                    {
+                        int ix = Math.Max(0, Math.Min(dw - 1, x - 1));
+                        int px = MapXpAxis(ix, sw, sm.Left, sm.Right, dw, outputMargins.Left, outputMargins.Right, tile);
+                        result.Pixels[(top + y) * targetWidth + x] = source.Pixels[(sy + py) * source.Width + sx + px];
+                    }
+                }
+            }
+            return result;
+        }
+
+        private static Margins FitXpMargins(Margins margins, int width, int height)
+        {
+            FitXpAxis(Math.Max(0, margins?.Left ?? 0), Math.Max(0, margins?.Right ?? 0), width, out int l, out int r);
+            FitXpAxis(Math.Max(0, margins?.Top ?? 0), Math.Max(0, margins?.Bottom ?? 0), height, out int t, out int b);
+            return new Margins(l, t, r, b);
+        }
+
+        private static void FitXpAxis(int first, int second, int extent, out int a, out int b)
+        {
+            long sum = (long)first + second;
+            if (sum < extent) { a = first; b = second; return; }
+            int room = Math.Max(0, extent - 1);
+            a = sum == 0 ? 0 : (int)(first * (long)room / sum);
+            b = room - a;
+        }
+
+        private static int MapXpAxis(int position, int sourceExtent, int sourceFirst, int sourceLast,
+            int targetExtent, int targetFirst, int targetLast, bool tile)
+        {
+            if (position < targetFirst) return (int)((long)position * sourceFirst / targetFirst);
+            if (position >= targetExtent - targetLast)
+                return sourceExtent - sourceLast + (int)((long)(position - targetExtent + targetLast) * sourceLast / targetLast);
+            int sourceBody = sourceExtent - sourceFirst - sourceLast;
+            int p = position - targetFirst;
+            return sourceFirst + (tile ? p % sourceBody : (int)((long)p * sourceBody / (targetExtent - targetFirst - targetLast)));
         }
 
         /// <summary>
@@ -359,6 +865,11 @@ namespace libmsstyle.Import
                 plan.Note = $"source rect {plan.SourceRect} is outside the source atlas";
                 plan.Src = null;
             }
+        }
+
+        private static bool InsideAtlas(ArgbImage image, Rectangle rect)
+        {
+            return rect.X >= 0 && rect.Y >= 0 && rect.Width > 0 && rect.Height > 0 && rect.Right <= image.Width && rect.Bottom <= image.Height;
         }
 
         private static ArgbImage SafeCrop(ArgbImage img, Rectangle r)
@@ -534,7 +1045,8 @@ namespace libmsstyle.Import
                 {
                     newRect = slots[p.TargetRect];
                     expected = tAtlas.Crop(p.TargetRect);
-                    m_rep.FallbackParts.Add(p.Part.Name);
+                    // one entry per part: a part with two falling-back states is still one kept part.
+                    if (!m_rep.FallbackParts.Contains(p.Part.Name)) m_rep.FallbackParts.Add(p.Part.Name);
                 }
                 else
                 {

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 namespace libmsstyle.Import
 {
@@ -12,8 +13,8 @@ namespace libmsstyle.Import
     /// Three inputs: the custom style (source), stock win7 aero (base, the common ancestor) and
     /// the win10 template. Only what the source changed relative to the base is carried over, and
     /// only where the template still has the stock value. Everything the template adapted for
-    /// win10 stays. The output is a modified copy of the template file: class map, base class map,
-    /// animation map and every unrelated resource are left byte for byte.
+    /// win10 stays except for documented XP appearance-role mappings. Existing class IDs and
+    /// registration parents are preserved when supported source classes are appended.
     /// </summary>
     public class Win7StyleImporter
     {
@@ -26,8 +27,15 @@ namespace libmsstyle.Import
         private readonly Dictionary<string, ArgbImage> m_decoded = new Dictionary<string, ArgbImage>();
         // properties already rewritten, so the generic pass can't touch DWM records twice.
         private readonly HashSet<StyleProperty> m_touched = new HashSet<StyleProperty>();
+        // source IMAGE id -> template IMAGE ids it was placed as, to follow pictures across slot translations.
+        private readonly Dictionary<int, HashSet<int>> m_sourceImageTargets = new Dictionary<int, HashSet<int>>();
         // band pictures already reported as rebuilt, one note per source picture instead of per record.
         private readonly HashSet<string> m_bandStripsNoted = new HashSet<string>(StringComparer.Ordinal);
+        // target class/part/state whose band picture was rebuilt -> the template margins that picture was laid out
+        // with. The source's own margins describe the 1 pixel column that no longer exists and are put back below.
+        private readonly Dictionary<string, Margins> m_bandMargins = new Dictionary<string, Margins>(StringComparer.Ordinal);
+        private readonly Dictionary<int, string> m_appendedClasses = new Dictionary<int, string>();
+        private readonly Dictionary<string, byte[]> m_rewrittenMaps = new Dictionary<string, byte[]>();
 
         internal List<SpriteExpectation> SpriteChecks { get; } = new List<SpriteExpectation>();
         internal Dictionary<StyleProperty, string> ChangedProperties { get; } = new Dictionary<StyleProperty, string>();
@@ -94,6 +102,7 @@ namespace libmsstyle.Import
                             return Tuple.Create(e.Type, id, multiLang.Contains(e.Type + "/" + e.Name) ? null : e.Sha1);
                         }));
 
+                    if (xp) AppendExplorerToolbar();
                     CompareClasses();
                     BuildThreeWayDiff();
                     new DwmImport(this).Run();
@@ -102,6 +111,9 @@ namespace libmsstyle.Import
                     MergeGenericClasses();
                     shell?.Run();
                     m_headerMargins = shell?.HeaderContentMargins();
+                    m_headerFonts = shell?.HeaderFontRecords;
+                    m_taskFonts = shell?.TaskFontRecords;
+                    m_auxiliaryFonts = shell?.AuxiliaryFontRecords;
                     m_hoverRecords = shell?.HoverRecords;
                     m_paneRecord = shell?.PaneRecord;
                     m_watermarkRecord = shell?.Watermarks;
@@ -127,12 +139,15 @@ namespace libmsstyle.Import
                     candidate = Path.Combine(m_validationDir, name);
                     // added font strings only reach the file through the standalone path, which
                     // writes the string tables into the .msstyles (and drops a .mui link, if any).
+                    r.FinalizeResults(target);
                     target.Save(candidate, StringsAdded);
+                    if (m_appendedClasses.Count > 0)
+                        RewriteAppendedClassMaps(candidate, targetInv, target);
                     StyleCompanions.CopyAlongside(CompanionSource, candidate);
                 }
 
                 r.Validation = new StyleValidator(m_opt.TemplatePath, candidate, m_alloc.Added, SpriteChecks, ChangedProperties.Values.ToList(),
-                    StringsAdded, GeometryWaivers, AddedRecords, FrameWaivers, RemovedRecords).Validate();
+                    StringsAdded, GeometryWaivers, AddedRecords, FrameWaivers, RemovedRecords, m_appendedClasses, m_rewrittenMaps).Validate();
                 foreach (var e in r.Validation.Errors) r.Errors.Add("validation: " + e);
                 foreach (var w in r.Validation.Warnings) r.Warnings.Add("validation: " + w);
                 return Finish(candidate);
@@ -149,6 +164,9 @@ namespace libmsstyle.Import
         private XpShellStyle m_srcShell, m_baseShell;
         // the port's ExplorerBar header CONTENTMARGINS (true = main section), for the shellstyle layout patch.
         private Dictionary<bool, Margins> m_headerMargins;
+        private Dictionary<bool, (int Part, int State)> m_headerFonts;
+        private Dictionary<bool, (int Part, int State)> m_taskFonts;
+        private Dictionary<string, string> m_auxiliaryFonts;
         // ExplorerBar records holding the source's task hover picture (true = main section), for the same patch.
         private Dictionary<bool, (int Part, int State)> m_hoverRecords;
         // ExplorerBar record holding the source's task pane background picture, for the same patch.
@@ -207,23 +225,30 @@ namespace libmsstyle.Import
             return d;
         }
 
-        /// <summary>the copied win10 shellstyle (Shell\NormalColor, the only folder the .theme names) gets the source's bitmaps.</summary>
+        /// <summary>the copied win10 shellstyle (the Shell\&lt;color&gt; folder the style actually ships) gets the source's bitmaps.</summary>
         private void PatchShellBitmaps()
         {
             if (m_srcShell == null) return;
-            string target = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(m_opt.OutputPath)), "Shell", "NormalColor", "shellstyle.dll");
-            if (!File.Exists(target)) return;
+            string shellDir = StyleCompanions.FindShellFolder(Path.GetDirectoryName(Path.GetFullPath(m_opt.OutputPath)));
+            if (shellDir == null)
+            {
+                m_report.Errors.Add("shellstyle: the ported style has no Shell\\<color>\\shellstyle.dll, so the source's shell bitmaps could not be applied");
+                m_report.Status = ImportStatus.Blocked;
+                return;
+            }
+            string target = Path.Combine(shellDir, "shellstyle.dll");
             try
             {
                 var ids = XpShellImport.PatchShellStyleBitmaps(target, m_srcShell, m_baseShell, false);
+                string folder = Path.GetFileName(shellDir);
                 if (ids.Count > 0)
-                    m_report.Notes.Add($"shellstyle: replaced bitmaps {string.Join(", ", ids)} in Shell\\NormalColor\\shellstyle.dll with the source shellstyle's.");
+                    m_report.Notes.Add($"shellstyle: replaced bitmaps {string.Join(", ", ids)} in Shell\\{folder}\\shellstyle.dll with the source shellstyle's.");
                 else
                     m_report.Notes.Add("shellstyle: " + ShellIdentity(m_srcShell, m_baseShell)
-                        + "; nothing to replace, so Shell\\NormalColor keeps the port's own bitmaps, which are that same stock art transcribed for win10.");
+                        + $"; nothing to replace, so Shell\\{folder} keeps the port's own bitmaps, which are that same stock art transcribed for win10.");
                 m_report.Count("shellstyle-bitmaps-replaced", ids.Count);
                 m_report.AddNoteIfAny("shellstyle: {0} ExplorerBar records follow the source shellstyle. The win10 task pane is drawn from msstyles ExplorerBar records, and the port transcribed stock xp's shellstyle into them; where the source shellstyle resolves to that stock art the template's transcription stays.", "restored-shellstyle");
-                var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, m_paneRecord, m_watermarkRecord, false, m_opt.TaskBand, m_noSectionIcons);
+                var (notes, warnings) = XpShellImport.PatchShellStyleLayout(target, m_srcShell, m_baseShell, m_headerMargins, m_hoverRecords, m_paneRecord, m_watermarkRecord, false, m_opt.TaskBand, m_noSectionIcons, headerFonts: m_headerFonts, taskFonts: m_taskFonts, auxiliaryFonts: m_auxiliaryFonts);
                 m_report.Notes.AddRange(notes);
                 m_report.Warnings.AddRange(warnings);
             }
@@ -273,7 +298,8 @@ namespace libmsstyle.Import
                 }
                 catch (Exception ex)
                 {
-                    r.Warnings.Add("couldn't copy the Shell / language folders next to the candidate: " + ex.Message);
+                    r.Errors.Add("couldn't copy the Shell / language folders next to the candidate: " + ex.Message);
+                    r.Status = ImportStatus.Blocked;
                 }
             }
             if (m_validationDir != null)
@@ -466,7 +492,10 @@ namespace libmsstyle.Import
             }
             foreach (var dup in m_target.DuplicateClassNames)
             {
-                m_report.Warnings.Add($"template has class \"{dup}\" more than once; only the first is addressed by name.");
+                bool templateOnly = !m_source.ClassesByName.ContainsKey(dup) && !m_base.ClassesByName.ContainsKey(dup);
+                m_report.Notes.Add(templateOnly
+                    ? $"template-only duplicate class \"{dup}\" has no source or base counterpart; all instances retain their template records."
+                    : $"duplicate class \"{dup}\" is merged by instance; template-only instances retain their records.");
             }
 
             foreach (var kv in m_base.ClassesByName)
@@ -479,6 +508,98 @@ namespace libmsstyle.Import
                 if (!string.Equals(b, s, StringComparison.OrdinalIgnoreCase))
                     m_report.Warnings.Add($"source changed the base class of {kv.Key} from \"{b ?? "-"}\" to \"{s ?? "-"}\"; inheritance changes aren't imported.");
             }
+        }
+
+        internal static List<int> RegistrationOrder(VisualStyle style)
+        {
+            var result = style.Classes.Values.OrderBy(c => c.ClassId)
+                .Where(c => c.Parts.Values.Any(p => p.States.Values.Any(st => st.Properties.Count > 0)))
+                .Select(c => c.ClassId).ToList();
+            var seen = new HashSet<int>(result);
+            foreach (var timing in style.TimingFunctions)
+                if (seen.Add(timing.Header.classID)) result.Add(timing.Header.classID);
+            foreach (var animation in style.Animations)
+                if (seen.Add(animation.Header.classID)) result.Add(animation.Header.classID);
+            return result;
+        }
+
+        private void AppendExplorerToolbar()
+        {
+            const string name = "ExplorerBar::Toolbar";
+            if (m_target.ClassesByName.ContainsKey(name) || !m_source.ClassesByName.ContainsKey(name)) return;
+            int id = m_target.Style.Classes.Keys.Max() + 1;
+            var cls = new StyleClass { ClassId = id, ClassName = name };
+            if (m_target.ClassesByName.TryGetValue("Toolbar", out var parent)) cls.BaseClassId = parent.ClassId;
+            m_target.Style.Classes.Add(id, cls);
+            m_target.ClassesByName.Add(name, cls);
+            m_appendedClasses.Add(id, name);
+            m_target.Style.MarkClassmapDirty();
+            m_report.Notes.Add($"appended {name} as CMAP class {id}; existing class IDs stay unchanged and BCMAP registration parents are remapped at save.");
+        }
+
+        private void RewriteAppendedClassMaps(string candidate, ResourceInventory inventory, VisualStyle target)
+        {
+            foreach (var entry in inventory.Entries.Where(e => e.Type == "CMAP" || e.Type == "BCMAP"))
+            {
+                byte[] data;
+                if (entry.Type == "CMAP")
+                {
+                    using (var stream = new MemoryStream())
+                    {
+                        var original = inventory.GetData(entry);
+                        stream.Write(original, 0, original.Length);
+                        foreach (var cls in m_appendedClasses.OrderBy(c => c.Key))
+                        {
+                            while (stream.Length % 8 != 0) stream.WriteByte(0);
+                            var text = System.Text.Encoding.Unicode.GetBytes(cls.Value + "\0");
+                            stream.Write(text, 0, text.Length);
+                        }
+                        data = stream.ToArray();
+                    }
+                }
+                else
+                {
+                    var original = inventory.GetData(entry);
+                    int count = original.Length >= 4 ? BitConverter.ToInt32(original, 0) : -1;
+                    if (count < 0 || 4L + count * 4L > original.Length)
+                        throw new InvalidDataException("cannot append a class: BCMAP is not a counted registration map");
+                    // uxtheme indexes BCMAP entries by classmap position (class id minus the special-class
+                    // count), not by registration order: the loader pairs CMAP name i with BCMAP entry i.
+                    // Save() appends the new names at the end of the CMAP, so their slots are simply the
+                    // original count onward, and every original entry keeps its original slot. Permuting by
+                    // registration order lands the parent on a different class (SevenVG: the appended
+                    // ExplorerBar::Toolbar's parent hit ItemsViewAccessible::Header and the base was lost).
+                    int[] parents = new int[count + m_appendedClasses.Count];
+                    for (int i = 0; i < count; ++i) parents[i] = BitConverter.ToInt32(original, 4 + i * 4);
+                    int slot = count;
+                    foreach (var cls in m_appendedClasses.OrderBy(c => c.Key))
+                    {
+                        int parent = target.Classes[cls.Key].BaseClassId;
+                        parents[slot++] = parent >= 0 && parent < count ? BitConverter.ToInt32(original, 4 + parent * 4) : -1;
+                    }
+                    using (var stream = new MemoryStream())
+                    using (var writer = new BinaryWriter(stream))
+                    {
+                        writer.Write(parents.Length);
+                        foreach (int parent in parents) writer.Write(parent);
+                        writer.Write(original, 4 + count * 4, original.Length - 4 - count * 4);
+                        data = stream.ToArray();
+                    }
+                }
+                m_rewrittenMaps.Add(entry.Key, data);
+            }
+            if (!m_rewrittenMaps.Keys.Any(k => k.StartsWith("BCMAP/", StringComparison.Ordinal)))
+                throw new InvalidDataException("cannot append a class without BCMAP");
+            IntPtr handle = Win32Api.BeginUpdateResource(candidate, false);
+            if (handle == IntPtr.Zero) throw new IOException("cannot update appended class maps");
+            bool ok = true;
+            foreach (var entry in inventory.Entries.Where(e => m_rewrittenMaps.ContainsKey(e.Key)))
+            {
+                var bytes = m_rewrittenMaps[entry.Key];
+                ok = ok && Win32Api.UpdateResource(handle, entry.Type, entry.Name, entry.Language, bytes, (uint)bytes.Length);
+            }
+            if (!Win32Api.EndUpdateResource(handle, !ok) || !ok) throw new IOException("cannot save appended class maps");
+            Signature.AppendSignature(candidate, VisualStyle.PackthemSignature);
         }
 
         private static string BaseName(SemanticModel m, StyleClass c)
@@ -501,17 +622,25 @@ namespace libmsstyle.Import
                 m_source.ByKey.TryGetValue(key, out var s);
                 var any = s ?? b;
                 if (string.Equals(any.ClassName, DwmClass, StringComparison.OrdinalIgnoreCase)) continue;
-                if (m_target.DuplicateClassNames.Contains(any.ClassName)) 
+                if (m_target.DuplicateClassNames.Contains(any.ClassName))
                 {
-                    if (s != null && b != null && !Same(m_base, b, m_source, s))
-                        Decide(any, "skipped-ambiguous-class", "class name occurs more than once in the template", b, s, null, null);
+                    foreach (var instance in m_target.Style.Classes.Values.Where(c => c.ClassName.Equals(any.ClassName, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        var entry = m_target.Entries.FirstOrDefault(e => e.ClassId == instance.ClassId && e.PartName == any.PartName
+                            && e.StateId == any.StateId && e.NameId == any.NameId && e.TypeId == any.TypeId && e.Occurrence == any.Occurrence);
+                        if (entry != null)
+                            ThreeWay(any.ClassName, any.PartName, any.StateId, any.PropertyName, b, s, entry, m_source, any.PartNameKnown);
+                    }
                     continue;
                 }
                 m_target.ByKey.TryGetValue(key, out var a);
-                if (a != null && b != null && s != null && GeometryIds.Contains(any.NameId) && locked.TryGetValue(any.PartKey, out string why)
-                    && !Same(m_base, b, m_source, s) && !Same(m_source, s, m_target, a))
+                if (a != null && locked.TryGetValue(any.PartKey, out string why)
+                    && ((m_report.UnmappedStripParts.Contains(any.ClassName + "|" + a.PartId)
+                            && (any.ResourceType == "IMAGE" || GeometryIds.Contains(any.NameId)))
+                        || (GeometryIds.Contains(any.NameId) && b != null && s != null
+                            && !Same(m_base, b, m_source, s) && !Same(m_source, s, m_target, a))))
                 {
-                    Decide(s, "kept-target", why, b, s, a, null);
+                    Decide(any, "kept-target", why, b, s, a, null);
                     m_report.Count("kept-target-geometry-group");
                     continue;
                 }
@@ -526,18 +655,34 @@ namespace libmsstyle.Import
             if (m_source.Platform == Platform.WinXP) FillFlatFromXp();
             if (m_source.Platform == Platform.WinXP) SingleImageIntoDpiSlots();
             if (m_source.Platform == Platform.WinXP) GlyphSizeSlotsFromXp();
+            if (m_source.Platform == Platform.WinXP) DpiThresholdSlotsFromXp();
             if (m_source.Platform == Platform.WinXP) ThemeWholeClientEdge();
             if (m_source.Platform == Platform.WinXP) OpaqueSpinBackgrounds();
             if (m_source.Platform == Platform.WinXP) MenuColorsFromXp();
             if (m_source.Platform == Platform.WinXP) TransparentForTrueAlpha();
             if (m_source.Platform == Platform.WinXP) SizingTypeFromXp();
+            if (m_source.Platform == Platform.WinXP) BandMarginsForRebuiltPictures();
+            if (m_source.Platform == Platform.WinXP) StartPanelCounterpartsFromXp();
+            if (m_source.Platform == Platform.WinXP) FillDpiSlots(locked);
             if (m_source.Platform == Platform.WinXP) DropGlyphlessXpButtonDpi();
             if (m_source.Platform == Platform.WinXP) CompositeXpComboButton();
             if (m_source.Platform == Platform.WinXP) DropXpComboPlate();
             if (m_source.Platform == Platform.WinXP) FrameXpCombo();
             if (m_source.Platform == Platform.WinXP) FillXpEditField();
-            if (m_source.Platform == Platform.WinXP) FitXpStartPanel();
+            if (m_source.Platform == Platform.WinXP) StartPanelSizesFromXp();
             if (m_source.Platform == Platform.WinXP) StretchXpMaxCaption();
+        }
+
+        /// <summary>
+        /// the xp part id a part name has in the xp schema (tmschema.h's &lt;class&gt;PARTS table), or -1 when the
+        /// class has no xp table or the name isn't a part of it. The win10 part map is keyed by name as well, but
+        /// its ids are win10's: a class whose xp and win10 numbering differ (Combobox, Edit, Menu) needs xp's.
+        /// </summary>
+        private static int XpPartId(string className, string partName)
+        {
+            if (string.IsNullOrEmpty(className) || string.IsNullOrEmpty(partName)) return -1;
+            if (!XpSchema.Enums.TryGetValue(className + "PARTS", out var parts)) return -1;
+            return parts.TryGetValue(partName, out int id) ? id : -1;
         }
 
         /// <summary>
@@ -557,45 +702,56 @@ namespace libmsstyle.Import
                 if (!m_source.ClassesByName.TryGetValue(tc.ClassName, out var sc)) continue;
 
                 var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
-                var snames = SemanticModel.PartNames(sc.ClassName, Platform.WinXP);
                 foreach (var tp in tc.Parts.Values)
                 {
                     if (!tnames.TryGetValue(tp.PartId, out string partName)) continue;
-                    int? spid = null;
-                    foreach (var kv in snames)
-                        if (string.Equals(kv.Value, partName, StringComparison.OrdinalIgnoreCase)) { spid = kv.Key; break; }
+                    int spid = XpPartId(sc.ClassName, partName);
                     // win10 mirrors a few button parts for right-to-left (Combobox DROPDOWNBUTTONRIGHT/LEFT); xp has
                     // the one part, and a style needn't declare the mirrored ids, so a part the source lacks falls
                     // back to the name it mirrors.
-                    if ((spid == null || !sc.Parts.ContainsKey(spid.Value))
+                    if ((spid < 0 || !sc.Parts.ContainsKey(spid))
                         && (partName.EndsWith("RIGHT", StringComparison.Ordinal) || partName.EndsWith("LEFT", StringComparison.Ordinal)))
                     {
                         string stem = partName.Substring(0, partName.Length - (partName.EndsWith("RIGHT", StringComparison.Ordinal) ? 5 : 4));
-                        foreach (var kv in snames)
-                            if (string.Equals(kv.Value, stem, StringComparison.OrdinalIgnoreCase) && sc.Parts.ContainsKey(kv.Key))
-                            { spid = kv.Key; break; }
+                        spid = XpPartId(sc.ClassName, stem);
                     }
-                    if (spid == null) continue;
+                    if (spid < 0) continue;
 
-                    if (!sc.Parts.TryGetValue(spid.Value, out var spart)) continue;
+                    if (!sc.Parts.TryGetValue(spid, out var spart)) continue;
                     foreach (var st in tp.States.Values)
                     {
-                        if (!spart.States.TryGetValue(st.StateId, out var sstate)) continue;
-                        var tSizing = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.SIZINGTYPE
-                            && p.Header.typeID == (int)IDENTIFIER.ENUM);
-                        if (tSizing == null) continue;
-                        bool sourceImage = sstate.Properties.Any(p => ImageNames.Contains((IDENTIFIER)p.Header.nameID)
-                            && VisualStyle.XpImageIds.Contains(p.Header.nameID));
-                        if (!sourceImage) continue;
-                        var sSizing = SemanticModel.FindEffective(m_source.Style, sc, spid.Value, st.StateId, IDENTIFIER.SIZINGTYPE);
-                        if (sSizing == null) continue;
-                        if (!(tSizing.GetValue() is int tv) || !(sSizing.GetValue() is int sv) || tv == sv) continue;
+                        if (!spart.States.ContainsKey(st.StateId)) continue;
+                        // xp draws the picture STRETCH unless SIZINGTYPE says otherwise (imagefile.cpp line 94);
+                        // an image glyph is always TRUESIZE there (line 213). The template's value may be inherited
+                        // or absent, in which case win10's own default (STRETCH) is the one being compared.
+                        bool glyph = SemanticModel.FindEffective(m_source.Style, sc, spid, st.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int gt && gt == 1;
+                        var sSizing = SemanticModel.FindEffective(m_source.Style, sc, spid, st.StateId, IDENTIFIER.SIZINGTYPE);
+                        int sv = sSizing?.GetValue() is int v ? v : glyph ? 0 : 1;
+                        // the target's own default: an image glyph is TRUESIZE there too (imagefile.cpp:213), so a
+                        // glyph part with no SIZINGTYPE record is already at the source's value.
+                        bool tglyph = SemanticModel.FindEffective(m_target.Style, tc, tp.PartId, st.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int tg && tg == 1;
+                        var tSizing = SemanticModel.FindEffective(m_target.Style, tc, tp.PartId, st.StateId, IDENTIFIER.SIZINGTYPE);
+                        int tv = tSizing?.GetValue() is int t ? t : tglyph ? 0 : 1;
+                        if (tv == sv) continue;
                         if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, "SIZINGTYPE")) continue;
-                        if (!PicturesFromSource(sc, tc, spid.Value, tp.PartId, st.StateId, imageCache)) continue;
-                        if (!MarginsFromSource(sc, tc, spid.Value, tp.PartId, st.StateId)) continue;
-
-                        tSizing.SetValue(sv);
-                        MarkTouched(tSizing, $"{tc.ClassName}|{partName}|S{st.StateId}|SIZINGTYPE");
+                        if (!PicturesFromSource(sc, tc, spid, tp.PartId, st.StateId, imageCache)) continue;
+                        if (!MarginsFromSource(sc, tc, spid, tp.PartId, st.StateId)) continue;
+                        if (tSizing == null)
+                        {
+                            var rec = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGTYPE, (int)IDENTIFIER.ENUM)
+                            {
+                                classID = tc.ClassId, partID = tp.PartId, stateID = st.StateId
+                            });
+                            rec.SetValue(sv);
+                            st.Properties.Add(rec);
+                            AddedRecords.Add($"{tc.ClassId}/{tp.PartId}/{st.StateId}/{(int)IDENTIFIER.SIZINGTYPE}/{(int)IDENTIFIER.ENUM}");
+                            MarkTouched(rec, $"{tc.ClassName}|{partName}|S{st.StateId}|SIZINGTYPE");
+                        }
+                        else
+                        {
+                            tSizing.SetValue(sv);
+                            MarkTouched(tSizing, $"{tc.ClassName}|{partName}|S{st.StateId}|SIZINGTYPE");
+                        }
                         m_report.Decisions.Add(new MergeDecision
                         {
                             Class = tc.ClassName,
@@ -627,9 +783,9 @@ namespace libmsstyle.Import
         {
             if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
                 || !m_source.ClassesByName.TryGetValue("Combobox", out var sc)) return;
-            int spid = -1;
-            foreach (var kv in SemanticModel.PartNames(sc.ClassName, Platform.WinXP))
-                if (string.Equals(kv.Value, "DROPDOWNBUTTON", StringComparison.OrdinalIgnoreCase)) { spid = kv.Key; break; }
+            // xp's Combobox has one part, DROPDOWNBUTTON (tmschema.h:1056-1058); the id comes from the xp schema,
+            // not from the win10 part map.
+            int spid = XpPartId(sc.ClassName, "DROPDOWNBUTTON");
             if (spid < 0) return;
             var glyph = SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.GLYPHIMAGEFILE);
             if (glyph != null)
@@ -674,17 +830,19 @@ namespace libmsstyle.Import
         /// draws. win10 has one picture and picks it from the dpi set (IMAGEFILE1-7), which the merge
         /// filled with the arrow alone - so the dropdown drew the arrow strip stretched across the whole
         /// button (the "detached grey square" in the control preview and the address bar). Copying the
-        /// arrow onto the face per state and pointing both IMAGEFILE and IMAGEFILE1-7 at the composite
-        /// gives win10 the picture xp drew.
+        /// arrow onto the face per state and pointing both IMAGEFILE and IMAGEFILE1-5 at the composite
+        /// gives win10 the picture xp drew. Every state is composited, because win10 draws hot and pressed
+        /// from the same part.
         /// </summary>
         private void CompositeXpComboButton()
         {
             if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
                 || !m_source.ClassesByName.TryGetValue("Combobox", out var sc)) return;
-            var srcNames = SemanticModel.PartNames(sc.ClassName, Platform.WinXP);
             var tgtNames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            // xp has MAX_IMAGEFILE_SIZES (5) numbered pictures (imagefile.h:8), so IMAGEFILE1-5 is the whole set
+            // the source can describe; the parent IMAGEFILE is the picture win10 draws when no slot applies.
             var slots = new[] { IDENTIFIER.IMAGEFILE, IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3,
-                                IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5, IDENTIFIER.IMAGEFILE6, IDENTIFIER.IMAGEFILE7 };
+                                IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5 };
 
             foreach (var tp in tc.Parts.Values)
             {
@@ -692,70 +850,100 @@ namespace libmsstyle.Import
                 if (!string.Equals(partName, "DROPDOWNBUTTON", StringComparison.OrdinalIgnoreCase)
                     && !string.Equals(partName, "DROPDOWNBUTTONRIGHT", StringComparison.OrdinalIgnoreCase)
                     && !string.Equals(partName, "DROPDOWNBUTTONLEFT", StringComparison.OrdinalIgnoreCase)) continue;
-                if (!tp.States.TryGetValue(0, out var first)) continue;
 
-                int spid = -1;
-                foreach (var kv in srcNames) if (string.Equals(kv.Value, partName, StringComparison.OrdinalIgnoreCase)) { spid = kv.Key; break; }
-                if (spid < 0 || !sc.Parts.TryGetValue(spid, out var sp) || !sp.States.TryGetValue(0, out var ss)) continue;
+                int spid = XpPartId(sc.ClassName, partName);
+                if (spid < 0 && (partName.EndsWith("RIGHT", StringComparison.Ordinal) || partName.EndsWith("LEFT", StringComparison.Ordinal)))
+                    spid = XpPartId(sc.ClassName, partName.Substring(0, partName.Length - (partName.EndsWith("RIGHT", StringComparison.Ordinal) ? 5 : 4)));
+                if (spid < 0 || !sc.Parts.TryGetValue(spid, out var sp)) continue;
 
-                var picProp = SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.IMAGEFILE);
-                var glyphProp = SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.GLYPHIMAGEFILE);
-                if (picProp == null || glyphProp == null) continue;
-                if (!(picProp.GetValue() is int picId) || !(glyphProp.GetValue() is int glyphId)) continue;
-
-                var picture = Decoded(m_source, "IMAGE", picId & 0xFFFF);
-                var glyph = Decoded(m_source, "IMAGE", glyphId & 0xFFFF);
-                if (picture == null || glyph == null) continue;
-
-                int count = 1;
-                if (SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.IMAGECOUNT)?.GetValue() is int c && c > 0) count = c;
-                int fw = picture.Width, fh = picture.Height;
-                bool picVertical = count > 1 && picture.Height % count == 0;
-                if (picVertical) fh = picture.Height / count;
-                else if (count > 1 && picture.Width % count == 0) fw = picture.Width / count;
-                if (fw <= 0 || fh <= 0) continue;
-
-                int gw = glyph.Width, gh = glyph.Height;
-                bool glyphVertical = count > 1 && glyph.Height % count == 0;
-                if (glyphVertical) gh = glyph.Height / count;
-                else if (count > 1 && glyph.Width % count == 0) gw = glyph.Width / count;
-                if (gw > fw || gh > fh) continue;
-
-                var composite = new ArgbImage(picture.Width, picture.Height);
-                bool any = false;
-                for (int i = 0; i < count; ++i)
+                foreach (var st in tp.States.Values)
                 {
-                    int sx = picVertical ? 0 : i * fw;
-                    int sy = picVertical ? i * fh : 0;
-                    if (sx + fw > picture.Width || sy + fh > picture.Height) continue;
-                    var frame = picture.Crop(new Rectangle(sx, sy, fw, fh));
-                    int gx = glyphVertical ? 0 : i * gw;
-                    int gy = glyphVertical ? i * gh : 0;
-                    if (gx + gw <= glyph.Width && gy + gh <= glyph.Height)
-                        frame.BlendOver(glyph.Crop(new Rectangle(gx, gy, gw, gh)), (fw - gw) / 2, (fh - gh) / 2);
-                    composite.Blit(frame, sx, sy);
-                    any = true;
+                    if (!sp.States.ContainsKey(st.StateId)) continue;
+                    var picProp = SemanticModel.FindEffective(m_source.Style, sc, spid, st.StateId, IDENTIFIER.IMAGEFILE);
+                    var glyphProp = SemanticModel.FindEffective(m_source.Style, sc, spid, st.StateId, IDENTIFIER.GLYPHIMAGEFILE);
+                    if (picProp == null || glyphProp == null) continue;
+                    if (!(picProp.GetValue() is int picId) || !(glyphProp.GetValue() is int glyphId)) continue;
+
+                    var picture = Decoded(m_source, "IMAGE", picId & 0xFFFF);
+                    var glyph = Decoded(m_source, "IMAGE", glyphId & 0xFFFF);
+                    if (picture == null || glyph == null) continue;
+                    // stock self-port: the source's face and arrow are the ones the template was ported from, so the
+                    // template's already-composited button is used as is and no resource is poured back in.
+                    if (m_base.ClassesByName.TryGetValue("Combobox", out var bc) && bc.Parts.TryGetValue(spid, out var bpart) && bpart.States.ContainsKey(st.StateId))
+                    {
+                        var bp = SemanticModel.FindEffective(m_base.Style, bc, spid, st.StateId, IDENTIFIER.IMAGEFILE);
+                        var bglyph = SemanticModel.FindEffective(m_base.Style, bc, spid, st.StateId, IDENTIFIER.GLYPHIMAGEFILE);
+                        if (bp?.GetValue() is int b1 && bglyph?.GetValue() is int b2
+                            && Decoded(m_base, "IMAGE", b1 & 0xFFFF) is ArgbImage bi && Decoded(m_base, "IMAGE", b2 & 0xFFFF) is ArgbImage ba
+                            && bi.PixelSha1() == picture.PixelSha1() && ba.PixelSha1() == glyph.PixelSha1()) continue;
+                    }
+
+                    int count = 1;
+                    if (SemanticModel.FindEffective(m_source.Style, sc, spid, st.StateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int c && c > 0) count = c;
+                    // uxtheme's frame layout: TMT_IMAGELAYOUT, IL_HORIZONTAL when absent (imagefile.cpp:66-67).
+                    bool horizontal = SemanticModel.FindEffective(m_source.Style, sc, spid, st.StateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int lo ? lo == 1 : true;
+                    int fw = picture.Width, fh = picture.Height;
+                    if (count > 1)
+                    {
+                        if (horizontal) { if (picture.Width % count != 0) continue; fw = picture.Width / count; }
+                        else { if (picture.Height % count != 0) continue; fh = picture.Height / count; }
+                    }
+                    if (fw <= 0 || fh <= 0) continue;
+
+                    int gw = glyph.Width, gh = glyph.Height;
+                    if (count > 1)
+                    {
+                        if (horizontal) { if (glyph.Width % count != 0) continue; gw = glyph.Width / count; }
+                        else { if (glyph.Height % count != 0) continue; gh = glyph.Height / count; }
+                    }
+                    if (gw > fw || gh > fh) continue;
+
+                    var composite = new ArgbImage(picture.Width, picture.Height);
+                    bool any = false;
+                    for (int i = 0; i < count; ++i)
+                    {
+                        int sx = horizontal ? i * fw : 0;
+                        int sy = horizontal ? 0 : i * fh;
+                        if (sx + fw > picture.Width || sy + fh > picture.Height) continue;
+                        var frame = picture.Crop(new Rectangle(sx, sy, fw, fh));
+                        int gx = horizontal ? i * gw : 0;
+                        int gy = horizontal ? 0 : i * gh;
+                        if (gx + gw <= glyph.Width && gy + gh <= glyph.Height)
+                            frame.BlendOver(glyph.Crop(new Rectangle(gx, gy, gw, gh)), (fw - gw) / 2, (fh - gh) / 2);
+                        composite.Blit(frame, sx, sy);
+                        any = true;
+                    }
+                    if (!any) continue;
+
+                    var png = ImageIdentity.EncodePngVerified(composite);
+                    int newId = PlaceResource("IMAGE", picId, png, ImageIdentity.Analyze(png));
+                    foreach (var ident in slots)
+                    {
+                        var prop = SemanticModel.FindEffective(m_target.Style, tc, tp.PartId, st.StateId, ident);
+                        if (prop == null) continue;
+                        if (prop.GetValue() is int cur && cur == newId) continue;
+                        if (!st.Properties.Contains(prop))
+                        {
+                            // inherited from a base class: the value has to land on this state to win.
+                            prop = new StyleProperty(new PropertyHeader((int)ident, (int)IDENTIFIER.FILENAME)
+                            {
+                                classID = tc.ClassId, partID = tp.PartId, stateID = st.StateId
+                            });
+                            st.Properties.Add(prop);
+                            AddedRecords.Add($"{tc.ClassId}/{tp.PartId}/{st.StateId}/{(int)ident}/{(int)IDENTIFIER.FILENAME}");
+                        }
+                        prop.SetValue(newId);
+                        MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{ident}");
+                    }
+                    m_report.Decisions.Add(new MergeDecision
+                    {
+                        Class = tc.ClassName, Part = partName, State = st.StateId, Property = "IMAGEFILE",
+                        Action = "composited-xp-combo-button",
+                        Reason = "xp draws the button face (IMAGEFILE) under a separate arrow (GLYPHIMAGEFILE); win10 draws one picture from the dpi set, which held the arrow alone stretched across the button",
+                        Result = newId.ToString(),
+                    });
+                    m_report.Count("composited-xp-combo-button");
                 }
-                if (!any) continue;
-
-                var png = ImageIdentity.EncodePngVerified(composite);
-                int newId = PlaceResource("IMAGE", picId, png, ImageIdentity.Analyze(png));
-                foreach (var ident in slots)
-                {
-                    var prop = first.Properties.FirstOrDefault(p => p.Header.nameID == (int)ident && p.Header.typeID == (int)IDENTIFIER.FILENAME);
-                    if (prop == null) continue;
-                    if (prop.GetValue() is int cur && cur == newId) continue;
-                    prop.SetValue(newId);
-                    MarkTouched(prop, $"{tc.ClassName}|{partName}|S0|{ident}");
-                }
-                m_report.Decisions.Add(new MergeDecision
-                {
-                    Class = tc.ClassName, Part = partName, State = 0, Property = "IMAGEFILE",
-                    Action = "composited-xp-combo-button",
-                    Reason = "xp draws the button face (IMAGEFILE) under a separate arrow (GLYPHIMAGEFILE); win10 draws one picture from the dpi set, which held the arrow alone stretched across the button",
-                    Result = newId.ToString(),
-                });
-                m_report.Count("composited-xp-combo-button");
             }
         }
 
@@ -836,55 +1024,57 @@ namespace libmsstyle.Import
             var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
             Margins margins = null;
             if (SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins sm) margins = sm;
-            int fix = margins != null && margins.Left > 0 ? Math.Min(margins.Left, plate.Width - 1) : plate.Width / 2;
-            int fiy = margins != null && margins.Top > 0 ? Math.Min(margins.Top, plate.Height - 1) : plate.Height / 2;
+            // the face is the plate's body, inside the nine-slice margins on every side; sampling at the margin
+            // itself lands on the border ring, which is not the face.
+            int fl = margins?.Left ?? 0, ft = margins?.Top ?? 0, fr = margins?.Right ?? 0, fb = margins?.Bottom ?? 0;
+            int fix = (fl + plate.Width - fr) / 2, fiy = (ft + plate.Height - fb) / 2;
+            fix = Math.Max(0, Math.Min(fix, plate.Width - 1));
+            fiy = Math.Max(0, Math.Min(fiy, plate.Height - 1));
             uint facePixel = plate.Pixels[fiy * plate.Width + fix];
-            var face = (facePixel >> 24) == 0xFF
+            // no invented fallback: a see-through body means the plate has no face colour to carry over.
+            Color? face = (facePixel >> 24) == 0xFF
                 ? Color.FromArgb((int)((facePixel >> 16) & 0xFF), (int)((facePixel >> 8) & 0xFF), (int)(facePixel & 0xFF))
-                : Color.FromArgb(210, 217, 240);
+                : (Color?)null;
             // the source's COLOR_WINDOW, what xp fills a combo's editable field and list box with (stock luna 255,
-            // Elfin2 219); a style that names none keeps white.
-            var windowColor = Color.White;
+            // Elfin2 219); a style that names none has no field colour to carry over.
+            Color? windowColor = null;
             if (m_source.ClassesByName.TryGetValue("sysmetrics", out var sysm)
                 && SemanticModel.FindEffective(m_source.Style, sysm, 0, 0, IDENTIFIER.WINDOW)?.GetValue() is Color wc)
                 windowColor = Color.FromArgb(255, wc.R, wc.G, wc.B);
+            // only records the template already has in that state are recoloured: adding a FILLCOLOR where the
+            // template draws none would change what win10 paints, not translate what xp painted.
+            void Recolour(int partId, StyleState st, IDENTIFIER ident, Color color)
+            {
+                string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
+                if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, ident.ToString())) return;
+                var prop = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)ident && p.Header.typeID == (int)IDENTIFIER.COLOR);
+                if (prop == null) return;
+                if (prop.GetValue() is Color same && same.R == color.R && same.G == color.G && same.B == color.B) return;
+                prop.SetValue(color);
+                MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{ident}");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName,
+                    Part = partName,
+                    State = st.StateId,
+                    Property = ident.ToString(),
+                    Action = "applied-xp-combo-colors",
+                    Reason = "xp draws the combo frame from the Combobox common picture; win10 draws it as a border fill from these colors, so they were sampled off the source's picture instead of using the source's no-picture fallback colors",
+                    Result = $"{color.R},{color.G},{color.B}",
+                });
+                m_report.Count("applied-xp-combo-colors");
+            }
             foreach (int partId in new[] { 0, 4, 5 })
             {
                 if (!tc.Parts.TryGetValue(partId, out var part)) continue;
-                string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
                 // xp fills the combo's field with COLOR_WINDOW (Elfin2's SysMetrics has 219, its .theme 219 - the xp
                 // address bar shows exactly that grey, not white) and the readonly one with the plate's pale face;
                 // win10's border fill paints the same colour when the edit is absent.
-                var pairs = partId == 4 ? new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, windowColor) }
-                          : partId == 5 ? new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, face) }
-                          : new[] { (IDENTIFIER.BORDERCOLOR, edge), (IDENTIFIER.FILLCOLOR, windowColor) };
+                Color? fill = partId == 5 ? face : windowColor;
                 foreach (var st in part.States.Values)
                 {
-                    foreach (var (ident, color) in pairs)
-                    {
-                        if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, ident.ToString())) continue;
-                        var prop = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)ident && p.Header.typeID == (int)IDENTIFIER.COLOR);
-                        if (prop != null && prop.GetValue() is Color same && same.R == color.R && same.G == color.G && same.B == color.B) continue;
-                        if (prop == null)
-                        {
-                            prop = new StyleProperty(new PropertyHeader((int)ident, (int)IDENTIFIER.COLOR) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
-                            st.Properties.Add(prop);
-                            AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)ident}/{(int)IDENTIFIER.COLOR}");
-                        }
-                        prop.SetValue(color);
-                        MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{ident}");
-                        m_report.Decisions.Add(new MergeDecision
-                        {
-                            Class = tc.ClassName,
-                            Part = partName,
-                            State = st.StateId,
-                            Property = ident.ToString(),
-                            Action = "applied-xp-combo-colors",
-                            Reason = "xp draws the combo frame from the Combobox common picture; win10 draws it as a border fill from these colors, so they were sampled off the source's picture instead of using the source's no-picture fallback colors",
-                            Result = $"{color.R},{color.G},{color.B}",
-                        });
-                        m_report.Count("applied-xp-combo-colors");
-                    }
+                    Recolour(partId, st, IDENTIFIER.BORDERCOLOR, edge);
+                    if (fill is Color fc) Recolour(partId, st, IDENTIFIER.FILLCOLOR, fc);
                 }
             }
 
@@ -898,12 +1088,7 @@ namespace libmsstyle.Import
                 foreach (var st in part.States.Values)
                 {
                     var prop = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.BORDERSIZE && p.Header.typeID == (int)IDENTIFIER.INT);
-                    if (prop == null)
-                    {
-                        prop = new StyleProperty(new PropertyHeader((int)IDENTIFIER.BORDERSIZE, (int)IDENTIFIER.INT) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
-                        st.Properties.Add(prop);
-                        AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)IDENTIFIER.BORDERSIZE}/{(int)IDENTIFIER.INT}");
-                    }
+                    if (prop == null) continue;
                     if (prop.GetValue() is int bs && bs == 1) continue;
                     prop.SetValue(1);
                     MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{IDENTIFIER.BORDERSIZE}");
@@ -926,7 +1111,8 @@ namespace libmsstyle.Import
         /// xp only. An edit control's text area is COLOR_WINDOW on xp (the address bar's inner edit in Elfin2 shows the
         /// same 219 as the combo's field, not the theme record's 206); win10 paints it from the Edit class's FILLCOLOR,
         /// so the port fills that slot with the source's WINDOW colour - otherwise the text field inside a combo comes
-        /// out a different shade than the combo around it.
+        /// out a different shade than the combo around it. A source that ships its own Edit background art keeps it:
+        /// only a source without art gets the template's win10-only background parts turned into border fills.
         /// </summary>
         private void FillXpEditField()
         {
@@ -934,19 +1120,38 @@ namespace libmsstyle.Import
             if (!m_source.ClassesByName.TryGetValue("sysmetrics", out var sysm)) return;
             if (!(SemanticModel.FindEffective(m_source.Style, sysm, 0, 0, IDENTIFIER.WINDOW)?.GetValue() is Color wc)) return;
             var window = Color.FromArgb(255, wc.R, wc.G, wc.B);
+            // stock xp's edit (white field, no Edit art) is exactly what the port drew for win10; only a style that
+            // changed the field color or the Edit records needs its window color moved into the win10-only parts.
+            bool windowStays = m_base.ClassesByName.TryGetValue("sysmetrics", out var bsym)
+                && SemanticModel.FindEffective(m_base.Style, bsym, 0, 0, IDENTIFIER.WINDOW)?.GetValue() is Color bwp && bwp.ToArgb() == window.ToArgb();
+            if (windowStays && !SourceClassDiffersFromBase("Edit")) return;
+            // xp's edit is EDITTEXT (1) and CARET (2); a picture on either is real source art and the template's
+            // win10-only BACKGROUND records must not replace it.
+            bool sourceArt = m_source.ClassesByName.TryGetValue("Edit", out var sec)
+                && m_source.Entries.Any(e => e.ClassName.Equals(sec.ClassName, StringComparison.OrdinalIgnoreCase)
+                    && (e.NameId == (int)IDENTIFIER.IMAGEFILE || (e.NameId >= (int)IDENTIFIER.IMAGEFILE1 && e.NameId <= (int)IDENTIFIER.IMAGEFILE7))
+                    && e.ResourceType == "IMAGE");
             var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
+            // geometry that only made sense for the picture the part no longer draws.
+            var deadIds = new HashSet<int>
+            {
+                (int)IDENTIFIER.SIZINGMARGINS, (int)IDENTIFIER.CONTENTMARGINS, (int)IDENTIFIER.SIZINGTYPE, (int)IDENTIFIER.IMAGELAYOUT,
+                (int)IDENTIFIER.IMAGECOUNT, (int)IDENTIFIER.MINDPI1, (int)IDENTIFIER.MINDPI2, (int)IDENTIFIER.MINDPI3,
+                (int)IDENTIFIER.MINDPI4, (int)IDENTIFIER.MINDPI5, (int)IDENTIFIER.MINDPI6, (int)IDENTIFIER.MINDPI7,
+                (int)IDENTIFIER.MINSIZE1, (int)IDENTIFIER.MINSIZE2, (int)IDENTIFIER.MINSIZE3, (int)IDENTIFIER.MINSIZE4,
+                (int)IDENTIFIER.MINSIZE5,
+            };
             foreach (var kvp in tc.Parts)
             {
                 int partId = kvp.Key; var part = kvp.Value;
                 // 0 = the edit body, 5 = the combo's read-only body; parts 2/3 are win10-only records that still
                 // carry the template's (Luna) art - a white picture drawn over the text area, which is what left
-                // the address bar's inner field white inside Elfin2's grey combo. xp has no such art, so those
-                // parts become the same border fill as the body.
+                // the address bar's inner field white inside Elfin2's grey combo.
                 if (partId != 0 && partId != 2 && partId != 3 && partId != 5) continue;
                 string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
                 foreach (var st in part.States.Values)
                 {
-                    if (partId == 2 || partId == 3)
+                    if ((partId == 2 || partId == 3) && !sourceArt)
                     {
                         bool touched = false;
                         for (int i = st.Properties.Count - 1; i >= 0; --i)
@@ -957,31 +1162,35 @@ namespace libmsstyle.Import
                             st.Properties.RemoveAt(i);
                             touched = true;
                         }
+                        // the picture's geometry is dead once the picture is gone (luna10.tsv:2060-2073).
+                        for (int i = st.Properties.Count - 1; i >= 0; --i)
+                        {
+                            if (!deadIds.Contains(st.Properties[i].Header.nameID)) continue;
+                            RemovedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{st.Properties[i].Header.nameID}/{st.Properties[i].Header.typeID}");
+                            st.Properties.RemoveAt(i);
+                            touched = true;
+                        }
                         var bg = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.BGTYPE);
-                        if (bg == null)
+                        bool added = bg == null;
+                        if (added)
                         {
                             bg = new StyleProperty(new PropertyHeader((int)IDENTIFIER.BGTYPE, (int)IDENTIFIER.ENUM) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
                             st.Properties.Add(bg);
                             AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)IDENTIFIER.BGTYPE}/{(int)IDENTIFIER.ENUM}");
                         }
+                        bool changedBg = !(bg.GetValue() is int bv && bv == 1);
                         bg.SetValue(1); // BORDERFILL: the body's colour paints the field, no picture
                         MarkTouched(bg, $"{tc.ClassName}|{partName}|S{st.StateId}|BGTYPE");
-                        if (touched || bg.GetValue() is int bv && bv == 1)
+                        if (touched || added || changedBg)
                         {
                             m_report.Decisions.Add(new MergeDecision
                             {
                                 Class = tc.ClassName, Part = partName, State = st.StateId, Property = "BGTYPE",
                                 Action = "applied-xp-edit-field",
-                                Reason = "the template's edit background picture is drawn over the text area in win10; xp has no art there and fills the field with COLOR_WINDOW, so the part is a border fill",
+                                Reason = "the template's edit background picture is drawn over the text area in win10 and the source has no edit art of its own, so the part becomes the border fill xp drew",
                                 Result = "BORDERFILL",
                             });
                             m_report.Count("applied-xp-edit-field");
-                        }
-                        var artFill = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.FILLCOLOR && p.Header.typeID == (int)IDENTIFIER.COLOR);
-                        if (artFill != null && !(artFill.GetValue() is Color ac && ac.R == window.R && ac.G == window.G && ac.B == window.B))
-                        {
-                            artFill.SetValue(window);
-                            MarkTouched(artFill, $"{tc.ClassName}|{partName}|S{st.StateId}|FILLCOLOR");
                         }
                     }
                     var fill = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.FILLCOLOR && p.Header.typeID == (int)IDENTIFIER.COLOR);
@@ -1002,112 +1211,170 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// xp only. ExplorerEx builds the classic start panel straight from the theme's StartPanel records:
-        /// part 1 DEFAULTPANESIZE is the panel width, the other panes' DEFAULTPANESIZE must tile inside it,
-        /// and part 6 (PLACELIST) CONTENTMARGINS place the places listview inside its pane (windows clip
-        /// children to the parent, so a negative left moves the listview's contents under the clip).
-        /// SevenVG declares panel 375, logoff 406x37, a pane starting at top -30 and places left -38: the
-        /// logoff buttons ran 31px past the panel edge and "My Computer"/"Control Panel"/"Run..." lost their
-        /// first letters. Templates derived from Luna fit (panel 380, user pane 190, logoff 190x37, places left
-        /// 4), so only the misfit is trimmed.
-        /// The places listview puts its item text 30px right of its origin and draws the leading shell icon in
-        /// the 26px before it, so a negative offset between 0 and -28 leaves a cut-off icon and one below -28
-        /// cuts the labels. -28 is the offset that hides the icon without touching the text, which is what the
-        /// negative margin asks for: the theme paints a window-7 style sidebar with plain labels, and at 0 the
-        /// 130px column wraps "My Computer".
+        /// true when any record of the class differs between the source and stock xp (records added, removed, or
+        /// with another value). Used to keep passes that only translate xp semantics for a *custom* pack from
+        /// touching the template when the source is stock art.
         /// </summary>
-        /// <summary>
-        private void FitXpStartPanel()
+        private bool SourceClassDiffersFromBase(string className)
         {
-            if (!m_target.ClassesByName.TryGetValue("StartPanel", out var tc)) return;
-            if (m_target.DuplicateClassNames.Contains("StartPanel")) return;
+            var src = ClassRecords(m_source, className);
+            var bas = ClassRecords(m_base, className);
+            if (src.Count == 0 && bas.Count == 0) return false;
+            foreach (var kv in src)
+                if (!bas.TryGetValue(kv.Key, out var b) || !Same(m_base, b, m_source, kv.Value)) return true;
+            foreach (var kv in bas)
+                if (!src.ContainsKey(kv.Key)) return true;
+            return false;
+        }
 
-            (StyleProperty Prop, int State) Find(int partId, IDENTIFIER id)
+        // records by numeric identity only: class/part/state names are spelled differently by the xp and win10 maps,
+        // and AlignClassNames only respells the source, so the semantic keys of two identical xp styles differ.
+        private static Dictionary<string, SemanticEntry> ClassRecords(SemanticModel m, string className) =>
+            m.Entries.Where(e => string.Equals(e.ClassName, className, StringComparison.OrdinalIgnoreCase))
+                .GroupBy(e => e.PartId + "|" + e.StateId + "|" + e.NameId + "|" + e.TypeId + "|" + e.Occurrence)
+                .ToDictionary(g => g.Key, g => g.First());
+
+        /// <summary>
+        /// ExplorerEx uses XP's StartPanel layout: DEFAULTPANESIZE is a size expressed as a RECT,
+        /// not a positioned child rectangle (deskhost.cpp::_ReadPaneSizeFromTheme). In particular,
+        /// the final panel width comes from USERPANE, not part 0 (_ComputeActualSize). Keep the
+        /// source dimensions with its artwork, including negative origins and sizes missing from
+        /// the template; clipping them to part 0 collapses SevenVG's 130px places pane to 55px.
+        /// </summary>
+        private void StartPanelSizesFromXp()
+        {
+            if (!m_target.ClassesByName.TryGetValue("StartPanel", out var tc)
+                || m_target.DuplicateClassNames.Contains("StartPanel")
+                || !m_source.ClassesByName.TryGetValue("StartPanel", out var sc)) return;
+            var cache = new Dictionary<int, ImageInfo>();
+            foreach (int partId in new[] { 1, 2, 4, 6, 8 })
             {
-                if (!tc.Parts.TryGetValue(partId, out var part)) return (null, 0);
-                foreach (var st in part.States.Values)
-                    foreach (var p in st.Properties)
-                        if (p.Header.nameID == (int)id) return (p, st.StateId);
-                return (null, 0);
-            }
-
-            var (userPane, _) = Find(1, IDENTIFIER.DEFAULTPANESIZE);
-            if (!(userPane?.GetValue() is Margins up) || up.Right <= 0) return;
-            int panelWidth = up.Right;
-            var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
-
-            for (int partId = 0; partId <= 8; partId++)
-            {
-                var (prop, stateId) = Find(partId, IDENTIFIER.DEFAULTPANESIZE);
-                if (prop == null || !(prop.GetValue() is Margins m)) continue;
-                bool width = m.Right > panelWidth, edge = m.Left < 0 || m.Top < 0;
-                if (!width && !edge) continue;
-
-                string partName = tnames.TryGetValue(partId, out var n) ? n : "P" + partId;
-                m.Left = Math.Max(0, m.Left);
-                m.Top = Math.Max(0, m.Top);
-                m.Right = Math.Min(m.Right, panelWidth);
-                prop.SetValue(m);
-                MarkTouched(prop, $"{tc.ClassName}|{partName}|S{stateId}|DEFAULTPANESIZE");
+                if (!tc.Parts.TryGetValue(partId, out var part) || !part.States.TryGetValue(0, out var state)
+                    || !sc.Parts.TryGetValue(partId, out var sourcePart) || !sourcePart.States.TryGetValue(0, out var sourceState)) continue;
+                var source = sourceState.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.DEFAULTPANESIZE);
+                if (!(source?.GetValue() is Margins size) || !PicturesFromSource(sc, tc, partId, partId, 0, cache)) continue;
+                var prop = state.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.DEFAULTPANESIZE);
+                if (prop?.GetValue() is Margins current && current.Equals(size)) continue;
+                if (prop == null)
+                {
+                    prop = new StyleProperty(new PropertyHeader((int)IDENTIFIER.DEFAULTPANESIZE, (int)IDENTIFIER.RECTTYPE)
+                    { classID = tc.ClassId, partID = partId, stateID = 0 });
+                    state.Properties.Add(prop);
+                    AddedRecords.Add($"{tc.ClassId}/{partId}/0/{(int)IDENTIFIER.DEFAULTPANESIZE}/{(int)IDENTIFIER.RECTTYPE}");
+                }
+                prop.SetValue(size);
+                string partName = part.PartName;
+                MarkTouched(prop, $"{tc.ClassName}|{partName}|S0|DEFAULTPANESIZE");
                 m_report.Decisions.Add(new MergeDecision
                 {
-                    Class = tc.ClassName,
-                    Part = partName,
-                    State = stateId,
-                    Property = "DEFAULTPANESIZE",
-                    Action = "fitted-xp-startpanel",
-                    Reason = "xp's shell lays every start panel pane out inside the panel width; the source's pane would overflow or start outside its host, so it is clipped by the shell",
-                    Result = $"{m.Left},{m.Top},{m.Right},{m.Bottom}",
+                    Class = tc.ClassName, Part = partName, State = 0, Property = "DEFAULTPANESIZE",
+                    Action = "applied-xp-startpanel-size",
+                    Reason = "XP's shell reads pane rectangles as dimensions and derives the final width from USERPANE; source artwork keeps its own pane size",
+                    Result = $"{size.Left},{size.Top},{size.Right},{size.Bottom}",
                 });
-                m_report.Count("fitted-xp-startpanel");
-            }
-
-            var (places, placesState) = Find(6, IDENTIFIER.CONTENTMARGINS);
-            if (places?.GetValue() is Margins pm && pm.Left < 0)
-            {
-                string partName = tnames.TryGetValue(6, out var n) ? n : "PLACELIST";
-                pm.Left = -28;
-                places.SetValue(pm);
-                MarkTouched(places, $"{tc.ClassName}|{partName}|S{placesState}|CONTENTMARGINS");
-                m_report.Decisions.Add(new MergeDecision
-                {
-                    Class = tc.ClassName,
-                    Part = partName,
-                    State = placesState,
-                    Property = "CONTENTMARGINS",
-                    Action = "fitted-xp-startpanel",
-                    Reason = "the source hides the places icons by pulling the listview left; a smaller pull leaves a cut-off icon in front of every label and a larger one cuts the labels themselves, and -28 is the only offset that does neither",
-                    Result = $"{pm.Left},{pm.Top},{pm.Right},{pm.Bottom}",
-                });
-                m_report.Count("fitted-xp-startpanel");
+                m_report.Count("applied-xp-startpanel-size");
             }
         }
+        private static string XpStartPartName(string name)
+        {
+            if (name == "PLACESLIST") return "PLACELIST";
+            if (name == "PLACESLISTSEPARATOR") return "PLACELISTSEPARATOR";
+            if (name == "LOGOFFBACKGROUND") return "LOGOFF";
+            return name;
+        }
+
+        private void StartPanelCounterpartsFromXp()
+        {
+            if (!m_source.ClassesByName.TryGetValue("StartPanel", out var source)) return;
+            var sourceNames = SemanticModel.PartNames("StartPanel", m_source.Platform);
+            foreach (var target in m_target.Style.Classes.Values.Where(c => c.ClassName.StartsWith("StartPanelComposited", StringComparison.OrdinalIgnoreCase)))
+            {
+                if (m_target.DuplicateClassNames.Contains(target.ClassName)) continue;
+                var names = SemanticModel.PartNames(target.ClassName, m_target.Platform);
+                foreach (var part in target.Parts.Values)
+                {
+                    if (!names.TryGetValue(part.PartId, out string name)) continue;
+                    name = XpStartPartName(name);
+                    var matches = sourceNames.Where(p => p.Value == name).Select(p => p.Key).ToList();
+                    if (matches.Count != 1 || !source.Parts.TryGetValue(matches[0], out var sourcePart)) continue;
+                    foreach (var state in part.States.Values)
+                    {
+                        if (!sourcePart.States.TryGetValue(state.StateId, out var sourceState)) continue;
+                        foreach (var prop in state.Properties.ToList())
+                        {
+                            var entry = m_target.Entries.FirstOrDefault(e => ReferenceEquals(e.Property, prop));
+                            if (entry == null || KeyPattern.Matches(m_opt.Exclude, entry.ClassName, entry.PartName, entry.PropertyName)) continue;
+                            bool size = prop.Header.nameID == (int)IDENTIFIER.DEFAULTPANESIZE;
+                            if (!size && entry.ResourceType != "IMAGE" && !GeometryIds.Contains(entry.NameId)
+                                && entry.NameId != (int)IDENTIFIER.CONTENTMARGINS && entry.NameId != (int)IDENTIFIER.SIZINGTYPE
+                                && entry.NameId != (int)IDENTIFIER.TRANSPARENT_ && entry.NameId != (int)IDENTIFIER.TRANSPARENTCOLOR) continue;
+                            var from = m_source.Entries.FirstOrDefault(e => e.ClassId == source.ClassId && e.PartId == sourcePart.PartId
+                                && e.StateId == state.StateId && e.NameId == entry.NameId && e.TypeId == entry.TypeId);
+                            if (from == null && DpiSlotIds.Contains(entry.NameId))
+                                from = m_source.Entries.Where(e => e.ClassId == source.ClassId && e.PartId == sourcePart.PartId
+                                    && e.StateId == state.StateId && e.ResourceType == "IMAGE" && DpiSlotIds.Contains(e.NameId)).OrderByDescending(e => e.NameId).FirstOrDefault()
+                                    ?? m_source.Entries.FirstOrDefault(e => e.ClassId == source.ClassId && e.PartId == sourcePart.PartId
+                                        && e.StateId == state.StateId && e.NameId == (int)IDENTIFIER.IMAGEFILE && e.ResourceType == "IMAGE");
+                            if (from == null || Same(m_source, from, m_target, entry)) continue;
+                            ApplyExtra(entry, from, null, "applied-xp-startpanel-counterpart",
+                                $"composited Start counterpart matched by semantic part {name}, not numeric part ID");
+                        }
+                        if (state.Properties.Any(p => p.Header.nameID == (int)IDENTIFIER.DEFAULTPANESIZE)) continue;
+                        var pane = sourceState.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.DEFAULTPANESIZE);
+                        if (pane == null) continue;
+                        var added = new StyleProperty((PropertyHeader)pane.Header.Clone());
+                        added.Header.classID = target.ClassId;
+                        added.Header.partID = part.PartId;
+                        CopyValue(pane, added);
+                        state.Properties.Add(added);
+                        AddedRecords.Add($"{target.ClassId}/{part.PartId}/{state.StateId}/{added.Header.nameID}/{added.Header.typeID}");
+                        MarkTouched(added, $"{target.ClassName}|{part.PartName}|S{state.StateId}|DEFAULTPANESIZE");
+                    }
+                }
+            }
+        }
+
 
         /// <summary>
         /// Win10's non-composited caption renderer needs stretched XP caption strips. Keep each part's
         /// own artwork and geometry: normal captions can contain transparent rounded top edges which
         /// must never replace the separate, edge-covering maximized artwork. Caption metrics stay XP's.
+        /// Only a part xp itself tiled is converted (the maximized parts 5/6 are drawn from their own
+        /// artwork and xp never tiled them); a part the source already stretched is left alone.
         /// </summary>
         private void StretchXpMaxCaption()
         {
             if (!m_target.ClassesByName.TryGetValue("Window", out var tc) || m_target.DuplicateClassNames.Contains("Window")) return;
-            StyleState Part(int id) => tc.Parts.TryGetValue(id, out var p) && p.States.TryGetValue(0, out var s) ? s : null;
+            if (!m_source.ClassesByName.TryGetValue("Window", out var sc)) return;
             var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
-            StyleProperty Prop(StyleState st, IDENTIFIER id) => st.Properties.FirstOrDefault(x => x.Header.nameID == (int)id);
-            foreach (int id in new[] { 1, 2, 3, 5, 6 })
+            // xp's window parts: CAPTION 1, SMALLCAPTION 2, MINCAPTION 3, SMALLMINCAPTION 4 (tmschema.h:410-422).
+            foreach (int id in new[] { 1, 2, 3, 4 })
             {
-                var st = Part(id);
-                if (st == null) continue;
-                var sizing = Prop(st, IDENTIFIER.SIZINGTYPE);
-                if (sizing == null || !(sizing.GetValue() is int sc) || sc == 1) continue;
+                if (!tc.Parts.TryGetValue(id, out var part) || !part.States.TryGetValue(0, out var st)) continue;
+                string partName = tnames.TryGetValue(id, out var pn) ? pn : "P" + id;
+                // the xp part id comes from the xp schema by name, not from the win10 part map.
+                int spid = XpPartId(sc.ClassName, partName);
+                if (spid < 0 || !sc.Parts.ContainsKey(spid)) continue;
+                // xp tiles the part only when its own SIZINGTYPE says so; otherwise there is nothing to convert.
+                if (!(SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.SIZINGTYPE)?.GetValue() is int sv) || sv != 2) continue;
+                var sizing = SemanticModel.FindEffective(m_target.Style, tc, id, 0, IDENTIFIER.SIZINGTYPE);
+                if (sizing == null)
+                {
+                    sizing = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGTYPE, (int)IDENTIFIER.ENUM)
+                    {
+                        classID = tc.ClassId, partID = id, stateID = 0
+                    });
+                    st.Properties.Add(sizing);
+                    AddedRecords.Add($"{tc.ClassId}/{id}/0/{(int)IDENTIFIER.SIZINGTYPE}/{(int)IDENTIFIER.ENUM}");
+                }
+                else if (sizing.GetValue() is int cur && cur == 1) continue;
                 sizing.SetValue(1);
-                string nm = tnames.TryGetValue(id, out var pn2) ? pn2 : "P" + id;
-                MarkTouched(sizing, $"{tc.ClassName}|{nm}|S0|SIZINGTYPE");
+                MarkTouched(sizing, $"{tc.ClassName}|{partName}|S0|SIZINGTYPE");
                 m_report.Decisions.Add(new MergeDecision
                 {
-                    Class = tc.ClassName, Part = nm, State = 0, Property = "SIZINGTYPE",
+                    Class = tc.ClassName, Part = partName, State = 0, Property = "SIZINGTYPE",
                     Action = "applied-caption-stretch",
-                    Reason = "xp tiles this caption part; win10's caption renderer draws a tiled part as one sprite and leaves the bar's fill visible, so the art is stretched instead",
+                    Reason = "xp tiles this caption part and win10's non-composited caption renderer draws a tiled part as one sprite, leaving the bar's fill visible, so the art is stretched instead",
                     Result = "STRETCH",
                 });
                 m_report.Count("applied-caption-stretch");
@@ -1124,30 +1391,43 @@ namespace libmsstyle.Import
         };
 
         /// <summary>
-        /// true when every picture the source uses in this part/state is also the picture the output draws
-        /// there. Added pictures are read from the allocator (GetRawResource ignores queued data).
+        /// true when every picture the source draws in this part/state is also drawn by the output there, and at
+        /// least one of them was replaced by this run. Pictures are matched by resource identity, so a slot the
+        /// template moved (xp IMAGEFILE -> win10 IMAGEFILE1) or the strip remap re-cut still counts; pictures read
+        /// from the file or from the allocator are compared by pixels.
         /// </summary>
         private bool PicturesFromSource(StyleClass sc, StyleClass tc, int spid, int tpid, int stateId, Dictionary<int, ImageInfo> cache)
         {
             bool any = false, applied = false;
-            foreach (var name in ImageNames)
+            foreach (var sp in SelectedPictures(m_source, sc, spid, stateId))
             {
-                if (!VisualStyle.XpImageIds.Contains((int)name)) continue; // xp has no IMAGEFILE6/7
-                var sp = SemanticModel.FindEffective(m_source.Style, sc, spid, stateId, name);
-                if (sp == null) continue;
-                var tp = SemanticModel.FindEffective(m_target.Style, tc, tpid, stateId, name);
-                if (tp == null) return false;
-                if (m_touched.Contains(tp)) applied = true;
-                var si = m_source.GetImageInfo("IMAGE", sp.Header.shortFlag & 0xFFFF);
+                if (!(sp.GetValue() is int sid)) return false;
+                var si = m_source.GetImageInfo("IMAGE", sid & 0xFFFF);
                 if (si == null || !si.Decodable) return false;
-                int tid = tp.Header.shortFlag & 0xFFFF;
-                if (!cache.TryGetValue(tid, out var ti))
+                m_sourceImageTargets.TryGetValue(sid & 0xFFFF, out var placed);
+                bool found = false;
+                foreach (var name in ImageNames)
                 {
-                    byte[] bytes = m_alloc.Added.TryGetValue("IMAGE/" + tid, out var added) ? added : m_target.GetResourceBytes("IMAGE", tid);
-                    ti = bytes == null ? null : ImageIdentity.Analyze(bytes);
-                    cache[tid] = ti;
+                    if (!VisualStyle.XpImageIds.Contains((int)name)) continue; // xp has no IMAGEFILE6/7
+                    var tp = SemanticModel.FindEffective(m_target.Style, tc, tpid, stateId, name);
+                    if (tp == null || tp.Header.typeID != (int)IDENTIFIER.FILENAME) continue;
+                    int tid = tp.Header.shortFlag & 0xFFFF;
+                    bool same = placed != null && placed.Contains(tid);
+                    if (!same)
+                    {
+                        if (!cache.TryGetValue(tid, out var ti))
+                        {
+                            byte[] bytes = ImageBytes(tid);
+                            ti = bytes == null ? null : ImageIdentity.Analyze(bytes);
+                            cache[tid] = ti;
+                        }
+                        same = ti != null && ti.Decodable && si.PixelSha1 == ti.PixelSha1;
+                    }
+                    if (!same) continue;
+                    found = true;
+                    if (m_touched.Contains(tp)) applied = true;
                 }
-                if (ti == null || !ti.Decodable || si.PixelSha1 != ti.PixelSha1) return false;
+                if (!found) return false;
                 any = true;
             }
             // only a picture the import actually replaced: the template's own picture (stock Luna onto the Luna
@@ -1155,22 +1435,57 @@ namespace libmsstyle.Import
             return any && applied;
         }
 
-        /// <summary>true when the part/state's effective sizing margins are the source's, not the template's.</summary>
+        /// <summary>
+        /// Makes the part/state's effective sizing margins the source's and returns true. xp without a
+        /// SIZINGMARGINS record draws the picture as one frame with no nine-grid margins, so the template's
+        /// record (fitted to its own art) is zeroed rather than silently kept under the source's TILE/STRETCH.
+        /// </summary>
         private bool MarginsFromSource(StyleClass sc, StyleClass tc, int spid, int tpid, int stateId)
         {
             var sm = SemanticModel.FindEffective(m_source.Style, sc, spid, stateId, IDENTIFIER.SIZINGMARGINS);
-            if (sm == null) return true;
+            Margins want;
+            if (sm == null) want = new Margins(0, 0, 0, 0);             // xp's missing record: no margins
+            else if (sm.GetValue() is Margins m) want = m;
+            else return false;
             var tm = SemanticModel.FindEffective(m_target.Style, tc, tpid, stateId, IDENTIFIER.SIZINGMARGINS);
-            return tm != null && sm.GetValue() is Margins a && tm.GetValue() is Margins b && a.Equals(b);
+            if (tm != null && tm.GetValue() is Margins have && have.Equals(want)) return true;
+
+            if (!tc.Parts.TryGetValue(tpid, out var tpart) || !tpart.States.TryGetValue(stateId, out var tstate)) return false;
+            var local = tstate.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.SIZINGMARGINS && p.Header.typeID == (int)IDENTIFIER.MARGINS);
+            bool added = false;
+            if (local == null)
+            {
+                local = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGMARGINS, (int)IDENTIFIER.MARGINS)
+                {
+                    classID = tc.ClassId, partID = tpid, stateID = stateId
+                });
+                tstate.Properties.Add(local);
+                AddedRecords.Add($"{tc.ClassId}/{tpid}/{stateId}/{(int)IDENTIFIER.SIZINGMARGINS}/{(int)IDENTIFIER.MARGINS}");
+                added = true;
+            }
+            local.SetValue(want);
+            MarkTouched(local, $"{tc.ClassName}|{tpart.PartName}|S{stateId}|SIZINGMARGINS");
+            m_report.Decisions.Add(new MergeDecision
+            {
+                Class = tc.ClassName, Part = tpart.PartName, State = stateId, Property = "SIZINGMARGINS",
+                Action = "applied-xp-margins",
+                Reason = sm == null
+                    ? "xp has no sizing margins for this picture (the art is drawn without a nine grid); the template's margins were fitted to its own picture, so they are zeroed to draw the source's art the way xp did"
+                    : "the part draws the source's picture with xp's sizing, so the source's margins go with it; the template's were fitted to the template's own art",
+                Result = $"{want.Left},{want.Top},{want.Right},{want.Bottom}",
+            });
+            m_report.Count(added ? "added-xp-margins" : "applied-xp-margins");
+            return true;
         }
 
+
         /// <summary>
-        /// xp only. xp's uxtheme blends a picture with true alpha (some pixel partly transparent) by its alpha channel
-        /// whatever TRANSPARENT says: fAlphaChannel comes from the bitmap header (imagefile.cpp SetImageInfo,
-        /// pdi->fAlphaChannel = fTrueAlpha) and TRANSPARENT only switches the color key. Windows 10 doesn't blend a part
-        /// with TRANSPARENT false: XPMC's toolbar buttons (TRANSPARENT = False on a 32bpp alpha strip) were drawn on
-        /// black. Every state that now shows a picture with partial alpha and says TRANSPARENT false gets true,
-        /// which is how xp drew it. Template pictures stay as they are (Luna10's frames are opaque).
+        /// xp only. xp's uxtheme blends a picture with an alpha channel by that channel whatever TRANSPARENT says:
+        /// fAlphaChannel comes from the bitmap header (imagefile.cpp SetImageInfo, pdi-&gt;fAlphaChannel = fTrueAlpha)
+        /// and TRANSPARENT only switches the color key. Windows 10 doesn't blend a part with TRANSPARENT false, so a
+        /// source picture whose alpha carries the transparency (partial alpha, or a binary 0/255 mask) was drawn on
+        /// black. Every state that now draws such a source picture while its effective TRANSPARENT (which may be
+        /// inherited) is false gets true, which is how xp drew it. Template pictures stay as they are.
         /// </summary>
         private void TransparentForTrueAlpha()
         {
@@ -1178,25 +1493,81 @@ namespace libmsstyle.Import
                 foreach (var part in cls.Parts.Values)
                     foreach (var st in part.States.Values)
                     {
-                        var tr = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.TRANSPARENT_ && p.Header.typeID == (int)IDENTIFIER.BOOLTYPE);
-                        if (tr == null || !(tr.GetValue() is bool on) || on) continue;
                         if (KeyPattern.Matches(m_opt.Exclude, cls.ClassName, part.PartName, "TRANSPARENT")) continue;
-                        bool alpha = st.Properties.Where(p => p.Header.nameID == (int)IDENTIFIER.IMAGEFILE || DpiSlotIds.Contains(p.Header.nameID))
-                            .Select(p => p.GetValue() is int id && m_alloc.Added.TryGetValue("IMAGE/" + id, out var bytes) ? bytes : null)
-                            .Where(b => b != null)
-                            .Any(b => ImageIdentity.Decode(b).Pixels.Any(px => (px >> 24) != 0 && (px >> 24) != 0xFF));
+                        var tr = SemanticModel.FindEffective(m_target.Style, cls, part.PartId, st.StateId, IDENTIFIER.TRANSPARENT_);
+                        if (tr == null || !(tr.GetValue() is bool on) || on || tr.Header.typeID != (int)IDENTIFIER.BOOLTYPE) continue;
+                        // only the picture uxtheme actually reads: with IMAGESELECTTYPE, IMAGEFILE is shadowed by the
+                        // selected dpi slot, so a transparent template IMAGEFILE must not turn a part TRANSPARENT.
+                        bool alpha = false;
+                        foreach (var pic in SelectedPictures(m_target, cls, part.PartId, st.StateId))
+                        {
+                            if (!(pic.GetValue() is int id)) continue;
+                            // a picture the import put here (a touched property, or an id it placed while filling a
+                            // slot); a template picture merely equal to one the source reuses still means the
+                            // source relies on its alpha, but an unrelated template picture must not count.
+                            if (!m_touched.Contains(pic) && !ImportedPicture(id)) continue;
+                            byte[] bytes = ImageBytes(id);
+                            if (bytes == null) continue;
+                            ArgbImage img;
+                            try { img = ImageIdentity.Decode(bytes); } catch (ArgumentException) { continue; }
+                            // any non-opaque pixel means the picture's alpha carries the shape, including a plain
+                            // 0/255 mask: that still only shows through when uxtheme blends the picture.
+                            if (img.Pixels.Any(px => (px >> 24) != 0xFF)) { alpha = true; break; }
+                        }
                         if (!alpha) continue;
+                        bool local = st.Properties.Contains(tr);
+                        if (!local)
+                        {
+                            tr = new StyleProperty(new PropertyHeader((int)IDENTIFIER.TRANSPARENT_, (int)IDENTIFIER.BOOLTYPE)
+                            {
+                                classID = cls.ClassId, partID = part.PartId, stateID = st.StateId
+                            });
+                            st.Properties.Add(tr);
+                            AddedRecords.Add($"{cls.ClassId}/{part.PartId}/{st.StateId}/{(int)IDENTIFIER.TRANSPARENT_}/{(int)IDENTIFIER.BOOLTYPE}");
+                        }
                         tr.SetValue(true);
                         MarkTouched(tr, $"{cls.ClassName}|{part.PartName}|S{st.StateId}|TRANSPARENT");
                         m_report.Decisions.Add(new MergeDecision
                         {
                             Class = cls.ClassName, Part = part.PartName, State = st.StateId, Property = "TRANSPARENT", Action = "applied-true-alpha",
-                            Reason = "the picture has partial alpha, which xp blended whatever TRANSPARENT said; windows 10 only blends with TRANSPARENT true",
+                            Reason = "the source picture's alpha carries the transparency, which xp blended whatever TRANSPARENT said; windows 10 only blends with TRANSPARENT true, and this state's effective value was false",
                             Result = "true",
                         });
                         m_report.Count("applied-true-alpha");
                     }
         }
+
+        /// <summary>the picture properties uxtheme reads for the part's background in this state (xp selection rules).</summary>
+        private static List<StyleProperty> SelectedPictures(SemanticModel m, StyleClass c, int part, int state)
+        {
+            var list = new List<StyleProperty>();
+            var ist = SemanticModel.FindEffective(m.Style, c, part, state, IDENTIFIER.IMAGESELECTTYPE);
+            var gt = SemanticModel.FindEffective(m.Style, c, part, state, IDENTIFIER.GLYPHTYPE);
+            // xp only selects among the numbered slots when the image isn't an image glyph; an image glyph's
+            // background still comes from IMAGEFILE.
+            if (ist?.GetValue() is int sel && sel != 0 && !(gt?.GetValue() is int g && g == 1))
+                foreach (var name in DpiSlotIds)
+                {
+                    var p = SemanticModel.FindEffective(m.Style, c, part, state, (IDENTIFIER)name);
+                    if (p != null && p.Header.typeID == (int)IDENTIFIER.FILENAME) list.Add(p);
+                }
+            var img = SemanticModel.FindEffective(m.Style, c, part, state, IDENTIFIER.IMAGEFILE);
+            if (img != null && img.Header.typeID == (int)IDENTIFIER.FILENAME) { if (list.Count == 0) list.Add(img); }
+            return list;
+        }
+
+        /// <summary>bytes of an image resource, from this run's allocator first (added pictures aren't in the file).</summary>
+        private byte[] ImageBytes(int id) =>
+            m_alloc.Added.TryGetValue("IMAGE/" + id, out var bytes) ? bytes : m_target.GetResourceBytes("IMAGE", id);
+
+        /// <summary>true when <paramref name="id"/> is one of the images this run placed (possibly reusing an equal template id).</summary>
+        private bool ImportedPicture(int id)
+        {
+            int key = id & 0xFFFF;
+            foreach (var set in m_sourceImageTargets.Values) if (set.Contains(key)) return true;
+            return false;
+        }
+
 
         /// <summary>
         /// xp only. comctl32's up-down erases with its class brush (BTNFACE, updown.c) before drawing the Spin parts,
@@ -1245,35 +1616,46 @@ namespace libmsstyle.Import
         }
 
         // win10 menu records Luna10 filled with stock xp's system colors, and the xp color each stands for. XP drew
-        // menus unthemed (flat menus: user32 mndraw.c MENU fill, MENUHILIGHT hot fill with a HIGHLIGHT frame and
-        // HIGHLIGHTTEXT text, BTNSHADOW border; shell32 menuband mnbase.cpp the same for menu bands such as the
-        // Quick Launch chevron menu). Windows 10 draws them themed from these records, so they kept Luna's blue
-        // highlight and white popups under every other theme.
+        // menus unthemed (user32 mndraw.c: MENU fill, MENUHILIGHT hot fill when flat menus are on, HIGHLIGHT hot fill
+        // for popups when they are off, HIGHLIGHTTEXT text, BTNSHADOW border; shell32 menuband mnbase.cpp the same
+        // for menu bands such as the Quick Launch chevron menu). Windows 10 draws them themed from these records, so
+        // they kept Luna's blue highlight and white popups under every other theme.
+        //
+        // the parts are win10's (Menu|7 BARBACKGROUND, |8 BARITEM, |9 POPUPBACKGROUND, |10 POPUPBORDERS, |13
+        // POPUPGUTTER, |14 POPUPITEM, |15 POPUPSEPARATOR); xp's Menu class has parts 1-6 only (tmschema.h:648-654),
+        // so every row here translates a color xp painted from a system color into the win10 part that paints it.
         private static readonly (string Class, int Part, int State, IDENTIFIER Prop, IDENTIFIER From)[] XpMenuColors =
         {
             ("Menu", 7, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUBAR), ("Menu", 7, 0, IDENTIFIER.BORDERCOLOR, IDENTIFIER.MENUBAR),
             ("Menu", 8, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUBAR), ("Menu", 8, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
-            ("Menu", 8, 2, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 8, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
-            ("Menu", 8, 3, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 8, 3, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
             ("Menu", 8, 4, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT), ("Menu", 8, 5, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
             ("Menu", 8, 6, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
             ("Menu", 14, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU), ("Menu", 14, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
             ("Menu", 14, 1, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU), ("Menu", 14, 1, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
-            ("Menu", 14, 2, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 14, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
             ("Menu", 14, 3, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU), ("Menu", 14, 3, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
-            ("Menu", 14, 4, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT), ("Menu", 14, 4, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
             // explorer's menu bands (the toolbar chevron menu, Favorites): a menu drawn as a toolbar.
             ("ExplorerMenu::Toolbar", 0, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
-            ("ExplorerMenu::Toolbar", 0, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
-            ("ExplorerMenu::Toolbar", 0, 3, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
             ("ExplorerMenu::Toolbar", 0, 4, IDENTIFIER.TEXTCOLOR, IDENTIFIER.GRAYTEXT),
             ("ExplorerMenu::Toolbar", 1, 0, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENU),
-            ("ExplorerMenu::Toolbar", 1, 2, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT),
-            ("ExplorerMenu::Toolbar", 1, 3, IDENTIFIER.FILLCOLOR, IDENTIFIER.MENUHILIGHT),
             ("StartMenu::Toolbar", 0, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
-            ("StartMenu::Toolbar", 0, 2, IDENTIFIER.TEXTCOLOR, IDENTIFIER.HIGHLIGHTTEXT),
             ("StartMenu::MenuBand", 0, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
             ("StartMenu::MenuBand", 1, 0, IDENTIFIER.TEXTCOLOR, IDENTIFIER.MENUTEXT),
+        };
+
+        // the hot (selected/open) menu records. XP picks the fill from TMT_FLATMENUS (mndraw.c:1010-1037): flat menus
+        // use MENUHILIGHT for every hot item; without it a hot popup item uses HIGHLIGHT and a hot menubar item is
+        // drawn as a normal item (MENU fill, MENUTEXT text). BarItem says which of the two the win10 part is.
+        private static readonly (string Class, int Part, int State, IDENTIFIER Prop, bool BarItem)[] XpMenuHot =
+        {
+            ("Menu", 8, 2, IDENTIFIER.FILLCOLOR, true), ("Menu", 8, 2, IDENTIFIER.TEXTCOLOR, true),
+            ("Menu", 8, 3, IDENTIFIER.FILLCOLOR, true), ("Menu", 8, 3, IDENTIFIER.TEXTCOLOR, true),
+            ("Menu", 14, 2, IDENTIFIER.FILLCOLOR, false), ("Menu", 14, 2, IDENTIFIER.TEXTCOLOR, false),
+            ("Menu", 14, 4, IDENTIFIER.FILLCOLOR, false), ("Menu", 14, 4, IDENTIFIER.TEXTCOLOR, false),
+            ("ExplorerMenu::Toolbar", 0, 2, IDENTIFIER.TEXTCOLOR, true),
+            ("ExplorerMenu::Toolbar", 0, 3, IDENTIFIER.TEXTCOLOR, true),
+            ("ExplorerMenu::Toolbar", 1, 2, IDENTIFIER.FILLCOLOR, true),
+            ("ExplorerMenu::Toolbar", 1, 3, IDENTIFIER.FILLCOLOR, true),
+            ("StartMenu::Toolbar", 0, 2, IDENTIFIER.TEXTCOLOR, true),
         };
 
         // the plain Luna10 menu pictures: every pixel is one of stock xp's menu colors (or see-through), so each is
@@ -1283,16 +1665,17 @@ namespace libmsstyle.Import
             ("Menu", 9, IDENTIFIER.IMAGEFILE),   // POPUPBACKGROUND: MENU
             ("Menu", 10, IDENTIFIER.IMAGEFILE),  // POPUPBORDERS: BTNSHADOW frame around MENU
             ("Menu", 13, IDENTIFIER.IMAGEFILE),  // POPUPGUTTER: MENU
-            ("Menu", 14, IDENTIFIER.IMAGEFILE),  // POPUPITEM: see-through / MENUHILIGHT frames
+            ("Menu", 14, IDENTIFIER.IMAGEFILE),  // POPUPITEM: see-through / hot frames
             ("Menu", 15, IDENTIFIER.IMAGEFILE),  // POPUPSEPARATOR: BTNSHADOW line over MENU
             ("ExplorerMenu::Toolbar", 0, IDENTIFIER.IMAGEFILE), // menu band background: MENU
         };
 
         /// <summary>
         /// xp only: the menu records and plain menu pictures follow the source's SysMetrics menu colors
-        /// (<see cref="XpMenuColors"/>, <see cref="XpMenuPictures"/>). Untouched when the source keeps stock xp's
-        /// colors. A stock color a picture uses for two roles (stock MENU and HIGHLIGHTTEXT are both white) is
-        /// mapped by the picture's role, so a white popup background becomes the source's MENU, not its text color.
+        /// (<see cref="XpMenuColors"/>, <see cref="XpMenuHot"/>, <see cref="XpMenuPictures"/>). Untouched when the
+        /// source keeps stock xp's colors. A stock color a picture uses for two roles (stock MENU and HIGHLIGHTTEXT
+        /// are both white) is mapped by the picture's role, so a white popup background becomes the source's MENU,
+        /// not its text color.
         /// </summary>
         private void MenuColorsFromXp()
         {
@@ -1301,32 +1684,47 @@ namespace libmsstyle.Import
             Color? Stock(IDENTIFIER id) => SemanticModel.FindEffective(m_base.Style, bm, 0, 0, id)?.GetValue() as Color?;
             // XP's user32 fills a missing MENUHILIGHT/MENUBAR from HIGHLIGHT/BTNFACE (flat menu defaults).
             Color? Role(IDENTIFIER id) => Src(id) ?? (id == IDENTIFIER.MENUHILIGHT ? Src(IDENTIFIER.HIGHLIGHT) : id == IDENTIFIER.MENUBAR ? Src(IDENTIFIER.BTNFACE) : null);
+            // TMT_FLATMENUS defaults to FALSE (loader.cpp:1353 area, tm->fBools[TMT_FLATMENUS] = FALSE).
+            bool flat = SemanticModel.FindEffective(m_source.Style, sm, 0, 0, IDENTIFIER.FLATMENUS)?.GetValue() is bool f && f;
+            // the fill and text xp used for a hot item, by whether the part is a menubar item (mndraw.c:1010-1037).
+            IDENTIFIER HotFill(bool barItem) => flat ? IDENTIFIER.MENUHILIGHT : barItem ? IDENTIFIER.MENU : IDENTIFIER.HIGHLIGHT;
+            IDENTIFIER HotText(bool barItem) => flat || !barItem ? IDENTIFIER.HIGHLIGHTTEXT : IDENTIFIER.MENUTEXT;
             var roles = new[] { IDENTIFIER.MENU, IDENTIFIER.MENUTEXT, IDENTIFIER.MENUBAR, IDENTIFIER.MENUHILIGHT, IDENTIFIER.HIGHLIGHT,
                 IDENTIFIER.HIGHLIGHTTEXT, IDENTIFIER.GRAYTEXT, IDENTIFIER.BTNSHADOW };
             if (roles.All(r => Role(r) is Color s && Stock(r) is Color b && s.ToArgb() == b.ToArgb())) return;
 
             int changed = 0;
-            foreach (var m in XpMenuColors)
+            // one row: set the record to the source's color for that role, when the source changed it from stock.
+            void Apply(string cls, int partId, int stateId, IDENTIFIER prop, IDENTIFIER from, string why)
             {
-                if (!m_target.ClassesByName.TryGetValue(m.Class, out var tc) || m_target.DuplicateClassNames.Contains(m.Class)
-                    || KeyPattern.Matches(m_opt.Exclude, m.Class, "*", m.Prop.ToString())) continue;
-                if (!(Role(m.From) is Color want)) continue;
+                if (!m_target.ClassesByName.TryGetValue(cls, out var tc) || m_target.DuplicateClassNames.Contains(cls)
+                    || KeyPattern.Matches(m_opt.Exclude, cls, "*", prop.ToString())) return;
+                if (!(Role(from) is Color want)) return;
                 // a role the source keeps at stock xp's color leaves the template's value, adaptations included
                 // (Luna10 draws disabled bar text 109,109,109 where xp's GRAYTEXT is 172,168,153).
-                if (Stock(m.From) is Color stockRole && stockRole.ToArgb() == want.ToArgb()) continue;
-                if (!tc.Parts.TryGetValue(m.Part, out var part) || !part.States.TryGetValue(m.State, out var st)) continue;
-                var p = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)m.Prop && x.Header.typeID == (int)IDENTIFIER.COLOR);
-                if (p == null || m_touched.Contains(p) || !(p.GetValue() is Color have) || have.ToArgb() == want.ToArgb()) continue;
+                if (Stock(from) is Color stockRole && stockRole.ToArgb() == want.ToArgb()) return;
+                if (!tc.Parts.TryGetValue(partId, out var part) || !part.States.TryGetValue(stateId, out var st)) return;
+                var p = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)prop && x.Header.typeID == (int)IDENTIFIER.COLOR);
+                if (p == null || m_touched.Contains(p) || !(p.GetValue() is Color have) || have.ToArgb() == want.ToArgb()) return;
                 p.SetValue(want);
-                string label = $"{m.Class}|{part.PartName}|S{m.State}|{SemanticModel.PropertyName((int)m.Prop)}";
-                MarkTouched(p, label);
+                MarkTouched(p, $"{cls}|{part.PartName}|S{stateId}|{SemanticModel.PropertyName((int)prop)}");
                 m_report.Decisions.Add(new MergeDecision
                 {
-                    Class = m.Class, Part = part.PartName, State = m.State, Property = SemanticModel.PropertyName((int)m.Prop),
-                    Action = "applied-menu-color", Reason = $"xp drew this menu part in the {m.From} system color",
-                    Result = SemanticModel.FormatValue(p),
+                    Class = cls, Part = part.PartName, State = stateId, Property = SemanticModel.PropertyName((int)prop),
+                    Action = "applied-menu-color", Reason = why, Result = SemanticModel.FormatValue(p),
                 });
                 ++changed;
+            }
+
+            foreach (var m in XpMenuColors)
+                Apply(m.Class, m.Part, m.State, m.Prop, m.From, $"xp painted this menu area in the {m.From} system color; win10 draws it from this record");
+            foreach (var m in XpMenuHot)
+            {
+                IDENTIFIER from = m.Prop == IDENTIFIER.FILLCOLOR ? HotFill(m.BarItem) : HotText(m.BarItem);
+                Apply(m.Class, m.Part, m.State, m.Prop, from,
+                    flat
+                        ? $"xp draws a hot menu item in the {from} system color while flat menus are on"
+                        : $"xp's flat menus are off, so a hot {(m.BarItem ? "menubar item is drawn as a normal item" : "popup item")} in the {from} system color");
             }
 
             // stock color -> source color, per picture role. Unknown pixels leave the picture alone.
@@ -1336,7 +1734,8 @@ namespace libmsstyle.Import
                 [9] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU) },
                 [10] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU), [Stock(IDENTIFIER.BTNSHADOW).Value.ToArgb()] = Op(IDENTIFIER.BTNSHADOW) },
                 [13] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU) },
-                [14] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENUHILIGHT).Value.ToArgb()] = Op(IDENTIFIER.MENUHILIGHT) },
+                // POPUPITEM's frames are the hot fill, which follows FLATMENUS like the records above.
+                [14] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENUHILIGHT).Value.ToArgb()] = Op(HotFill(false)) },
                 [15] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU), [Stock(IDENTIFIER.BTNSHADOW).Value.ToArgb()] = Op(IDENTIFIER.BTNSHADOW) },
                 [0] = new Dictionary<int, Color> { [Stock(IDENTIFIER.MENU).Value.ToArgb()] = Op(IDENTIFIER.MENU) },
             };
@@ -1357,15 +1756,23 @@ namespace libmsstyle.Import
                     try { src = ImageIdentity.Decode(bytes); } catch (ArgumentException) { continue; }
                     var outImg = new ArgbImage(src.Width, src.Height);
                     bool known = true, any = false;
+                    int unknown = 0;
                     for (int i = 0; i < src.Pixels.Length && known; ++i)
                     {
                         uint px = src.Pixels[i];
                         if ((px >> 24) == 0) { outImg.Pixels[i] = px; continue; }
-                        if ((px >> 24) != 0xFF || !map.TryGetValue((int)(px | 0xFF000000), out var to)) { known = false; break; }
+                        if ((px >> 24) != 0xFF || !map.TryGetValue((int)(px | 0xFF000000), out var to)) { known = false; ++unknown; break; }
                         outImg.Pixels[i] = 0xFF000000 | ((uint)to.R << 16) | ((uint)to.G << 8) | to.B;
                         any |= outImg.Pixels[i] != px;
                     }
-                    if (!known || !any) continue;
+                    if (!known)
+                    {
+                        // the picture carries art of its own (a check mark, an arrow), so it keeps the template's
+                        // colors; say so instead of dropping it quietly.
+                        m_report.Notes.Add($"{pic.Class} part {pic.Part} picture {id} keeps the template's menu colors: it draws pixels that aren't one of stock xp's menu colors (first at index {unknown - 1}).");
+                        continue;
+                    }
+                    if (!any) continue;
                     var png = ImageIdentity.EncodePngVerified(outImg);
                     newId = PlaceResource("IMAGE", id, png, ImageIdentity.Analyze(png));
                     redone[(pic.Part, id)] = newId;
@@ -1387,13 +1794,16 @@ namespace libmsstyle.Import
 
         /// <summary>
         /// xp only. comctl32 (cutils.c CCDrawNonClientTheme) draws a client edge with the part's background, then
-        /// fills what a BORDERSIZE thinner than the 2px edge leaves with a brush that is white on win10 for Task
-        /// Manager's and the Open dialog's lists: a white ring inside GSM's dark border. SIZINGBORDERWIDTH at the
-        /// edge width skips that fill, so the BORDERFILL (border, then its FILLCOLOR) covers the whole edge.
-        /// Only when the fill isn't white already (Luna's lists look the same either way).
+        /// fills what a BORDERSIZE thinner than the edge metric (SM_CXEDGE) leaves with a brush that is white on
+        /// win10 for Task Manager's and the Open dialog's lists: a white ring inside GSM's dark border.
+        /// SIZINGBORDERWIDTH at the edge width skips that fill, so the BORDERFILL (border, then its FILLCOLOR)
+        /// covers the whole edge. Only when the fill isn't white already (Luna's lists look the same either way).
         /// </summary>
         private void ThemeWholeClientEdge()
         {
+            // cutils.c:3119-3123 compares the theme value against g_cxEdge/g_cyEdge, so the record has to be at
+            // least the system's edge metric; nothing in the theme declares it, so it is read from the system.
+            int edge = SystemEdgeWidth();
             foreach (var name in ClientEdgeClasses)
             {
                 if (!m_target.ClassesByName.TryGetValue(name, out var tc) || m_target.DuplicateClassNames.Contains(name)
@@ -1403,16 +1813,38 @@ namespace libmsstyle.Import
                 if (!(SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.FILLCOLOR)?.GetValue() is Color fill)
                     || (fill.R == 255 && fill.G == 255 && fill.B == 255)) continue;
                 if (SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.SIZINGBORDERWIDTH) != null) continue;
-                if (SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.BORDERSIZE)?.GetValue() is int bs && bs >= 2) continue;
+                if (SemanticModel.FindEffective(m_target.Style, tc, 0, 0, IDENTIFIER.BORDERSIZE)?.GetValue() is int bs && bs >= edge) continue;
 
-                var p = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGBORDERWIDTH, (int)IDENTIFIER.INT) { classID = tc.ClassId, partID = 0, stateID = 0 });
-                p.SetValue(2);
+                // TMT_SIZINGBORDERWIDTH is a SIZE (tmschema.h:194), not an INT.
+                var p = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGBORDERWIDTH, (int)IDENTIFIER.SIZE) { classID = tc.ClassId, partID = 0, stateID = 0 });
+                p.SetValue(edge);
                 state.Properties.Add(p);
-                AddedRecords.Add($"{tc.ClassId}/0/0/{(int)IDENTIFIER.SIZINGBORDERWIDTH}/{(int)IDENTIFIER.INT}");
+                AddedRecords.Add($"{tc.ClassId}/0/0/{(int)IDENTIFIER.SIZINGBORDERWIDTH}/{(int)IDENTIFIER.SIZE}");
                 MarkTouched(p, $"{name}|{part.PartName}|S0|SIZINGBORDERWIDTH");
-                m_report.Notes.Add($"{name}: SIZINGBORDERWIDTH 2 added so the theme paints the whole client edge in {fill.R},{fill.G},{fill.B} (comctl32 filled the rest white).");
+                m_report.Notes.Add($"{name}: SIZINGBORDERWIDTH {edge} added so the theme paints the whole client edge in {fill.R},{fill.G},{fill.B} (comctl32 filled the rest white).");
                 m_report.Count("applied-client-edge");
             }
+        }
+
+        /// <summary>SM_CXEDGE, the width comctl32 compares the theme's SIZINGBORDERWIDTH against.</summary>
+        private static int SystemEdgeWidth()
+        {
+            try
+            {
+                int edge = User32.GetSystemMetrics(SmCxEdge);
+                if (edge > 0) return edge;
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+            return 2; // the 96 dpi metric
+        }
+
+        private const int SmCxEdge = 45;
+
+        private static class User32
+        {
+            [DllImport("user32.dll")]
+            internal static extern int GetSystemMetrics(int index);
         }
 
         // win10 class/part that draws what an xp class/part drew, and the xp class/part whose picture it takes.
@@ -1479,7 +1911,7 @@ namespace libmsstyle.Import
                 var img = Decoded(m, "IMAGE", e.ResourceId);
                 if (img == null) return null;
                 int n = SemanticModel.FindEffective(m.Style, c, part, stateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int cnt && cnt > 0 ? cnt : 1;
-                bool horizontal = SemanticModel.FindEffective(m.Style, c, part, stateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int lo && lo == 1;
+                bool horizontal = SemanticModel.FindEffective(m.Style, c, part, stateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int lo ? lo == 1 : true; // uxtheme's default is IL_HORIZONTAL (imagefile.cpp:66-67)
                 return horizontal ? new Size(img.Width / n, img.Height) : new Size(img.Width, img.Height / n);
             }
             foreach (var state in m_source.Entries.Where(e => e.ResourceType == "IMAGE" && e.NameId == (int)IDENTIFIER.IMAGEFILE1)
@@ -1489,17 +1921,29 @@ namespace libmsstyle.Import
                 var src = m_source.Entries.Where(e => e.StateKey == state.StateKey).ToList();
                 var sp = src.FirstOrDefault()?.Property;
                 if (sp == null || !m_source.Style.Classes.TryGetValue(sp.Header.classID, out var scls)) continue;
-                if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int sg && sg == 1)) continue;
+                // xp selects among the numbered slots for image glyphs (fForGlyph) and for every part whose
+                // GLYPHTYPE isn't an image glyph (SelectCorrectImageFile), so a non-glyph picture strip is
+                // picked by the same min-size rule; only a font glyph has no numbered pictures.
+                int sgv = SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int g0 ? g0 : 0;
+                if (sgv == 2) continue;
                 if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ss && ss == 1)) continue;
-                // the source's glyph files in slot order with the min size xp gave each.
+                // the source's glyph files in slot order with the min size xp gave each. A missing slot just isn't
+                // in the set (xp's _iMultiImageCount counts the files it found), it doesn't end the list.
                 var glyphs = new List<(SemanticEntry Entry, int W, int H)>();
+                bool skipped = false;
                 for (int i = 0; i < slotIds.Length; ++i)
                 {
                     var e = src.FirstOrDefault(x => x.NameId == (int)slotIds[i] && x.ResourceType == "IMAGE");
-                    if (e == null) break;
-                    if (!(MinSize(m_source, scls, sp.Header.partID, state.StateId, i, e) is Size sz)) { glyphs.Clear(); break; }
+                    if (e == null) continue;
+                    if (!(MinSize(m_source, scls, sp.Header.partID, state.StateId, i, e) is Size sz))
+                    {
+                        skipped = true;
+                        continue;
+                    }
                     glyphs.Add((e, sz.Width, sz.Height));
                 }
+                if (skipped)
+                    m_report.Notes.Add($"{state.ClassName} {state.PartName} S{state.StateId}: a numbered picture has no min size and no decodable frame, so it is left out of the glyph set.");
                 if (glyphs.Count < 1) continue;
                 // glyphs the source kept at stock xp's stay the template's (Luna10 redrew them for its larger slots).
                 if (glyphs.All(g => m_base.ByKey.TryGetValue(g.Entry.Key, out var b) && Same(m_base, b, m_source, g.Entry))) continue;
@@ -1508,7 +1952,8 @@ namespace libmsstyle.Import
                     && t.ResourceType == "IMAGE" && DpiSlotIds.Contains(t.NameId)).ToList();
                 if (slots.Count == 0) continue;
                 var tcls = m_target.Style.Classes[slots[0].Property.Header.classID];
-                if (!(SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int tg && tg == 1)) continue;
+                int tgv = SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int g1 ? g1 : 0;
+                if (tgv == 2) continue;
                 if (!(SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ts && ts == 1)) continue;
                 // min sizes of the template's own pictures, read before any slot is rewritten.
                 var targetMin = slots.ToDictionary(t => t, t => MinSize(m_target, tcls, t.PartId, state.StateId, Array.IndexOf(slotIds, (IDENTIFIER)t.NameId), t));
@@ -1521,13 +1966,80 @@ namespace libmsstyle.Import
                 {
                     if (!explicitMin && m_touched.Contains(t.Property)) continue;
                     var tms = targetMin[t];
-                    var pick = tms is Size tsz
-                        ? glyphs.LastOrDefault(g => g.W <= tsz.Width && g.H <= tsz.Height)
-                        : glyphs[glyphs.Count - 1];
+                    // xp walks the slots from the largest index down and takes the first that fits
+                    // (SelectCorrectImageFile, imagefile.cpp:1208-1223), not the largest by area.
+                    (SemanticEntry Entry, int W, int H) pick = default;
+                    if (tms is Size tsz)
+                    {
+                        for (int i = glyphs.Count - 1; i >= 0; --i)
+                            if (glyphs[i].W <= tsz.Width && glyphs[i].H <= tsz.Height) { pick = glyphs[i]; break; }
+                    }
+                    else
+                    {
+                        pick = glyphs[glyphs.Count - 1];
+                    }
                     if (pick.Entry == null) pick = glyphs[0]; // smaller than every source glyph: xp drew the first.
                     if (Same(m_source, pick.Entry, m_target, t)) continue;
                     ApplyExtra(t, pick.Entry, null, "applied-glyph-size-slot",
                         $"xp picks the image glyph by size; at this slot's min size ({(tms is Size z ? $"{z.Width}x{z.Height}" : "unknown")}) it drew the source's {pick.Entry.PropertyName} ({pick.W}x{pick.H})");
+                }
+            }
+        }
+
+        /// <summary>
+        /// xp only: IMAGESELECTTYPE = IST_DPI on a part with numbered slots. uxtheme picks the largest slot whose
+        /// MINDPIn is at or below min(LOGPIXELSX, LOGPIXELSY) (imagefile.cpp SelectCorrectImageFile). The template
+        /// keeps its own dpi thresholds; each of its slots takes the source picture xp would have drawn at that dpi.
+        /// </summary>
+        private void DpiThresholdSlotsFromXp()
+        {
+            var minDpiIds = new[] { IDENTIFIER.MINDPI1, IDENTIFIER.MINDPI2, IDENTIFIER.MINDPI3, IDENTIFIER.MINDPI4, IDENTIFIER.MINDPI5 };
+            var slotIds = new[] { IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3, IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5 };
+            int Dpi(SemanticModel m, StyleClass c, int part, int stateId, int slot)
+            {
+                if (slot >= 0 && slot < minDpiIds.Length && SemanticModel.FindEffective(m.Style, c, part, stateId, minDpiIds[slot])?.GetValue() is int d) return d;
+                return 96; // uxtheme's default (imagefile.cpp line 262)
+            }
+            foreach (var state in m_source.Entries.Where(e => e.ResourceType == "IMAGE" && e.NameId == (int)IDENTIFIER.IMAGEFILE1)
+                .Select(e => (e.ClassName, e.PartName, e.StateId, e.StateKey)).Distinct().ToList())
+            {
+                if (m_target.DuplicateClassNames.Contains(state.ClassName) || KeyPattern.Matches(m_opt.Exclude, state.ClassName, state.PartName, "IMAGEFILE*")) continue;
+                var src = m_source.Entries.Where(e => e.StateKey == state.StateKey).ToList();
+                var sp = src.FirstOrDefault()?.Property;
+                if (sp == null || !m_source.Style.Classes.TryGetValue(sp.Header.classID, out var scls)) continue;
+                int sgv = SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int g0 ? g0 : 0;
+                if (sgv == 2) continue;
+                if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ss && ss == 2)) continue;
+                var picks = new List<(SemanticEntry Entry, int Dpi)>();
+                bool explicitDpi = true;
+                for (int i = 0; i < slotIds.Length; ++i)
+                {
+                    var e = src.FirstOrDefault(x => x.NameId == (int)slotIds[i] && x.ResourceType == "IMAGE");
+                    if (e == null) break;
+                    if (!(SemanticModel.FindEffective(m_source.Style, scls, sp.Header.partID, state.StateId, minDpiIds[i])?.GetValue() is int)) explicitDpi = false;
+                    picks.Add((e, Dpi(m_source, scls, sp.Header.partID, state.StateId, i)));
+                }
+                if (picks.Count < 1) continue;
+                if (picks.All(p => m_base.ByKey.TryGetValue(p.Entry.Key, out var b) && Same(m_base, b, m_source, p.Entry))) continue;
+
+                var slots = m_target.Entries.Where(t => t.ClassName == state.ClassName && t.PartName == state.PartName && t.StateId == state.StateId
+                    && t.ResourceType == "IMAGE" && DpiSlotIds.Contains(t.NameId)).ToList();
+                if (slots.Count == 0) continue;
+                var tcls = m_target.Style.Classes[slots[0].Property.Header.classID];
+                int tgv = SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int g1 ? g1 : 0;
+                if (tgv == 2) continue;
+                if (!(SemanticModel.FindEffective(m_target.Style, tcls, slots[0].PartId, state.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int ts && ts == 2)) continue;
+                foreach (var t in slots)
+                {
+                    if (!explicitDpi && m_touched.Contains(t.Property)) continue;
+                    int td = Dpi(m_target, tcls, t.PartId, state.StateId, Array.IndexOf(slotIds, (IDENTIFIER)t.NameId));
+                    // xp walks the slots from the largest down and takes the first whose min dpi fits; nothing fits
+                    // before slot 1, which is the parent image, so a smaller threshold still draws the first pick.
+                    var pick = picks.LastOrDefault(p => p.Dpi <= td);
+                    if (pick.Entry == null) pick = picks[0];
+                    if (Same(m_source, pick.Entry, m_target, t)) continue;
+                    ApplyExtra(t, pick.Entry, null, "applied-dpi-threshold-slot",
+                        $"xp selects the numbered picture by display dpi; at {td} dpi it drew the source's {pick.Entry.PropertyName} ({pick.Dpi} dpi)");
                 }
             }
         }
@@ -1559,12 +2071,23 @@ namespace libmsstyle.Import
                 var bp = SemanticModel.FindEffective(m_base.Style, bc, f.FromPart, 0, f.FromProp);
                 if (!(sp?.GetValue() is Color fill) || (bp?.GetValue() is Color stock && stock.ToArgb() == fill.ToArgb())) continue;
                 if (!tc.Parts.TryGetValue(f.Part, out var part) || !part.States.TryGetValue(0, out var state)) continue;
-                var bg = state.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.BGTYPE);
+                // the background may be inherited from the class's part 0 / globals, not stored on this state.
+                var bg = SemanticModel.FindEffective(m_target.Style, tc, f.Part, 0, IDENTIFIER.BGTYPE);
                 if (bg == null || !(bg.GetValue() is int t) || t != 0 || m_touched.Contains(bg)) continue; // only an untouched imagefile background
 
                 string label = $"{f.Class}|{part.PartName}|S0|";
+                // an inherited record is written as a local one so the fill's own BGTYPE travels with it.
+                if (bg.Header.classID != tc.ClassId || bg.Header.partID != f.Part || bg.Header.stateID != 0)
+                {
+                    var local = new StyleProperty(new PropertyHeader((int)IDENTIFIER.BGTYPE, (int)IDENTIFIER.ENUM) { classID = tc.ClassId, partID = f.Part, stateID = 0 });
+                    local.SetValue(0);
+                    state.Properties.Add(local);
+                    AddedRecords.Add($"{tc.ClassId}/{f.Part}/0/{(int)IDENTIFIER.BGTYPE}/{(int)IDENTIFIER.ENUM}");
+                    bg = local;
+                }
                 bg.SetValue(1); // BORDERFILL
                 MarkTouched(bg, label + "BGTYPE");
+                // BORDERSIZE is an INT (tmschema.h:298 TM_PROP(2403, TMT, BORDERSIZE, INT)), not a SIZE.
                 foreach (var (id, type, value) in new (IDENTIFIER, IDENTIFIER, object)[] { (IDENTIFIER.BORDERSIZE, IDENTIFIER.INT, 0), (IDENTIFIER.FILLCOLOR, IDENTIFIER.COLOR, fill) })
                 {
                     var p = state.Properties.FirstOrDefault(x => x.Header.nameID == (int)id);
@@ -1577,9 +2100,17 @@ namespace libmsstyle.Import
                     if (value is Color c) p.SetValue(c); else p.SetValue((int)value);
                     MarkTouched(p, label + id);
                 }
-                var s = m_source.Entries.First(e => ReferenceEquals(e.Property, sp));
-                Decide(s, "applied-flat-fill", $"{f.Why} replaces the template's picture on {f.Class} part {f.Part}",
-                    null, s, null, $"BORDERFILL {SemanticModel.FormatValue(sp)}");
+                // the source entry may come from an inherited state, so it needn't be in Entries.
+                var s = m_source.Entries.FirstOrDefault(e => ReferenceEquals(e.Property, sp));
+                if (s != null)
+                {
+                    Decide(s, "applied-flat-fill", $"{f.Why} replaces the template's picture on {f.Class} part {f.Part}",
+                        null, s, null, $"BORDERFILL {SemanticModel.FormatValue(sp)}");
+                }
+                else
+                {
+                    m_report.Notes.Add($"{f.Class} part {f.Part}: filled with {SemanticModel.FormatValue(sp)} from {f.FromClass} part {f.FromPart} {f.FromProp} (the record is inherited from another state).");
+                }
                 m_report.Count("applied-flat-fill");
             }
         }
@@ -1631,6 +2162,15 @@ namespace libmsstyle.Import
         };
 
         /// <summary>
+        /// Win10's ProperTreeLinksHeader uses <c>gtc(Communications::Rebar, 0, 0, 3803)</c> as its
+        /// <em>background</em> (UIFILE 1), not as text: xp's black Rebar TEXTCOLOR copied into it made the
+        /// "Folders" strip a solid black bar with invisible black text. Keep the template's light value.
+        /// </summary>
+        private static bool IsNavPaneHeaderPaint(SemanticEntry a)
+            => string.Equals(a.ClassName, "Communications::Rebar", StringComparison.OrdinalIgnoreCase)
+               && a.PartId == 0 && a.NameId == (int)IDENTIFIER.TEXTCOLOR;
+
+        /// <summary>
         /// Template-only records (aero11 additions) that hide a value the source changed further up
         /// the inheritance chain get the source's value copied in, never deleted. Explorer::Button
         /// doesn't exist on win7, inherits Button, and adds its own PUSHBUTTON text colors that would
@@ -1649,6 +2189,7 @@ namespace libmsstyle.Import
                     || m_base.ByKey.ContainsKey(a.Key) || m_source.ByKey.ContainsKey(a.Key)
                     || a.ClassName.StartsWith("DarkMode", StringComparison.OrdinalIgnoreCase)
                     || m_target.DuplicateClassNames.Contains(a.ClassName)
+                    || IsNavPaneHeaderPaint(a)
                     || string.Equals(a.ClassName, DwmClass, StringComparison.OrdinalIgnoreCase)
                     || KeyPattern.Matches(m_opt.Exclude, a.ClassName, a.PartName, a.PropertyName)) continue;
                 bool win10Only = !m_base.ClassesByName.ContainsKey(a.ClassName);
@@ -1879,6 +2420,10 @@ namespace libmsstyle.Import
             (int)IDENTIFIER.IMAGEFILE, (int)IDENTIFIER.IMAGEFILE1, (int)IDENTIFIER.IMAGEFILE2, (int)IDENTIFIER.IMAGEFILE3,
             (int)IDENTIFIER.IMAGEFILE4, (int)IDENTIFIER.IMAGEFILE5, (int)IDENTIFIER.IMAGEFILE6, (int)IDENTIFIER.IMAGEFILE7,
             (int)IDENTIFIER.IMAGECOUNT, (int)IDENTIFIER.IMAGELAYOUT, (int)IDENTIFIER.SIZINGMARGINS,
+            // the slot thresholds are fitted to the slot pictures (xp's MINSIZE/MINDPI say which picture a size
+            // or display dpi gets), so they belong to the same geometry as the pictures they select.
+            (int)IDENTIFIER.MINSIZE1, (int)IDENTIFIER.MINSIZE2, (int)IDENTIFIER.MINSIZE3, (int)IDENTIFIER.MINSIZE4, (int)IDENTIFIER.MINSIZE5,
+            (int)IDENTIFIER.MINDPI1, (int)IDENTIFIER.MINDPI2, (int)IDENTIFIER.MINDPI3, (int)IDENTIFIER.MINDPI4, (int)IDENTIFIER.MINDPI5,
         };
 
         // IMAGEFILE1..7: the same picture at different dpi, picked by IMAGESELECTTYPE.
@@ -1911,6 +2456,8 @@ namespace libmsstyle.Import
         private Dictionary<string, string> LockedGeometryParts(IEnumerable<string> keys)
         {
             var locked = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var e in m_target.Entries.Where(e => m_report.UnmappedStripParts.Contains(e.ClassName + "|" + e.PartId)))
+                locked[e.PartKey] = "source strip has no supported state mapping for this target part; its template art and geometry stay together";
             var keptImage = new Dictionary<string, string>(StringComparer.Ordinal);
             var scalarChange = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var e in m_target.Entries.Where(e => e.ResourceType == "IMAGE" && !DpiSlotIds.Contains(e.NameId) && !m_base.ByKey.ContainsKey(e.Key)))
@@ -1919,13 +2466,13 @@ namespace libmsstyle.Import
             // prefer-source art: the source kept xp's own picture, the template redrew that slot, and the source's
             // picture still cuts into the template's frame count. Those parts take the source picture and, with it,
             // the source's own strip geometry (ExplorerBar's single-picture group headers and backgrounds).
-            if (m_source.Platform == Platform.WinXP && m_opt.PreferSource.Count > 0)
+            if (m_source.Platform == Platform.WinXP)
             {
                 foreach (var e in m_target.Entries.Where(e => e.ResourceType == "IMAGE" && !m_touched.Contains(e.Property)))
                 {
                     if (!m_base.ByKey.TryGetValue(e.Key, out var b) || !m_source.ByKey.TryGetValue(e.Key, out var se)) continue;
-                    if (se.ResourceType != "IMAGE" || Same(m_base, b, m_source, se) || Same(m_base, b, m_target, e)) continue;
-                    if (!KeyPattern.Matches(m_opt.PreferSource, e.ClassName, e.PartName, e.PropertyName)) continue;
+                    if (se.ResourceType != "IMAGE" || Same(m_source, se, m_target, e)) continue;
+                    if (!PreferSourceRecord(se)) continue;
                     if (!SameFrameCut(se, e)) continue;
                     m_preferStockArtParts.Add(e.PartKey);
                 }
@@ -1936,7 +2483,7 @@ namespace libmsstyle.Import
                 if (!m_base.ByKey.TryGetValue(key, out var b) || !m_source.ByKey.TryGetValue(key, out var s)) continue;
                 if (!GeometryIds.Contains(b.NameId) || Same(m_base, b, m_source, s)) continue;
                 if (!m_target.ByKey.TryGetValue(key, out var a) || Same(m_source, s, m_target, a)) continue;
-                if (KeyPattern.Matches(m_opt.PreferSource, b.ClassName, b.PartName, b.PropertyName)) continue;
+                if (PreferSourceRecord(s)) continue;
 
                 bool conflict = !Same(m_base, b, m_target, a);
                 // a picture the source replaced never holds the part back, even where the template redrew
@@ -2012,36 +2559,117 @@ namespace libmsstyle.Import
             var slots = m_target.Entries.Where(e =>
                 e.ResourceType == "IMAGE" && DpiSlotIds.Contains(e.NameId)
                 && !m_touched.Contains(e.Property)
-                && !m_base.ByKey.ContainsKey(e.Key)
+                && !m_report.UnmappedStripParts.Contains(e.ClassName + "|" + e.PartId)
                 && !string.Equals(e.ClassName, DwmClass, StringComparison.OrdinalIgnoreCase)
                 && !m_target.DuplicateClassNames.Contains(e.ClassName)
-                && !locked.ContainsKey(e.PartKey)
                 && !KeyPattern.Matches(m_opt.Exclude, e.ClassName, e.PartName, e.PropertyName)).ToList();
             foreach (var e in slots)
             {
                 // only states whose pictures the import replaced: untouched parts keep aero11's high dpi art.
                 bool replaced = m_target.Entries.Any(o => o.PartKey == e.PartKey && o.StateId == e.StateId
-                    && o.ResourceType == "IMAGE" && (o.NameId == (int)IDENTIFIER.IMAGEFILE || DpiSlotIds.Contains(o.NameId))
+                    && o.ResourceType == "IMAGE"
                     && m_touched.Contains(o.Property));
                 if (!replaced) continue;
-                // a part drawn as an image glyph with IMAGESELECTTYPE (Luna10 Toolbar SPLITBUTTONDROPDOWN, the
-                // back/forward dropdown arrows) picks its glyph from IMAGEFILE1-7: those slots are glyph sizes
-                // and get the source's GLYPHIMAGEFILE. Filling them with the button background left no arrow.
-                bool glyphSlots = m_target.Style.Classes.TryGetValue(e.Property.Header.classID, out var tcls)
-                    && SemanticModel.FindEffective(m_target.Style, tcls, e.PartId, e.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int gt && gt == 1
-                    && SemanticModel.FindEffective(m_target.Style, tcls, e.PartId, e.StateId, IDENTIFIER.IMAGESELECTTYPE) != null;
-                var from = glyphSlots
-                    ? m_source.Entries.FirstOrDefault(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE" && s.NameId == (int)IDENTIFIER.GLYPHIMAGEFILE)
-                    : m_source.Entries
-                        .Where(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE"
-                            && (DpiSlotIds.Contains(s.NameId) || s.NameId == (int)IDENTIFIER.IMAGEFILE))
-                        .OrderByDescending(s => DpiSlotIds.Contains(s.NameId) ? s.NameId : 0)
-                        .FirstOrDefault();
+                // numbered files are a multi-dib rooted at IMAGEFILE1. xp's SelectCorrectImageFile walks that set
+                // whenever IMAGESELECTTYPE is set (or when the part isn't an image glyph); GLYPHIMAGEFILE is a
+                // single scaled glyph and only stands in for a plain image glyph, never for the multi-dib.
+                bool haveTcls = m_target.Style.Classes.TryGetValue(e.Property.Header.classID, out var tcls);
+                int sel = haveTcls && SemanticModel.FindEffective(m_target.Style, tcls, e.PartId, e.StateId, IDENTIFIER.IMAGESELECTTYPE)?.GetValue() is int v ? v : 0;
+                int gt = haveTcls && SemanticModel.FindEffective(m_target.Style, tcls, e.PartId, e.StateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int g ? g : 0;
+                var sourceSlots = m_source.Entries
+                    .Where(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE" && DpiSlotIds.Contains(s.NameId))
+                    .OrderByDescending(s => s.NameId)
+                    .ToList();
+                SemanticEntry from;
+                if (sel != 0)
+                {
+                    from = sourceSlots.FirstOrDefault();
+                    if (from == null)
+                        from = m_source.Entries.FirstOrDefault(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE"
+                            && s.NameId == (int)(gt == 1 ? IDENTIFIER.GLYPHIMAGEFILE : IDENTIFIER.IMAGEFILE));
+                }
+                else
+                {
+                    from = gt == 1
+                        ? m_source.Entries.FirstOrDefault(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE" && s.NameId == (int)IDENTIFIER.GLYPHIMAGEFILE)
+                        : null;
+                    if (from == null) from = sourceSlots.FirstOrDefault();
+                    if (from == null)
+                        from = m_source.Entries.FirstOrDefault(s => s.PartKey == e.PartKey && s.StateId == e.StateId && s.ResourceType == "IMAGE" && s.NameId == (int)IDENTIFIER.IMAGEFILE);
+                }
                 if (from == null || Same(m_source, from, m_target, e)) continue;
+                if (locked.ContainsKey(e.PartKey) && !SameFrameCut(from, e)) continue;
                 ApplyExtra(e, from, null, "applied-dpi-fill",
-                    glyphSlots ? "template-only dpi slot of an image glyph in a state that now uses the source's pictures; took the source's GLYPHIMAGEFILE"
-                               : $"template-only dpi slot in a state that now uses the source's pictures; took the source's largest ({from.PropertyName})");
+                    $"template-only dpi slot in a state that now uses the source's pictures; took the source's largest numbered picture ({from.PropertyName})");
+                // the copied slot's art was designed for xp's own display dpi, so its selection threshold follows it.
+                if (sel == 2) CopyDpiThreshold(e, from);
             }
+        }
+
+        private static readonly IDENTIFIER[] MinDpiIds = { IDENTIFIER.MINDPI1, IDENTIFIER.MINDPI2, IDENTIFIER.MINDPI3, IDENTIFIER.MINDPI4, IDENTIFIER.MINDPI5 };
+
+        private static int DpiSlotIndex(int nameId)
+        {
+            int i = 0;
+            foreach (var id in new[] { IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3, IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5 })
+            {
+                if ((int)id == nameId) return i;
+                ++i;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// A dpi slot filled from the source's own multi-dib keeps the source picture's design dpi as its threshold,
+        /// clamped so it never sits above the next slot's (uxtheme walks the slots from the largest down and takes
+        /// the first whose MINDPI fits, so a lower slot above the next one would never be reached).
+        /// </summary>
+        private void CopyDpiThreshold(SemanticEntry slot, SemanticEntry from)
+        {
+            int ti = DpiSlotIndex(slot.NameId), fi = DpiSlotIndex(from.NameId);
+            if (ti < 0 || fi < 0) return;
+            var srcDpi = m_source.Entries.FirstOrDefault(s => s.PartKey == from.PartKey && s.StateId == from.StateId
+                && s.ResourceType != "IMAGE" && s.NameId == (int)MinDpiIds[fi]);
+            if (!(srcDpi?.Property.GetValue() is int dpi)) return;
+            if (ti + 1 < MinDpiIds.Length)
+            {
+                var next = m_target.Entries.FirstOrDefault(t => t.PartKey == slot.PartKey && t.StateId == slot.StateId && t.NameId == (int)MinDpiIds[ti + 1]);
+                if (next?.Property.GetValue() is int nd && dpi > nd) dpi = nd;
+            }
+            var have = m_target.Entries.FirstOrDefault(t => t.PartKey == slot.PartKey && t.StateId == slot.StateId && t.NameId == (int)MinDpiIds[ti]);
+            if (have != null && have.Property.GetValue() is int cur && cur == dpi) return;
+            if (have == null)
+            {
+                if (!m_target.Style.Classes.TryGetValue(slot.Property.Header.classID, out var tcls)
+                    || !tcls.Parts.TryGetValue(slot.PartId, out var part) || !part.States.TryGetValue(slot.StateId, out var state)) return;
+                var rec = new StyleProperty(new PropertyHeader((int)MinDpiIds[ti], (int)IDENTIFIER.INT)
+                {
+                    classID = slot.Property.Header.classID, partID = slot.PartId, stateID = slot.StateId
+                });
+                rec.SetValue(dpi);
+                state.Properties.Add(rec);
+                AddedRecords.Add($"{slot.Property.Header.classID}/{slot.PartId}/{slot.StateId}/{(int)MinDpiIds[ti]}/{(int)IDENTIFIER.INT}");
+                MarkTouched(rec, $"{slot.ClassName}|{slot.PartName}|S{slot.StateId}|MINDPI{ti + 1}");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = slot.ClassName, Part = slot.PartName, State = slot.StateId, Property = $"MINDPI{ti + 1}",
+                    Action = "added-dpi-threshold",
+                    Reason = "the copied dpi slot keeps the display dpi its picture was drawn for instead of the template's threshold, which was fitted to the template's own picture",
+                    Result = dpi.ToString(),
+                });
+                m_report.Count("added-dpi-threshold");
+                return;
+            }
+            have.Property.SetValue(dpi);
+            MarkTouched(have.Property, $"{slot.ClassName}|{slot.PartName}|S{slot.StateId}|MINDPI{ti + 1}");
+            m_report.Decisions.Add(new MergeDecision
+            {
+                Class = slot.ClassName, Part = slot.PartName, State = slot.StateId, Property = $"MINDPI{ti + 1}",
+                Action = "applied-dpi-threshold",
+                Reason = "the copied dpi slot keeps the display dpi its picture was drawn for instead of the template's threshold, which was fitted to the template's own picture",
+                Result = dpi.ToString(),
+            });
+            m_report.Count("applied-dpi-threshold");
         }
 
         private Dictionary<string, List<SemanticEntry>> m_baseImagesBySize;
@@ -2153,7 +2781,7 @@ namespace libmsstyle.Import
                     // colors follow the source no matter what.
                     bool withGeometry = GeometryIds.Contains(s.NameId) && m_sourceGeometryParts.Contains(s.PartKey);
                     bool isColor = a.TypeId == (int)IDENTIFIER.COLOR;
-                    if ((withGeometry || isColor) && !KeyPattern.Matches(m_opt.Exclude, cls, part, prop) && !m_touched.Contains(a.Property))
+                    if ((withGeometry || isColor || PreferSourceRecord(s)) && !KeyPattern.Matches(m_opt.Exclude, cls, part, prop) && !m_touched.Contains(a.Property))
                     {
                         if (!ApplySourceValue(src, s, a.Property, out string addErr))
                         {
@@ -2197,9 +2825,9 @@ namespace libmsstyle.Import
             // template retuned for its own Win10-only records is not something a stock xp value describes.
             bool preferStockHere = m_preferStockArtParts.Contains(s.PartKey) && GeometryIds.Contains(s.NameId);
             if (sourceUnchanged && a != null && !m_touched.Contains(a.Property)
-                && src.Platform == Platform.WinXP && GeometryIds.Contains(s.NameId)
+                && src.Platform == Platform.WinXP && (GeometryIds.Contains(s.NameId) || PreferSourceRecord(s))
                 && !Same(m_base, b, m_target, a)
-                && (preferStockHere || KeyPattern.Matches(m_opt.PreferSource, cls, part, prop)))
+                && (preferStockHere || PreferSourceRecord(s)))
             {
                 if (!ApplySourceValue(src, s, a.Property, out string stockErr))
                 {
@@ -2215,7 +2843,7 @@ namespace libmsstyle.Import
                 m_report.Notes.Add($"prefer-source: {cls}|{part}|{prop} took the source's stock xp value over the template's adaptation.");
                 return true;
             }
-            if (sourceUnchanged)
+            if (sourceUnchanged && a != null)
             {
                 r.Count("unchanged");
                 return false;
@@ -2242,13 +2870,16 @@ namespace libmsstyle.Import
                 // to left while its normal caption stayed centered. the source's non-default alignment is added.
                 bool centeredCaption = s.NameId == (int)IDENTIFIER.CONTENTALIGNMENT && string.Equals(cls, "Window", StringComparison.OrdinalIgnoreCase)
                     && s.Property.GetValue() is int align && align != 0;
-                if (src.Platform == Platform.WinXP && (s.NameId == (int)IDENTIFIER.BGTYPE || s.TypeId == (int)IDENTIFIER.COLOR || cut || centeredCaption) && TryAddRecord(s, src, out string bgWhy))
+                bool supported = s.TypeId == (int)IDENTIFIER.FONT || s.ResourceType == "IMAGE"
+                    || GeometryIds.Contains(s.NameId) || s.NameId == (int)IDENTIFIER.FILLTYPE
+                    || s.NameId == (int)IDENTIFIER.TRANSPARENT_ || s.NameId == (int)IDENTIFIER.TRANSPARENTCOLOR
+                    || s.NameId == (int)IDENTIFIER.SIZINGTYPE || s.NameId == (int)IDENTIFIER.IMAGESELECTTYPE
+                    || s.NameId == (int)IDENTIFIER.GLYPHTYPE || s.NameId == (int)IDENTIFIER.MINSIZE
+                    || m_appendedClasses.Values.Contains(s.ClassName);
+                if (src.Platform == Platform.WinXP && (s.NameId == (int)IDENTIFIER.BGTYPE || s.TypeId == (int)IDENTIFIER.COLOR || cut || centeredCaption || supported)
+                    && TryAddRecord(s, src, out string bgWhy))
                 {
-                    Decide(s, "added", s.TypeId == (int)IDENTIFIER.COLOR
-                        ? "template dropped this color; xp still draws with it, so the source's color was added"
-                        : centeredCaption ? "template has no alignment for this caption part; win10 would draw it left, xp aligned it where the source says, so the source's CONTENTALIGNMENT was added"
-                        : cut ? "template has no frame layout/count here; win10's default would cut the source's strip differently than xp, so the source's was added"
-                        : "template has no BGTYPE here; without it uxtheme ignores the source's image, so the source's BGTYPE was added", b, s, null, null);
+                    Decide(s, "added", "template lacks a supported XP appearance record; copied the source value with resource/font translation", b, s, null, null);
                     r.Count("added");
                     return true;
                 }
@@ -2279,7 +2910,7 @@ namespace libmsstyle.Import
             bool pictureFollows = false;
             if (!targetStock && !color)
             {
-                if (!KeyPattern.Matches(m_opt.PreferSource, cls, part, prop))
+                if (!PreferSourceRecord(s))
                 {
                     var alias = ReferenceEquals(src, m_source) ? FindImageAlias(a) : null;
                     if (alias == null)
@@ -2439,16 +3070,47 @@ namespace libmsstyle.Import
         /// The value goes through ApplySourceValue, so images are copied, string and font ids are
         /// translated and records whose meaning changed between win7 and win10 are refused.
         /// </summary>
+        private bool PreferSourceRecord(SemanticEntry s)
+        {
+            if (KeyPattern.Matches(m_opt.PreferSource, s.ClassName, s.PartName, s.PropertyName)) return true;
+            if (m_source.Platform != Platform.WinXP) return false;
+            if (s.TypeId == (int)IDENTIFIER.FONT
+                && (s.ClassName.Equals("ExplorerBar::Rebar", StringComparison.OrdinalIgnoreCase)
+                    || s.ClassName.Equals("TaskBar::Toolbar", StringComparison.OrdinalIgnoreCase)
+                    || s.ClassName.Equals("TaskBarVert::Toolbar", StringComparison.OrdinalIgnoreCase)
+                    || (s.ClassName.Equals("ExplorerBar", StringComparison.OrdinalIgnoreCase)
+                        && (s.PartName == "NORMALGROUPHEAD" || s.PartName == "SPECIALGROUPHEAD")))) return true;
+            bool artwork = s.ResourceType == "IMAGE" || GeometryIds.Contains(s.NameId)
+                || s.NameId == (int)IDENTIFIER.SIZINGTYPE || s.NameId == (int)IDENTIFIER.TRANSPARENT_
+                || s.NameId == (int)IDENTIFIER.TRANSPARENTCOLOR || s.NameId == (int)IDENTIFIER.BGTYPE;
+            if (s.ClassName.Equals("ExplorerBar", StringComparison.OrdinalIgnoreCase)
+                && (s.PartName == "NORMALGROUPBACKGROUND" || s.PartName == "SPECIALGROUPBACKGROUND")) return artwork;
+            if (s.ClassName.Equals("ExplorerBar::Rebar", StringComparison.OrdinalIgnoreCase)
+                || s.ClassName.Equals("TaskBand::Scrollbar", StringComparison.OrdinalIgnoreCase)) return artwork;
+            if (artwork && ((s.ClassName.Equals("Toolbar", StringComparison.OrdinalIgnoreCase) && s.PartName == "SEPARATORVERT")
+                || (s.ClassName.Equals("TrackBar", StringComparison.OrdinalIgnoreCase) && s.PartName == "THUMBBOTTOM")
+                || (s.ClassName.Equals("Button", StringComparison.OrdinalIgnoreCase) && s.PartName == "RADIOBUTTON"))) return true;
+            return s.NameId == (int)IDENTIFIER.CONTENTMARGINS
+                && ((s.ClassName.Equals("TaskBand", StringComparison.OrdinalIgnoreCase) && s.PartName == "FLASHBUTTONGROUPMENU")
+                    || (s.ClassName.Equals("TaskBar::Rebar", StringComparison.OrdinalIgnoreCase) && s.PartName == "CHEVRON"));
+        }
+
         private bool TryAddRecord(SemanticEntry s, SemanticModel src, out string why)
         {
             why = null;
+            if (s.ClassName.Equals("Window", StringComparison.OrdinalIgnoreCase)
+                && (s.PropertyName == "OFFSET" || s.PropertyName == "OFFSETTYPE"))
+            {
+                why = "XP caption OFFSET/OFFSETTYPE have no verified corresponding Windows 10 caption consumer";
+                return false;
+            }
             if (!m_target.ClassesByName.TryGetValue(s.ClassName, out var cls) || m_target.DuplicateClassNames.Contains(s.ClassName))
             {
                 why = "class doesn't exist in the template (or isn't unique)";
                 return false;
             }
             // a class without records isn't registered by uxtheme; giving it one shifts every later BCMAP parent.
-            if (!cls.Parts.Values.Any(p => p.States.Values.Any(st => st.Properties.Count > 0)))
+            if (!m_appendedClasses.ContainsKey(cls.ClassId) && !cls.Parts.Values.Any(p => p.States.Values.Any(st => st.Properties.Count > 0)))
             {
                 why = "the template class has no records; adding the first one would shift uxtheme's BCMAP parents";
                 return false;
@@ -2461,6 +3123,12 @@ namespace libmsstyle.Import
                 partId = byName[0];
             }
 
+            if (m_report.UnmappedStripParts.Contains(cls.ClassName + "|" + partId)
+                && (s.ResourceType == "IMAGE" || GeometryIds.Contains(s.NameId)))
+            {
+                why = "the source strip has no supported state mapping; source art and geometry cannot be added piecemeal";
+                return false;
+            }
             cls.Parts.TryGetValue(partId, out var part);
             StyleState state = null;
             part?.States.TryGetValue(s.StateId, out state);
@@ -2491,6 +3159,18 @@ namespace libmsstyle.Import
             state.Properties.Add(prop);
             MarkTouched(prop, $"{s.ClassName}|{s.PartName}|S{s.StateId}|{s.PropertyName}");
             AddedRecords.Add($"{cls.ClassId}/{partId}/{s.StateId}/{prop.Header.nameID}/{prop.Header.typeID}");
+            // Preserve original template identities for propagation, but expose additions to later DPI passes.
+            var addedEntry = new SemanticEntry
+            {
+                ClassName = cls.ClassName, ClassId = cls.ClassId, PartId = partId, PartName = s.PartName,
+                PartNameKnown = s.PartNameKnown, StateId = s.StateId, StateName = s.StateName,
+                NameId = s.NameId, PropertyName = s.PropertyName, TypeId = s.TypeId,
+                ResourceId = s.ResourceType == null ? -1 : prop.Header.shortFlag & 0xFFFF,
+                ResourceType = s.ResourceType, IsStringRef = s.IsStringRef, Property = prop,
+                RawValue = SemanticModel.FormatValue(prop), Value = s.Value
+            };
+            m_target.Entries.Add(addedEntry);
+            if (!m_target.ByKey.ContainsKey(addedEntry.Key)) m_target.ByKey.Add(addedEntry.Key, addedEntry);
             return true;
         }
 
@@ -2542,8 +3222,11 @@ namespace libmsstyle.Import
         {
             string k = (ReferenceEquals(m, m_base) ? "b" : ReferenceEquals(m, m_source) ? "s" : "t") + "/" + type + "/" + id;
             if (m_decoded.TryGetValue(k, out var img)) return img;
-            var info = m.GetImageInfo(type, id);
-            img = info != null && info.Decodable ? ImageIdentity.Decode(m.GetResourceBytes(type, id)) : null;
+            // a picture this import placed is not in the target style yet (resources are written at the end), so the
+            // target model can't see it; the allocator's pending bytes are the only copy until then.
+            byte[] pending = ReferenceEquals(m, m_target) && m_alloc.Added.TryGetValue(type + "/" + id, out var added) ? added : null;
+            var info = pending != null ? ImageIdentity.Analyze(pending) : m.GetImageInfo(type, id);
+            img = info != null && info.Decodable ? ImageIdentity.Decode(pending ?? m.GetResourceBytes(type, id)) : null;
             m_decoded[k] = img;
             return img;
         }
@@ -2578,14 +3261,10 @@ namespace libmsstyle.Import
         /// picture stays. Win7 imports keep their own rule (validator frame waivers).
         /// </summary>
         /// <summary>
-        /// xp's band backdrops (rebar, toolbar, status) are often one pixel wide: a vertical strip holding
-        /// the band's top edge rows, its fill row and its bottom edge rows, stretched with xp's own
-        /// SIZINGMARGINS. win10 keeps the same record but the template's picture is a whole band, drawn with
-        /// the template's margins; stretching the strip's edge rows to band height turned Xanadu's menu bar
-        /// band black. So the strip is rebuilt into a picture of the template's size: the fill row fills
-        /// everything the template's top margin leaves, and the strip's bottom edge rows are sampled into
-        /// the template's bottom margin. The art (fill color and bottom edge) survives, the geometry is the
-        /// one win10 stretches.
+        /// xp's one-pixel rebar backdrops store fixed top-edge artwork, a stretchable fill row and
+        /// bottom-edge artwork. Widen the column for the win10 template without changing its rows:
+        /// template-height resampling discards gradients and inflates single-pixel bottom borders.
+        /// Keep the source's vertical margins paired with those rows, not the template's geometry.
         /// </summary>
         private byte[] RebuildBandPicture(SemanticModel src, SemanticEntry s, StyleProperty target, byte[] data, ImageInfo info, out bool rebuilt)
         {
@@ -2597,35 +3276,63 @@ namespace libmsstyle.Import
             if (tinfo == null || !tinfo.Decodable || tinfo.Width < 8 || tinfo.Height < 3) return data;
             if (s == null || !src.Style.Classes.TryGetValue(s.Property.Header.classID, out var sc)) return data;
             if (!(SemanticModel.FindEffective(src.Style, sc, s.PartId, s.StateId, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins sm)) return data;
-            if (!m_target.Style.Classes.TryGetValue(target.Header.classID, out var tc)
-                || !(SemanticModel.FindEffective(m_target.Style, tc, target.Header.partID, target.Header.stateID, IDENTIFIER.SIZINGMARGINS)?.GetValue() is Margins tm)) return data;
-            // only the rebar's band backdrop: part 0 is xp's rebar background, part 6 is win10's BACKGROUND.
-            if (!tc.ClassName.EndsWith("Rebar", StringComparison.OrdinalIgnoreCase)) return data;
-            if (target.Header.partID != 0 && target.Header.partID != 6) return data;
+            // Follow the source backdrop through stock-image aliases too: win10's CommandModule
+            // can share the template rebar picture, but its margins cannot slice XP's column.
+            // Check the source role, not the consumer, so unrelated strips (e.g. Header) stay alone.
+            if (!sc.ClassName.EndsWith("Rebar", StringComparison.OrdinalIgnoreCase)) return data;
+            if (s.PartId != 0 && s.PartId != 6) return data;
             if (sm.Top <= 0 && sm.Bottom <= 0) return data;
+            if (sm.Left != 0 || sm.Right != 0 || sm.Top < 0 || sm.Bottom < 0
+                || sm.Top + sm.Bottom >= info.Height) return data;
             var column = ImageIdentity.Decode(data);
             if (column.Width != 1) return data;
-            int fillRow = Math.Min(Math.Max(sm.Top, 0), column.Height - 1);
-            int bottomRows = Math.Min(Math.Max(sm.Bottom, 0), column.Height - 1);
-            int band = Math.Max(tm.Bottom, 0);
-            band = Math.Min(band, tinfo.Height - 1);
-            int top = Math.Min(Math.Max(tm.Top, 0), tinfo.Height - band - 1);
-            var wide = new ArgbImage(tinfo.Width, tinfo.Height);
-            int fillEnd = wide.Height - band;
-            for (int y = 0; y < fillEnd; ++y)
-            {
-                uint px = column.Pixels[y < top && sm.Top > 0 ? (y * sm.Top / Math.Max(top, 1)) : fillRow];
-                for (int x = 0; x < wide.Width; ++x) wide.Pixels[y * wide.Width + x] = px;
-            }
-            for (int i = 0; i < band; ++i)
-            {
-                int srcRow = column.Height - bottomRows + (bottomRows == 0 ? 0 : i * bottomRows / band);
-                if (srcRow > column.Height - 1) srcRow = column.Height - 1;
-                uint px = column.Pixels[srcRow];
-                for (int x = 0; x < wide.Width; ++x) wide.Pixels[(fillEnd + i) * wide.Width + x] = px;
-            }
+            var wide = new ArgbImage(tinfo.Width, column.Height);
+            for (int y = 0; y < wide.Height; ++y)
+                for (int x = 0; x < wide.Width; ++x)
+                    wide.Pixels[y * wide.Width + x] = column.Pixels[y];
             rebuilt = true;
+            m_bandMargins[$"{target.Header.classID}/{target.Header.partID}/{target.Header.stateID}"] = sm;
             return ImageIdentity.EncodePngVerified(wide);
+        }
+
+        /// <summary>
+        /// xp only. Pair a widened band picture with its source margins. Its height and all source
+        /// rows are retained, so these margins leave a valid stretchable center and preserve the
+        /// source edge thickness. Restore them after the merge, which may retain template margins.
+        /// </summary>
+        private void BandMarginsForRebuiltPictures()
+        {
+            if (m_bandMargins.Count == 0) return;
+            foreach (var cls in m_target.Style.Classes.Values)
+            {
+                if (m_target.DuplicateClassNames.Contains(cls.ClassName)) continue;
+                foreach (var part in cls.Parts.Values)
+                    foreach (var st in part.States.Values)
+                    {
+                        if (!m_bandMargins.TryGetValue($"{cls.ClassId}/{part.PartId}/{st.StateId}", out var want)) continue;
+                        var rec = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.SIZINGMARGINS && p.Header.typeID == (int)IDENTIFIER.MARGINS);
+                        if (rec == null)
+                        {
+                            rec = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGMARGINS, (int)IDENTIFIER.MARGINS)
+                            {
+                                classID = cls.ClassId, partID = part.PartId, stateID = st.StateId
+                            });
+                            st.Properties.Add(rec);
+                            AddedRecords.Add($"{cls.ClassId}/{part.PartId}/{st.StateId}/{(int)IDENTIFIER.SIZINGMARGINS}/{(int)IDENTIFIER.MARGINS}");
+                        }
+                        if (rec.GetValue() is Margins have && have.Equals(want)) continue;
+                        rec.SetValue(new Margins(want.Left, want.Top, want.Right, want.Bottom));
+                        MarkTouched(rec, $"{cls.ClassName}|{part.PartName}|S{st.StateId}|SIZINGMARGINS");
+                        m_report.Decisions.Add(new MergeDecision
+                        {
+                            Class = cls.ClassName, Part = part.PartName, State = st.StateId, Property = "SIZINGMARGINS",
+                            Action = "applied-band-margins",
+                            Reason = "the band picture retains every source row; its source margins preserve the gradient and edge thickness with a valid stretchable center",
+                            Result = $"{want.Left},{want.Top},{want.Right},{want.Bottom}",
+                        });
+                        m_report.Count("applied-band-margins");
+                    }
+            }
         }
 
         private bool FitsTargetFrames(SemanticModel src, SemanticEntry s, StyleProperty target, ImageInfo info, out string error)
@@ -2641,14 +3348,16 @@ namespace libmsstyle.Import
             if (layoutProp == null && s != null && src.Style.Classes.TryGetValue(s.Property.Header.classID, out var lsc))
                 layoutProp = SemanticModel.FindEffective(src.Style, lsc, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT);
             int count = countProp?.GetValue() is int c && c > 0 ? c : 1;
-            bool horizontal = layoutProp?.GetValue() is int l && l == 1;
+            // xp cuts a strip horizontally when its IMAGELAYOUT record is missing (its loader's default); this
+            // check only ever judges xp sources, so a missing layout here means horizontal, not win10's vertical.
+            bool horizontal = layoutProp?.GetValue() is int l ? l == 1 : true;
             int len = horizontal ? info.Width : info.Height;
             if (len % count == 0) return true;
             // xp drew this very strip with the same cut: uxtheme slices length / count (integer division) on xp and
             // win10 alike, the spare rows are never shown. appows' 53px frame borders with ImageCount 2.
             if (s != null && src.Style.Classes.TryGetValue(s.Property.Header.classID, out var sc)
                 && SemanticModel.FindEffective(src.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int scount && scount == count
-                && (SemanticModel.FindEffective(src.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int sl && sl == 1) == horizontal)
+                && (SemanticModel.FindEffective(src.Style, sc, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT)?.GetValue() is int sl ? sl == 1 : true) == horizontal)
             {
                 FrameWaivers.Add(StyleValidator.FrameWaiverKey(info.PixelSha1, count));
                 return true;
@@ -2662,6 +3371,13 @@ namespace libmsstyle.Import
         {
             error = null;
             var sp = s.Property;
+            if (src.Platform == Platform.WinXP && m_target.Style.Classes.TryGetValue(target.Header.classID, out var targetClass)
+                && m_report.UnmappedStripParts.Contains(targetClass.ClassName + "|" + target.Header.partID)
+                && (s.ResourceType == "IMAGE" || GeometryIds.Contains(s.NameId)))
+            {
+                error = "source strip has no supported state mapping; template art and geometry remain together";
+                return false;
+            }
             if (sp.Header.typeID != target.Header.typeID)
             {
                 error = $"type mismatch ({sp.Header.typeID} vs {target.Header.typeID})";
@@ -2698,7 +3414,7 @@ namespace libmsstyle.Import
                     string stripDims = $"{info.Width}x{info.Height}";
                     var band = ImageIdentity.Analyze(data);
                     if (band.Decodable) info = band;
-                    string note = $"{s.ClassName}|{s.PartName}|S{s.StateId}|{s.PropertyName}: xp's {stripDims} band strip rebuilt at the template's picture size, so win10 stretches it the way xp did";
+                    string note = $"{s.ClassName}|{s.PartName}|S{s.StateId}|{s.PropertyName}: xp's {stripDims} band strip widened to the template picture's width with every source row and its sizing margins retained";
                     if (m_bandStripsNoted.Add(s.ResourceType + "/" + s.ResourceId) && !m_report.Notes.Contains(note))
                         m_report.Notes.Add(note);
                 }
@@ -2719,7 +3435,7 @@ namespace libmsstyle.Import
                     error = "external ATLASINPUTIMAGE string: win10 uxtheme checks its decoded size, win7 didn't; not copied";
                     return false;
                 }
-                string text = src.ResolveString(sp.Header.shortFlag);
+                string text = sp.Header.typeID == (int)IDENTIFIER.FONT ? src.ResolveFontText(sp) : src.ResolveString(sp.Header.shortFlag);
                 if (text == null)
                 {
                     error = $"source string {sp.Header.shortFlag} not found";
@@ -2816,7 +3532,17 @@ namespace libmsstyle.Import
         internal int PlaceResource(string type, int sourceId, byte[] data, ImageInfo info)
         {
             int id = m_alloc.Place(type, data, out bool reused);
-            if (!m_report.Resources.Any(x => x.Type == type && x.SourceId == sourceId))
+            // source image id -> the template ids it was placed as (the same source picture can land in several
+            // slots), so later passes can tell whether a state draws source art after a slot translation.
+            if (type == "IMAGE")
+            {
+                if (!m_sourceImageTargets.TryGetValue(sourceId, out var targets))
+                    m_sourceImageTargets[sourceId] = targets = new HashSet<int>();
+                targets.Add(id);
+            }
+            // one row per placed id: the same source picture can land in several slots, and the report's table
+            // is reconciled against the resources-added count.
+            if (!m_report.Resources.Any(x => x.Type == type && x.SourceId == sourceId && x.TargetId == id))
             {
                 m_report.Resources.Add(new ResourceMapping
                 {

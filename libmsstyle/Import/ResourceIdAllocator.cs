@@ -18,11 +18,14 @@ namespace libmsstyle.Import
 
         public IReadOnlyDictionary<string, byte[]> Added => m_added;
 
-        /// <param name="existing">(type, id, sha1 of bytes) for every resource already in the template.</param>
+        /// <param name="existing">(type, id, sha1 of bytes) for every resource already in the template. An id of 0 means
+        /// "this resource has no numeric name" (the caller couldn't parse one): it is skipped, because a property's
+        /// low header word reads 0 as an inline payload rather than a resource, so nothing may ever be handed out as 0.</param>
         public ResourceIdAllocator(IEnumerable<Tuple<string, int, string>> existing)
         {
             foreach (var e in existing)
             {
+                if (e == null || e.Item2 <= 0) continue;
                 Used(e.Item1).Add(e.Item2);
                 string ck = e.Item1 + "/" + e.Item3;
                 // first one wins so reuse is deterministic.

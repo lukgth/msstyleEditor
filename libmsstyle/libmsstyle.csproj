@@ -60,6 +60,7 @@
     <Reference Include="Microsoft.CSharp" />
     <Reference Include="System.Data" />
     <Reference Include="System.Xml" />
+    <Reference Include="System.Xml.Linq" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Animation.cs" />
@@ -83,11 +84,16 @@
     <Compile Include="Import\VariantMaps.cs" />
     <Compile Include="Import\VariantWriter.cs" />
     <Compile Include="Import\DuiCascade.cs" />
+    <Compile Include="Import\Dui\DuiXmlDocument.cs" />
+    <Compile Include="Import\Dui\LegacyPaneMarkup.cs" />
+    <Compile Include="Import\Dui\XpShellTranslator.cs" />
+    <Compile Include="Import\Dui\XpUifileSyntax.cs" />
     <Compile Include="Import\StockStyles.cs" />
     <Compile Include="Import\XpShellImport.cs" />
     <Compile Include="Import\XpShellStyle.cs" />
     <Compile Include="Import\XpStripRemap.cs" />
-    <Compile Include="Import\XpThemeApply.cs" />
+    <Compile Include="Import\XpThemeApply.cs" />
+
     <Compile Include="Import\XpThemeExtras.cs" />
     <Compile Include="Import\XpThemeFiles.cs" />
     <Compile Include="Import\XpThemeImport.cs" />

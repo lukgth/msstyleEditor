@@ -22,6 +22,8 @@ namespace libmsstyle.Import
         private readonly List<string> m_addedRecords;
         private readonly List<string> m_removedRecords;
         private readonly HashSet<string> m_frameWaivers;
+        private readonly IReadOnlyDictionary<int, string> m_addedClasses;
+        private readonly IReadOnlyDictionary<string, byte[]> m_rewrittenMaps;
         private readonly ValidationReport m_rep = new ValidationReport();
 
         /// <param name="added">"TYPE/id" -> bytes for every resource the import added.</param>
@@ -30,7 +32,8 @@ namespace libmsstyle.Import
         /// <param name="frameWaivers"><see cref="FrameWaiverKey"/>s of source images that ship with a remainder after splitting into IMAGECOUNT frames.</param>
         internal StyleValidator(string template, string candidate, IReadOnlyDictionary<string, byte[]> added,
             List<SpriteExpectation> sprites, List<string> changedLabels, bool stringsAdded = false, IEnumerable<string> geometryWaivers = null,
-            IEnumerable<string> addedRecords = null, IEnumerable<string> frameWaivers = null, IEnumerable<string> removedRecords = null)
+            IEnumerable<string> addedRecords = null, IEnumerable<string> frameWaivers = null, IEnumerable<string> removedRecords = null,
+            IReadOnlyDictionary<int, string> addedClasses = null, IReadOnlyDictionary<string, byte[]> rewrittenMaps = null)
         {
             m_template = template;
             m_candidate = candidate;
@@ -42,6 +45,8 @@ namespace libmsstyle.Import
             m_addedRecords = (addedRecords ?? new string[0]).ToList();
             m_removedRecords = (removedRecords ?? new string[0]).ToList();
             m_frameWaivers = new HashSet<string>(frameWaivers ?? new string[0], StringComparer.Ordinal);
+            m_addedClasses = addedClasses ?? new Dictionary<int, string>();
+            m_rewrittenMaps = rewrittenMaps ?? new Dictionary<string, byte[]>();
         }
 
         /// <summary>No-op check: the candidate must equal the template except for the listed additions.</summary>
@@ -93,15 +98,35 @@ namespace libmsstyle.Import
             int same = 0;
             foreach (var te in tInv.Entries)
             {
-                // a standalone save rewrites every string bucket and drops the MUI link; the strings
-                // themselves are compared one by one in CheckStrings.
-                bool stringResource = te.Type == "#6" || te.Type == "MUI";
+                bool stringBucket = te.Type == "#6";
+                bool muiLink = te.Type == "MUI";
                 if (!cByKey.TryGetValue(te.Key, out var ce))
                 {
-                    if (!(m_stringsAdded && stringResource)) Error($"resource {te.Key} from the template is missing in the candidate");
+                    // the standalone save moves the .mui's strings into the .msstyles and drops the link; it also
+                    // rewrites the buckets from the loaded tables, so bucket numbering can shift. the text is
+                    // compared per language in CheckStringTables.
+                    if (muiLink && m_stringsAdded) continue;
+                    if (stringBucket && m_stringsAdded) continue;
+                    Error($"resource {te.Key} from the template is missing in the candidate");
                     continue;
                 }
-                if (m_stringsAdded && stringResource) continue;
+                if (muiLink && m_stringsAdded) continue;
+                if (stringBucket)
+                {
+                    // the text is compared per language in CheckStringTables; the bucket bytes themselves
+                    // only survive untouched when no string was added.
+                    if (!m_stringsAdded)
+                    {
+                        if (te.Sha1 != ce.Sha1) Error($"string bucket {te.Key} changed but no string was added");
+                        else same++;
+                    }
+                    continue;
+                }
+                if (m_rewrittenMaps.TryGetValue(te.Key, out var rewritten))
+                {
+                    if (!cInv.GetData(ce).SequenceEqual(rewritten)) Error($"resource {te.Key} differs from the declared class-map rewrite");
+                    continue;
+                }
                 if (te.Type == "VARIANT")
                 {
                     if (m_changed.Count == 0)
@@ -118,7 +143,7 @@ namespace libmsstyle.Import
                 if (m_added.ContainsKey(addKey))
                     Error($"resource {addKey} was allocated by the import but already existed in the template");
             }
-            Check($"{same} template resources (everything except VARIANT/NORMAL) are byte-identical in the candidate, including CMAP, BCMAP, AMAP, string tables and PACKTHEM_VERSION.");
+            Check($"{same} template resources are byte-identical; VARIANT, declared class-map rewrites and added-font string buckets are checked separately.");
 
             int added = 0;
             foreach (var ce in cInv.Entries.Where(e => !tByKey.ContainsKey(e.Key) && !(m_stringsAdded && e.Type == "#6")))
@@ -153,17 +178,34 @@ namespace libmsstyle.Import
 
         private void CheckClasses(VisualStyle t, VisualStyle c)
         {
-            if (t.Classes.Count != c.Classes.Count)
-            {
-                Error($"class count changed {t.Classes.Count} -> {c.Classes.Count}");
-                return;
-            }
+            if (c.Classes.Count != t.Classes.Count + m_addedClasses.Count)
+                Error($"class count changed {t.Classes.Count} -> {c.Classes.Count}, expected {m_addedClasses.Count} declared additions");
             foreach (var kv in t.Classes)
             {
-                if (!c.Classes.TryGetValue(kv.Key, out var cc) || cc.ClassName != kv.Value.ClassName || cc.BaseClassId != kv.Value.BaseClassId)
-                    Error($"class {kv.Key} ({kv.Value.ClassName}) changed name or base class");
+                if (!c.Classes.TryGetValue(kv.Key, out var cc) || cc.ClassName != kv.Value.ClassName)
+                    Error($"class {kv.Key} ({kv.Value.ClassName}) changed name or ID");
+                if (m_addedClasses.Count == 0 && cc != null && cc.BaseClassId != kv.Value.BaseClassId)
+                    Error($"class {kv.Key} ({kv.Value.ClassName}) changed base class");
             }
-            Check($"{c.Classes.Count} classes, ids and base classes identical to the template.");
+            foreach (var kv in m_addedClasses)
+                if (t.Classes.ContainsKey(kv.Key) || !c.Classes.TryGetValue(kv.Key, out var cls) || cls.ClassName != kv.Value)
+                    Error($"declared appended class {kv.Key} ({kv.Value}) is missing or overwrote an existing class");
+            Check($"existing CMAP class IDs and names preserved; {m_addedClasses.Count} declared classes appended.");
+        }
+
+        /// <summary>
+        /// "3 removed records (IMAGEFILE x2, BGTYPE x1)" for the declared removals. They aren't all colors:
+        /// the xp passes drop IMAGEFILE/BGTYPE/IMAGELAYOUT/SIZINGMARGINS/SIZINGTYPE records too.
+        /// </summary>
+        private string RemovedSummary()
+        {
+            var byProperty = new List<string>();
+            foreach (var g in m_removedRecords
+                .Select(r => r.Split('/'))
+                .GroupBy(p => p.Length > 3 && int.TryParse(p[3], out int id) ? SemanticModel.PropertyName(id) : "?")
+                .OrderBy(g => g.Key, StringComparer.Ordinal))
+                byProperty.Add(g.Count() == 1 ? g.Key : $"{g.Key} x{g.Count()}");
+            return $"{m_removedRecords.Count} removed record{(m_removedRecords.Count == 1 ? "" : "s")} ({string.Join(", ", byProperty)})";
         }
 
         private static IEnumerable<string> RecordKeys(VisualStyle s)
@@ -188,7 +230,7 @@ namespace libmsstyle.Import
             var tk = expected.OrderBy(x => x, StringComparer.Ordinal).ToList();
             var ck = RecordKeys(c).OrderBy(x => x, StringComparer.Ordinal).ToList();
             if (!tk.SequenceEqual(ck)) Error("candidate's property records aren't the template's plus the declared additions and minus the declared removals");
-            else Check($"{ck.Count} property records: the template's set{(m_addedRecords.Count > 0 ? $" plus {m_addedRecords.Count} added records" : "")}{(m_removedRecords.Count > 0 ? $" minus {m_removedRecords.Count} removed colors" : "")}, nothing else.");
+            else Check($"{ck.Count} property records: the template's set{(m_addedRecords.Count > 0 ? $" plus {m_addedRecords.Count} added records" : "")}{(m_removedRecords.Count > 0 ? $" minus {RemovedSummary()}" : "")}, nothing else.");
 
             // uxtheme registers only classes that have VARIANT records and BCMAP parents index that
             // registration order (18362 LoadClassDataMap / AddIndexInternal). a class gaining its first
@@ -196,10 +238,10 @@ namespace libmsstyle.Import
             var tReg = new HashSet<int>(t.Classes.Values.Where(HasRecords).Select(x => x.ClassId));
             var cReg = new HashSet<int>(c.Classes.Values.Where(HasRecords).Select(x => x.ClassId));
             var lost = tReg.Except(cReg).Select(id => t.Classes[id].ClassName).ToList();
-            var gained = cReg.Except(tReg).Select(id => c.Classes[id].ClassName).ToList();
+            var gained = cReg.Except(tReg).Where(id => !m_addedClasses.ContainsKey(id)).Select(id => c.Classes[id].ClassName).ToList();
             if (lost.Count > 0) Error($"classes lost all their records, which shifts every later BCMAP parent: {string.Join(", ", lost)}");
-            if (gained.Count > 0) Error($"classes got their first records, which shifts every later BCMAP parent: {string.Join(", ", gained)}");
-            if (lost.Count == 0 && gained.Count == 0) Check($"{cReg.Count} classes with records, the same set as the template: BCMAP parents keep pointing at the same classes.");
+            if (gained.Count > 0) Error($"undeclared classes got their first records: {string.Join(", ", gained)}");
+            if (lost.Count == 0 && gained.Count == 0) Check($"registered class changes are limited to {m_addedClasses.Count} declared appended classes.");
 
             // uxtheme 19041 builds one section per class/part/state and fails with a duplicate
             // section error when a tuple shows up again later in the stream.
@@ -248,14 +290,45 @@ namespace libmsstyle.Import
             // the registration order BCMAP parents are relative to.
             var tOrder = ClassOrder(tInv.GetData(tInv.Entries.First(e => e.Type == "VARIANT")));
             var cOrder = ClassOrder(data);
-            if (!tOrder.SequenceEqual(cOrder))
-            {
-                int at = 0;
-                while (at < Math.Min(tOrder.Count, cOrder.Count) && tOrder[at] == cOrder[at]) at++;
-                Error($"classes show up in VARIANT in a different order than in the template (first difference at position {at}), which shifts BCMAP parents");
-            }
-            else Check($"{cOrder.Count} classes show up in VARIANT in the template's order.");
+            if (!tOrder.SequenceEqual(cOrder.Where(id => !m_addedClasses.ContainsKey(id))))
+                Error("existing classes show up in VARIANT in a different order than in the template");
+            else Check($"{tOrder.Count} existing classes show up in VARIANT in the template's order.");
+            if (m_addedClasses.Count > 0) CheckBaseRegistration(t, c, tInv, cInv);
         }
+
+        private void CheckBaseRegistration(VisualStyle template, VisualStyle candidate, ResourceInventory tInv, ResourceInventory cInv)
+        {
+            var before = Win7StyleImporter.RegistrationOrder(template);
+            var after = Win7StyleImporter.RegistrationOrder(candidate);
+            var tb = tInv.GetData(tInv.Entries.First(e => e.Type == "BCMAP"));
+            var cb = cInv.GetData(cInv.Entries.First(e => e.Type == "BCMAP"));
+            int oldCount = BitConverter.ToInt32(tb, 0), newCount = BitConverter.ToInt32(cb, 0);
+            if (oldCount < before.Count || newCount < after.Count || 4L + oldCount * 4L > tb.Length || 4L + newCount * 4L > cb.Length)
+            {
+                Error("BCMAP does not cover its complete registration order");
+                return;
+            }
+            for (int i = 0; i < before.Count; ++i)
+            {
+                int oldParent = BitConverter.ToInt32(tb, 4 + i * 4);
+                int at = after.IndexOf(before[i]);
+                if (at < 0) { Error($"registered class {before[i]} disappeared"); continue; }
+                int newParent = BitConverter.ToInt32(cb, 4 + at * 4);
+                if (oldParent < 0 ? newParent != oldParent
+                    : oldParent < before.Count ? newParent < 0 || newParent >= after.Count || before[oldParent] != after[newParent]
+                    : newParent != oldParent + m_addedClasses.Count)
+                    Error($"BCMAP parent of existing class {before[i]} changed its registered target");
+            }
+            foreach (var cls in m_addedClasses)
+            {
+                int at = after.IndexOf(cls.Key);
+                if (at < 0) { Error($"appended class {cls.Value} has no registered records"); continue; }
+                int parent = BitConverter.ToInt32(cb, 4 + at * 4);
+                if (parent >= after.Count || parent < -1) Error($"appended class {cls.Value} has an invalid BCMAP parent");
+            }
+            Check("BCMAP preserves every existing registered parent across the class append, including AMAP-only registrations.");
+        }
+
 
         /// <summary>type id -> declared size of external-id records, where the template is consistent.</summary>
         private static Dictionary<int, int> ExternalRecordSizes(byte[] data)
@@ -304,9 +377,10 @@ namespace libmsstyle.Import
         private void CheckReferences(SemanticModel tm, SemanticModel cm)
         {
             int images = 0, fonts = 0;
+            var templateEntries = tm.Entries.ToDictionary(e => (e.ClassId, e.Key));
             foreach (var ce in cm.Entries)
             {
-                tm.ByKey.TryGetValue(ce.Key, out var te);
+                templateEntries.TryGetValue((ce.ClassId, ce.Key), out var te);
                 string label = $"{ce.ClassName}|{ce.PartName}|S{ce.StateId}|{ce.PropertyName}";
                 bool changed = m_changed.Contains(label) || (te != null && te.RawValue != ce.RawValue);
                 if (te != null && te.RawValue != ce.RawValue && !m_changed.Contains(label))
@@ -490,6 +564,49 @@ namespace libmsstyle.Import
                 else same++;
             }
             if (ids.Count > 0) Check($"{same} template strings resolve to the same text in the candidate{(m_stringsAdded ? " (tables rewritten for added font strings)" : "")}.");
+            CheckStringTables(tm, cm);
+        }
+
+        /// <summary>
+        /// ResolveString falls back across languages and tables, so a bucket that was dropped, merged into
+        /// another language or written with the wrong text still "resolves". Compare every language's table
+        /// entry by entry instead: a standalone save rewrites the buckets from the loaded tables, so the text
+        /// has to survive per language even though the bucket bytes don't.
+        /// </summary>
+        private void CheckStringTables(SemanticModel tm, SemanticModel cm)
+        {
+            int compared = 0;
+            foreach (var lang in tm.Style.StringTables.Keys.OrderBy(k => k))
+            {
+                var before = tm.Style.StringTables[lang];
+                if (before.Count == 0) continue; // a language the loader enumerated but that holds no text
+                if (!cm.Style.StringTables.TryGetValue(lang, out var after))
+                {
+                    Error($"string table for language {lang} is missing from the candidate");
+                    continue;
+                }
+                int lost = 0, changed = 0;
+                foreach (var kv in before.OrderBy(k => k.Key))
+                {
+                    compared++;
+                    if (!after.TryGetValue(kv.Key, out string now)) { lost++; continue; }
+                    if (now != kv.Value) changed++;
+                }
+                if (lost > 0) Error($"string table for language {lang} lost {lost} of {before.Count} strings");
+                if (changed > 0) Error($"string table for language {lang} has {changed} strings with different text");
+                if (lost == 0 && changed == 0)
+                    Check($"string table for language {lang}: all {before.Count} strings kept their text.");
+                var extra = after.Keys.Except(before.Keys).ToList();
+                if (extra.Count > 0 && !m_stringsAdded)
+                    Error($"string table for language {lang} gained {extra.Count} strings the import never added");
+            }
+            if (compared == 0)
+            {
+                int cand = cm.Style.StringTables.Sum(t => t.Value.Count);
+                Check(cand == 0
+                    ? "neither style has string tables; nothing to compare per language."
+                    : $"the template has no string table (its strings live in a .mui), so only the candidate's {cand} strings could be read.");
+            }
         }
 
         private void CheckFonts(SemanticModel tm, SemanticModel cm)

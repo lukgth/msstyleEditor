@@ -12,20 +12,22 @@ namespace libmsstyle.Import
         {
             var paths = new List<string> { prefix + ".json", prefix + ".md", prefix + ".threeway.json" };
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(prefix)));
-            File.WriteAllText(paths[0], JsonWriter.Serialize(r), Encoding.UTF8);
-            File.WriteAllText(paths[1], ToMarkdown(r), Encoding.UTF8);
-            File.WriteAllText(paths[2], JsonWriter.Serialize(new { Summary = r.ThreeWaySummary, Entries = r.ThreeWayEntries }), Encoding.UTF8);
+            // no BOM: the .md shows it as a stray character and not every json reader skips it.
+            var utf8 = new UTF8Encoding(false);
+            File.WriteAllText(paths[0], JsonWriter.Serialize(r), utf8);
+            File.WriteAllText(paths[1], ToMarkdown(r), utf8);
+            File.WriteAllText(paths[2], JsonWriter.Serialize(new { Summary = r.ThreeWaySummary, Entries = r.ThreeWayEntries }), utf8);
             return paths;
         }
 
         public static string ToMarkdown(ImportReport r)
         {
             var sb = new StringBuilder();
-            sb.AppendLine("# Windows 7 style import report");
+            sb.AppendLine($"# {r.Tool} report");
             sb.AppendLine();
             sb.AppendLine($"Status: **{r.Status}** ({(r.DryRun ? "dry run" : "write")}). {r.StatusText}");
             sb.AppendLine();
-            sb.AppendLine("Offline checks only. The candidate was never loaded by uxtheme or applied; it is unverified visually until tested in a disposable VM.");
+            sb.AppendLine("Offline checks only: the candidate was never applied to a live desktop, so it is unverified visually until tested in a disposable VM. A `uxtheme loads` line below means this process asked uxtheme to open the file, not that the style was drawn.");
             sb.AppendLine();
             sb.AppendLine("| input | path |");
             sb.AppendLine("|---|---|");
@@ -33,8 +35,10 @@ namespace libmsstyle.Import
             if (r.Output != null) sb.AppendLine($"| output | `{r.Output}` |");
             sb.AppendLine();
 
-            List("Errors", r.Errors, sb);
-            List("Warnings", r.Warnings, sb);
+            // the importer copies the validation errors/warnings into the report lists with a "validation: "
+            // prefix, and the same problems are printed again under "## Validation": show each one once.
+            List("Errors", r.ErrorsWithoutValidation, sb);
+            List("Warnings", r.WarningsWithoutValidation, sb);
 
             sb.AppendLine("## Counts");
             sb.AppendLine();
@@ -49,43 +53,77 @@ namespace libmsstyle.Import
             sb.AppendLine("|---|---:|");
             foreach (var kv in r.ThreeWaySummary.OrderBy(k => k.Key)) sb.AppendLine($"| {kv.Key} | {kv.Value} |");
             sb.AppendLine();
-            sb.AppendLine("`source-changed`: source differs from stock win7. `template-adapted`: template differs from stock win7. `conflict`: both. `win7-only`: no such record in the template. Full list in the `.threeway.json` file.");
+            sb.AppendLine("`source-changed`: source differs from its stock baseline. `template-adapted`: template differs from that baseline. `conflict`: both. `win7-only` (historical category name): no such source record in the template. Full list in the `.threeway.json` file.");
             sb.AppendLine();
 
+            // only when the atlas was actually rebuilt: DwmImport sets NewAtlasSize in BuildAtlas, the last step
+            // of a real import. An import that kept the template's DWMWindow (no source atlas, a non-stock
+            // template atlas, an exclude rule) bails out before that and would otherwise print the defaults as
+            // if they were verified facts. the reason it was skipped is already in the warnings.
             var d = r.Dwm;
-            sb.AppendLine("## DWMWindow");
-            sb.AppendLine();
-            sb.AppendLine($"- template atlas is the stock win7 atlas: {d.TemplateAtlasIsStockWin7}");
-            sb.AppendLine($"- source atlas differs from stock: {d.SourceAtlasChanged} ({d.SourceAtlasSize})");
-            sb.AppendLine($"- atlas stream: template {d.TemplateAtlasId} -> output {d.NewAtlasId} ({d.NewAtlasSize}{(d.AtlasReencoded ? ", re-encoded with kept template sprites" : ", source bytes unchanged")})");
-            sb.AppendLine($"- win7-only parts dropped: {(d.Win7OnlyParts.Count == 0 ? "none" : string.Join(", ", d.Win7OnlyParts))}");
-            sb.AppendLine($"- template sprites kept (fallback): {(d.FallbackParts.Count == 0 ? "none" : string.Join(", ", d.FallbackParts.Distinct()))}");
-            sb.AppendLine();
-            if (d.Parts.Count > 0)
+            if (d.NewAtlasSize != null)
             {
-                sb.AppendLine("| id | template part | from win7 part | method | template rect | new rect | note |");
-                sb.AppendLine("|---:|---|---|---|---|---|---|");
-                foreach (var p in d.Parts)
-                    sb.AppendLine($"| {p.TargetPartId} | {p.TargetPart} | {p.SourcePart} | {p.Method} | {Rect(p.TargetRect)} | {Rect(p.NewRect)} | {p.Note} |");
+                sb.AppendLine("## DWMWindow");
+                sb.AppendLine();
+                bool xpFrames = d.Parts.Any(p => p.Method == "xp-frame" || p.Method == "xp-button");
+                if (xpFrames)
+                    sb.AppendLine("- XP frame/button artwork synthesized into the template's unchanged DWM packing; stock Win7 atlas comparison is not applicable.");
+                else
+                {
+                    sb.AppendLine($"- template atlas is the stock win7 atlas: {d.TemplateAtlasIsStockWin7}");
+                    sb.AppendLine($"- source atlas differs from stock: {d.SourceAtlasChanged} ({d.SourceAtlasSize})");
+                }
+                sb.AppendLine($"- atlas stream: template {d.TemplateAtlasId} -> output {d.NewAtlasId} ({d.NewAtlasSize}{(d.AtlasReencoded ? ", re-encoded with kept template sprites" : ", source bytes unchanged")})");
+                if (!xpFrames) sb.AppendLine($"- win7-only parts dropped: {(d.Win7OnlyParts.Count == 0 ? "none" : string.Join(", ", d.Win7OnlyParts))}");
+                sb.AppendLine($"- template sprites kept (fallback): {(d.FallbackParts.Count == 0 ? "none" : string.Join(", ", d.FallbackParts.Distinct()))}");
+                sb.AppendLine();
+                if (d.Parts.Count > 0)
+                {
+                    sb.AppendLine("| id | template part | from win7 part | method | template rect | new rect | note |");
+                    sb.AppendLine("|---:|---|---|---|---|---|---|");
+                    foreach (var p in d.Parts)
+                        sb.AppendLine($"| {p.TargetPartId} | {p.TargetPart} | {p.SourcePart} | {p.Method} | {Rect(p.TargetRect)} | {Rect(p.NewRect)} | {p.Note} |");
+                    sb.AppendLine();
+                }
+            }
+
+            var v = r.Validation ?? new ValidationReport();
+            sb.AppendLine("## Validation");
+            sb.AppendLine();
+            // a blocked run never kept a candidate: its checks can't add up to a pass even when none failed.
+            if (v.Blocked) sb.AppendLine("- blocked: the run stopped before keeping a candidate, so these checks are not a pass.");
+            foreach (var c in v.Checks) sb.AppendLine("- ok: " + c);
+            foreach (var e in v.Errors) sb.AppendLine("- FAIL: " + e);
+            foreach (var w in v.Warnings) sb.AppendLine("- warn: " + w);
+            sb.AppendLine();
+
+            if (r.FinalStartPanelSizes.Count > 0)
+            {
+                sb.AppendLine("## Final StartPanel pane sizes");
+                sb.AppendLine();
+                sb.AppendLine("Values below are the final stored records after all import passes, not intermediate merge choices. RECT values are dimensions as consumed by the shell, including any negative origins.");
+                sb.AppendLine();
+                sb.AppendLine("| class | class id | part | part id | final value |");
+                sb.AppendLine("|---|---:|---|---:|---|");
+                foreach (var size in r.FinalStartPanelSizes.OrderBy(s => s.ClassId).ThenBy(s => s.PartId))
+                    sb.AppendLine($"| {size.Class} | {size.ClassId} | {size.Part} | {size.PartId} | {size.Value} |");
                 sb.AppendLine();
             }
 
-            sb.AppendLine("## Validation");
-            sb.AppendLine();
-            foreach (var c in r.Validation.Checks) sb.AppendLine("- ok: " + c);
-            foreach (var e in r.Validation.Errors) sb.AppendLine("- FAIL: " + e);
-            foreach (var w in r.Validation.Warnings) sb.AppendLine("- warn: " + w);
-            sb.AppendLine();
-
             if (r.Resources.Count > 0)
             {
-                sb.AppendLine("## Resources copied");
+                var placements = r.Resources.GroupBy(x => x.Type + "/" + x.TargetId).Select(g => g.First()).ToList();
+                int reused = placements.Count(x => x.Reused);
+                int fresh = placements.Count - reused;
+                int referenced = placements.Count(x => x.Referenced);
+                r.Counts.TryGetValue("resources-added", out int queued);
+                sb.AppendLine("## Resource placements");
                 sb.AppendLine();
-                sb.AppendLine($"{r.Resources.Count(x => !x.Reused)} added, {r.Resources.Count(x => x.Reused)} shared with identical bytes already in the template.");
+                sb.AppendLine($"{r.Resources.Count} source-to-output mappings, {placements.Count} distinct output resources: {fresh} allocated ids, {reused} reused ids. {referenced} output resources remain referenced by final property records; {placements.Count - referenced} placements have no final explicit reference. `resources-added` records {queued} queued resources, including resources generated outside this placement table.");
                 sb.AppendLine();
-                sb.AppendLine("| type | source id | output id | reused | size | bytes |");
-                sb.AppendLine("|---|---:|---:|---|---|---:|");
-                foreach (var m in r.Resources) sb.AppendLine($"| {m.Type} | {m.SourceId} | {m.TargetId} | {m.Reused} | {m.Dimensions} | {m.Bytes} |");
+                sb.AppendLine("| type | source id | output id | reused | size | bytes | final references |");
+                sb.AppendLine("|---|---:|---:|---|---|---:|---:|");
+                foreach (var m in r.Resources) sb.AppendLine($"| {m.Type} | {m.SourceId} | {m.TargetId} | {m.Reused} | {m.Dimensions} | {m.Bytes} | {m.FinalReferenceCount} |");
                 sb.AppendLine();
             }
 
@@ -100,13 +138,13 @@ namespace libmsstyle.Import
             if (interesting.Count == 0) sb.AppendLine("none");
             else
             {
-                sb.AppendLine("| class | part | state | property | action | reason | win7 | source | template |");
-                sb.AppendLine("|---|---|---:|---|---|---|---|---|---|");
+                sb.AppendLine("| class | part | state | property | action | reason | base | source | template | final result |");
+                sb.AppendLine("|---|---|---:|---|---|---|---|---|---|---|");
                 foreach (var x in interesting)
-                    sb.AppendLine($"| {x.Class} | {x.Part} | {x.State} | {x.Property} | {x.Action} | {x.Reason} | {x.Base} | {x.Source} | {x.Target} |");
+                    sb.AppendLine($"| {x.Class} | {x.Part} | {x.State} | {x.Property} | {x.Action} | {x.Reason} | {x.Base} | {x.Source} | {x.Target} | {x.Result} |");
             }
             sb.AppendLine();
-            sb.AppendLine("Every decision, including applies, is in the `.json` report.");
+            sb.AppendLine("Every decision, including applies, is in the `.json` report. Actions/reasons record merge history; Result is the final stored record after all passes (or absent/ambiguous), not a promise that an intermediate apply survived.");
             return sb.ToString();
         }
 

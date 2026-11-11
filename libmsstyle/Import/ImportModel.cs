@@ -20,9 +20,9 @@ namespace libmsstyle.Import
         /// <summary>xp only: scheme of the base the template was ported from (NormalColor, Metallic, HomeStead). Empty = the first one.</summary>
         public string BaseScheme { get; set; }
         /// <summary>
-        /// xp only: draw the task pane as a full-width band across the top of the folder window (xp's My Computer /
-        /// My Documents WebView layout) instead of Windows 10's 200rp left pane. Off by default: the port keeps the
-        /// left pane; pass --task-band to ask for the band.
+        /// xp only: force a full-width task pane band across the top of the folder window. Off by default: the
+        /// source shellstyle's own markup decides (top/bottom band, left/right sidebar); with --task-band a source
+        /// without markup gets xp's My Computer / My Documents WebView band.
         /// </summary>
         public bool TaskBand { get; set; } = false;
         /// <summary>xp only: the source's shellstyle.dll. Empty = Shell\&lt;SourceScheme&gt;\shellstyle.dll next to the source, if there is one.</summary>
@@ -103,6 +103,18 @@ namespace libmsstyle.Import
         public int Bytes { get; set; }
         public string Sha1 { get; set; }
         public string Dimensions { get; set; }
+        /// <summary>Number of explicit final property records referencing this placement.</summary>
+        public int FinalReferenceCount { get; set; }
+        public bool Referenced => FinalReferenceCount > 0;
+    }
+
+    public class StartPanelSizeResult
+    {
+        public string Class { get; set; }
+        public int ClassId { get; set; }
+        public string Part { get; set; }
+        public int PartId { get; set; }
+        public string Value { get; set; }
     }
 
     public class DwmPartMapping
@@ -133,7 +145,9 @@ namespace libmsstyle.Import
 
     public class ValidationReport
     {
-        public bool Passed => Errors.Count == 0;
+        /// <summary>the run blocked the candidate for a reason that isn't a validation error (a failed copy, a variant uxtheme rejects).</summary>
+        public bool Blocked { get; set; }
+        public bool Passed => !Blocked && Errors.Count == 0;
         public List<string> Errors { get; set; } = new List<string>();
         public List<string> Warnings { get; set; } = new List<string>();
         public List<string> Checks { get; set; } = new List<string>();
@@ -143,7 +157,18 @@ namespace libmsstyle.Import
     {
         public string Tool { get; set; } = "msstyleEditor win7 importer";
         public string Generated { get; set; } = DateTime.UtcNow.ToString("u");
-        public ImportStatus Status { get; set; }
+        private ImportStatus m_status;
+        /// <summary>blocking the run also blocks <see cref="Validation"/>, so <see cref="ValidationReport.Passed"/> can't
+        /// read true for a candidate that was never kept.</summary>
+        public ImportStatus Status
+        {
+            get => m_status;
+            set
+            {
+                m_status = value;
+                if (value == ImportStatus.Blocked && Validation != null) Validation.Blocked = true;
+            }
+        }
         public string StatusText { get; set; }
         public bool DryRun { get; set; }
         public Dictionary<string, string> Inputs { get; set; } = new Dictionary<string, string>();
@@ -160,10 +185,91 @@ namespace libmsstyle.Import
         public List<string> TemplateOnlyImages { get; set; } = new List<string>();
         public ValidationReport Validation { get; set; } = new ValidationReport();
         public List<MergeDecision> Decisions { get; set; } = new List<MergeDecision>();
+        /// <summary>Final pane-size records, after every layout/artwork pass.</summary>
+        public List<StartPanelSizeResult> FinalStartPanelSizes { get; set; } = new List<StartPanelSizeResult>();
+        /// <summary>Parts whose unknown strip-state mapping requires keeping template geometry.</summary>
+        [JsonIgnore]
+        public HashSet<string> UnmappedStripParts { get; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, int> ThreeWaySummary { get; set; } = new Dictionary<string, int>();
         /// <summary>full key-by-key comparison; written to its own file because it's large.</summary>
         [JsonIgnore]
         public List<DiffEntry> ThreeWayEntries { get; set; } = new List<DiffEntry>();
+
+        /// <summary><see cref="Errors"/> without the copies of <see cref="Validation"/>'s errors, which the report
+        /// prints under its validation section. The importer copies them with a "validation: " prefix.</summary>
+        [JsonIgnore]
+        public List<string> ErrorsWithoutValidation => WithoutValidation(Errors, Validation?.Errors);
+
+        /// <summary><see cref="Warnings"/> without the copies of <see cref="Validation"/>'s warnings.</summary>
+        [JsonIgnore]
+        public List<string> WarningsWithoutValidation => WithoutValidation(Warnings, Validation?.Warnings);
+
+        /// <summary>
+        /// <paramref name="items"/> without the copies of <paramref name="validation"/>. The prefix is matched
+        /// too, so a line the importer prefixed but the validation list no longer holds is still dropped once.
+        /// </summary>
+        private static List<string> WithoutValidation(List<string> items, List<string> validation)
+        {
+            if (validation == null || validation.Count == 0) return items;
+            var seen = new HashSet<string>(validation, StringComparer.Ordinal);
+            var result = new List<string>();
+            foreach (var i in items)
+            {
+                if (seen.Contains(i)) continue;
+                if (i.StartsWith("validation: ", StringComparison.Ordinal) && seen.Contains(i.Substring("validation: ".Length))) continue;
+                result.Add(i);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Snapshot the final records rather than presenting intermediate merge decisions as output.
+        /// The decision's inputs/action remain its history; Result always describes the final record.
+        /// Resource placements are history too: a later pass can replace their last reference.
+        /// </summary>
+        public void FinalizeResults(VisualStyle style)
+        {
+            var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var references = new Dictionary<string, int>(StringComparer.Ordinal);
+            var duplicates = new HashSet<string>(style.Classes.Values.GroupBy(c => c.ClassName, StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() > 1).Select(g => g.Key), StringComparer.OrdinalIgnoreCase);
+            FinalStartPanelSizes.Clear();
+            foreach (var cls in style.Classes.Values)
+            {
+                var names = SemanticModel.PartNames(cls.ClassName, style.Platform);
+                foreach (var part in cls.Parts.Values)
+                {
+                    string partName = names.TryGetValue(part.PartId, out var known) ? known : "Part " + part.PartId;
+                    foreach (var state in part.States.Values)
+                        foreach (var prop in state.Properties)
+                        {
+                            string value = SemanticModel.FormatValue(prop);
+                            string suffix = "|" + state.StateId + "|" + SemanticModel.PropertyName(prop.Header.nameID);
+                            values[cls.ClassName + "|" + partName + suffix] = value;
+                            values[cls.ClassName + "|" + part.PartName + suffix] = value;
+                            var resource = SemanticModel.ResourceRef(prop, style.Platform);
+                            if (resource != null)
+                            {
+                                string key = resource.Item1 + "/" + resource.Item2;
+                                references.TryGetValue(key, out int count);
+                                references[key] = count + 1;
+                            }
+                            if (cls.ClassName.IndexOf("StartPanel", StringComparison.OrdinalIgnoreCase) >= 0
+                                && state.StateId == 0 && prop.Header.nameID == (int)IDENTIFIER.DEFAULTPANESIZE)
+                                FinalStartPanelSizes.Add(new StartPanelSizeResult
+                                { Class = cls.ClassName, ClassId = cls.ClassId, Part = partName, PartId = part.PartId, Value = value });
+                        }
+                }
+            }
+            foreach (var decision in Decisions)
+            {
+                string key = decision.Class + "|" + decision.Part + "|" + decision.State + "|" + decision.Property;
+                decision.Result = duplicates.Contains(decision.Class) ? "(ambiguous duplicate class)"
+                    : values.TryGetValue(key, out var value) ? value : "(absent)";
+            }
+            foreach (var resource in Resources)
+                resource.FinalReferenceCount = references.TryGetValue(resource.Type + "/" + resource.TargetId, out int count) ? count : 0;
+        }
 
         public void Count(string what, int n = 1)
         {
