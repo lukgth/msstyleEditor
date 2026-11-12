@@ -74,6 +74,7 @@
     <Compile Include="Import\ImportModel.cs" />
     <Compile Include="Import\ImportReportWriter.cs" />
     <Compile Include="Import\JsonWriter.cs" />
+    <Compile Include="Import\ReferenceEqualityComparer.cs" />
     <Compile Include="Import\ResourceIdAllocator.cs" />
     <Compile Include="Import\ResourceInventory.cs" />
     <Compile Include="Import\SemanticModel.cs" />

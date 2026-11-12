@@ -150,8 +150,9 @@ namespace libmsstyleTests
             using (var target = new VisualStyle())
             {
                 stock.Load(Luna); source.Load(Luna); target.Load(Luna);
-                SetStrip(stock, "Toolbar", 1, 6, false, Pattern(6, false, 0xFF000000));
-                SetStrip(source, "Toolbar", 1, 6, false, Pattern(6, false, 0xFF100000));
+                // 7 frames has no state contract on either side (6 -> 8 does, see ToolbarAddsNearHotAndOtherSideHot).
+                SetStrip(stock, "Toolbar", 1, 7, false, Pattern(7, false, 0xFF000000));
+                SetStrip(source, "Toolbar", 1, 7, false, Pattern(7, false, 0xFF100000));
                 var redraw = Pattern(8, false, 0xFF000000);
                 for (int i = 6 * 9; i < redraw.Pixels.Length; ++i) redraw.Pixels[i] = 0xFFFFFFFF;
                 SetStrip(target, "Toolbar", 1, 8, false, redraw);
@@ -160,6 +161,65 @@ namespace libmsstyleTests
                 Assert.IsTrue(report.UnmappedStripParts.Contains("Toolbar|1"));
                 Assert.IsTrue(report.Warnings.Any(w => w.Contains("locked to the template")));
                 Assert.AreEqual(before, Strip(source, "Toolbar", 1).PixelSha1());
+            }
+        }
+
+        /// <summary>
+        /// XP's toolbar buttons have six states; win10 adds NEARHOT (the pointer is on a neighbouring button) and
+        /// OTHERSIDEHOT. Stock Luna10's own strip settles what they draw: frame 7 is pixel-identical to frame 1 and
+        /// frame 8 to frame 6, so the source's resting and hot-checked faces fill them.
+        /// </summary>
+        [TestMethod]
+        public void ToolbarAddsNearHotAndOtherSideHot()
+        {
+            using (var stock = new VisualStyle())
+            using (var source = new VisualStyle())
+            using (var target = new VisualStyle())
+            {
+                stock.Load(Luna); source.Load(Luna); target.Load(Luna);
+                SetStrip(stock, "Toolbar", 1, 6, false, Pattern(6, false, 0xFF000000));
+                SetStrip(source, "Toolbar", 1, 6, false, Pattern(6, false, 0xFF100000));
+                SetStrip(target, "Toolbar", 1, 8, false, Pattern(8, false, 0xFF001000));
+                var report = Remap(stock, source, target);
+                Assert.IsFalse(report.UnmappedStripParts.Contains("Toolbar|1"), string.Join("\n", report.Warnings));
+                Assert.AreEqual(8, Property(source, "Toolbar", 1, IDENTIFIER.IMAGECOUNT).GetValue());
+                var actual = Strip(source, "Toolbar", 1);
+                var want = Pattern(6, false, 0xFF100000);
+                foreach (var (frame, from) in new[] { (0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 0), (7, 5) })
+                    for (int y = 0; y < 3; ++y)
+                        for (int x = 0; x < 3; ++x)
+                            Assert.AreEqual(want.Pixels[(from * 3 + y) * 3 + x], actual.Pixels[(frame * 3 + y) * 3 + x],
+                                "frame " + (frame + 1) + " should draw frame " + (from + 1));
+            }
+        }
+
+        /// <summary>
+        /// A source that ships fewer gripper frames than win10's five (Elfin2: three, normal/hot/pressed) still
+        /// indexes its strip by state id, so frames 1-3 keep their state and the states the source doesn't draw
+        /// (DISABLED, HOVER) fall back to NORMAL instead of keeping the template's blue art for those frames.
+        /// </summary>
+        [TestMethod]
+        public void GripperWithFewerFramesKeepsItsStatesAndFallsBackToNormal()
+        {
+            foreach (int part in new[] { 8, 9 })
+            using (var stock = new VisualStyle())
+            using (var source = new VisualStyle())
+            using (var target = new VisualStyle())
+            {
+                stock.Load(Luna); source.Load(Luna); target.Load(Luna);
+                SetStrip(stock, "ScrollBar", part, 4, false, Pattern(4, false, 0xFF000000));
+                SetStrip(source, "ScrollBar", part, 3, false, Pattern(3, false, 0xFF100000));
+                SetStrip(target, "ScrollBar", part, 5, false, Pattern(5, false, 0xFF001000));
+                var report = Remap(stock, source, target);
+                Assert.IsFalse(report.UnmappedStripParts.Contains("ScrollBar|" + part), string.Join("\n", report.Warnings));
+                Assert.AreEqual(5, Property(source, "ScrollBar", part, IDENTIFIER.IMAGECOUNT).GetValue());
+                var actual = Strip(source, "ScrollBar", part);
+                var want = Pattern(3, false, 0xFF100000);
+                foreach (var (frame, from) in new[] { (0, 0), (1, 1), (2, 2), (3, 0), (4, 0) })
+                    for (int y = 0; y < 3; ++y)
+                        for (int x = 0; x < 3; ++x)
+                            Assert.AreEqual(want.Pixels[(from * 3 + y) * 3 + x], actual.Pixels[(frame * 3 + y) * 3 + x],
+                                "part " + part + " frame " + (frame + 1) + " should draw frame " + (from + 1));
             }
         }
 
@@ -626,6 +686,40 @@ namespace libmsstyleTests
                     type.GetMethod("HeaderInset", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(pane, new object[] { part, part == 12, "probe" });
                     Assert.AreEqual(new Margins(part, 3, 17, 5), Property(target, "ExplorerBar", part, IDENTIFIER.CONTENTMARGINS).GetValue());
                 }
+            }
+        }
+
+        /// <summary>
+        /// packthem writes every ExplorerBar record, so a source style that never touched the task pane still carries
+        /// stock xp's 8/12 CONTENTMARGINS (8,7,8,7). That record states nothing, and taking it replaced the template's
+        /// own header inset (Luna10's 12,2,3,0) with 7px of padding above and below the title: Elfin2's headers.
+        /// </summary>
+        [TestMethod]
+        public void StockEqualHeaderMarginsLeaveTheTemplatesInset()
+        {
+            using (var stock = new VisualStyle())
+            using (var source = new VisualStyle())
+            using (var target = new VisualStyle())
+            using (var shell = new XpShellStyle(StockStyles.XpLunaShellPath("NormalColor")))
+            {
+                stock.Load(Luna); source.Load(Luna); target.Load(Luna);
+                var adapted = new Margins(12, 2, 3, 0);
+                foreach (int part in new[] { 8, 12 })
+                {
+                    // the source repeats stock xp exactly; the template carries its own adaptation.
+                    Assert.AreEqual(new Margins(8, 7, 8, 7), Property(source, "ExplorerBar", part, IDENTIFIER.CONTENTMARGINS).GetValue());
+                    Property(target, "ExplorerBar", part, IDENTIFIER.CONTENTMARGINS).SetValue(adapted);
+                }
+                var importer = Importer(stock, source, target);
+                var type = typeof(Win7StyleImporter).Assembly.GetType("libmsstyle.Import.XpShellImport", true);
+                var pane = Activator.CreateInstance(type, importer, shell, shell, false);
+                type.GetMethod("Snapshot").Invoke(pane, null);
+                foreach (int part in new[] { 8, 12 })
+                {
+                    type.GetMethod("HeaderInset", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(pane, new object[] { part, part == 12, "probe" });
+                    Assert.AreEqual(adapted, Property(target, "ExplorerBar", part, IDENTIFIER.CONTENTMARGINS).GetValue(), "part " + part);
+                }
+                Assert.IsFalse(importer.Report.Decisions.Any(d => d.Action == "applied-xp-header-margins"));
             }
         }
 

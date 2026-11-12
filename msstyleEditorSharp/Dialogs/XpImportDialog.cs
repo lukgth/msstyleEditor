@@ -215,15 +215,19 @@ namespace msstyleEditor
 
             string gotStyle = ExpandPath(RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "DllName"));
             string gotColor = RegistryValue(@"Software\Microsoft\Windows\CurrentVersion\ThemeManager", "ColorName");
-            bool applied = result.Ok && string.Equals(gotStyle, destStyle, StringComparison.OrdinalIgnoreCase);
+            // the style took when ThemeManager names the installed file. result.Ok also covers the cosmetic extras
+            // (wallpaper, cursors, sounds, icons), and one of those missing must not report a live style as failed.
+            bool styleLive = string.Equals(gotStyle, destStyle, StringComparison.OrdinalIgnoreCase);
+            bool applied = styleLive && result.Ok;
             string detail = string.Join("\r\n", result.Notes.Concat(result.Warnings.Select(w => "! " + w)));
-            if (applied)
+            if (styleLive)
             {
                 string schemeInfo = string.IsNullOrEmpty(r.Scheme?.InternalName) || string.Equals(gotColor, r.Scheme.InternalName, StringComparison.OrdinalIgnoreCase)
                     ? "" : $"\r\nColor is \"{gotColor}\", the selected scheme is \"{r.Scheme.InternalName}\" (the .theme decides the color).";
+                string extras = applied ? "" : "\r\nThe visual style is live; some extras above could not be applied.";
                 MessageBox.Show(this,
-                    $"Installed to {destDir} and applied {Path.GetFileName(destTheme)}.{schemeInfo}\r\n\r\n{detail}",
-                    "Install & apply", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    $"Installed to {destDir} and applied {Path.GetFileName(destTheme)}.{schemeInfo}{extras}\r\n\r\n{detail}",
+                    "Install & apply", MessageBoxButtons.OK, applied ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
             }
             else
             {

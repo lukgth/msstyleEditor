@@ -25,8 +25,10 @@ namespace libmsstyle.Import
         private SemanticModel m_base, m_source, m_target;
         private ResourceIdAllocator m_alloc;
         private readonly Dictionary<string, ArgbImage> m_decoded = new Dictionary<string, ArgbImage>();
-        // properties already rewritten, so the generic pass can't touch DWM records twice.
-        private readonly HashSet<StyleProperty> m_touched = new HashSet<StyleProperty>();
+        // properties already rewritten, so the generic pass can't touch DWM records twice. Identity, not value:
+        // StyleProperty.Equals compares header and value, and the merge mutates values in place, so a value-keyed
+        // set would lose track of an entry the moment its value changed (and collide with a distinct equal record).
+        private readonly HashSet<StyleProperty> m_touched = new HashSet<StyleProperty>(ReferenceEqualityComparer<StyleProperty>.Instance);
         // source IMAGE id -> template IMAGE ids it was placed as, to follow pictures across slot translations.
         private readonly Dictionary<int, HashSet<int>> m_sourceImageTargets = new Dictionary<int, HashSet<int>>();
         // band pictures already reported as rebuilt, one note per source picture instead of per record.
@@ -38,7 +40,7 @@ namespace libmsstyle.Import
         private readonly Dictionary<string, byte[]> m_rewrittenMaps = new Dictionary<string, byte[]>();
 
         internal List<SpriteExpectation> SpriteChecks { get; } = new List<SpriteExpectation>();
-        internal Dictionary<StyleProperty, string> ChangedProperties { get; } = new Dictionary<StyleProperty, string>();
+        internal Dictionary<StyleProperty, string> ChangedProperties { get; } = new Dictionary<StyleProperty, string>(ReferenceEqualityComparer<StyleProperty>.Instance);
 
         public Win7StyleImporter(Win7ImportOptions options)
         {
@@ -480,7 +482,7 @@ namespace libmsstyle.Import
         /// </summary>
         private void ReportTemplateOnlyImages()
         {
-            var byProp = m_target.Entries.ToDictionary(e => e.Property);
+            var byProp = m_target.Entries.ToDictionary(e => e.Property, ReferenceEqualityComparer<StyleProperty>.Instance);
             var changedStates = new HashSet<string>(ChangedProperties.Keys
                 .Where(p => byProp.TryGetValue(p, out var e) && e.ResourceType == "IMAGE")
                 .Select(p => byProp[p].StateKey));
@@ -802,6 +804,11 @@ namespace libmsstyle.Import
                         if (tv == sv) continue;
                         if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, "SIZINGTYPE")) continue;
                         if (!PicturesFromSource(sc, tc, spid, tp.PartId, st.StateId, imageCache)) continue;
+                        // Only a sizing type the source actually chose may override the template's. A source that
+                        // replaced the art but kept stock xp's TILE never expressed an opinion: the template's
+                        // STRETCH was fitted to this slot (a progress bar spans the window), and reverting it tiles
+                        // a 10px chunk across the bar. Genuine changes (base 1 -> source 2) still apply.
+                        if (!SourceChangedSizingType(sc, spid, st.StateId, sv)) continue;
                         if (!MarginsFromSource(sc, tc, spid, tp.PartId, st.StateId)) continue;
                         if (tSizing == null || !st.Properties.Contains(tSizing))
                         {
@@ -1420,24 +1427,27 @@ namespace libmsstyle.Import
         /// Win10's non-composited caption renderer needs stretched XP caption strips. Keep each part's
         /// own artwork and geometry: normal captions can contain transparent rounded top edges which
         /// must never replace the separate, edge-covering maximized artwork. Caption metrics stay XP's.
-        /// Only a part xp itself tiled is converted (the maximized parts 5/6 are drawn from their own
-        /// artwork and xp never tiled them); a part the source already stretched is left alone.
+        /// Every caption part is converted, maximized ones (5/6) included: the caption bar spans the
+        /// window, so a sprite xp drew TRUESIZE or TILE paints only its own width and win10 leaves the
+        /// rest of the bar at the fill color (Elfin2's 66x32 maximized caption drew 6544 of 7600 pixels
+        /// black). A part the source already stretched is left alone.
         /// </summary>
         private void StretchXpMaxCaption()
         {
             if (!m_target.ClassesByName.TryGetValue("Window", out var tc) || m_target.DuplicateClassNames.Contains("Window")) return;
             if (!m_source.ClassesByName.TryGetValue("Window", out var sc)) return;
             var tnames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
-            // xp's window parts: CAPTION 1, SMALLCAPTION 2, MINCAPTION 3, SMALLMINCAPTION 4 (tmschema.h:410-422).
-            foreach (int id in new[] { 1, 2, 3, 4 })
+            // xp's window parts: CAPTION 1, SMALLCAPTION 2, MINCAPTION 3, SMALLMINCAPTION 4,
+            // MAXCAPTION 5, SMALLMAXCAPTION 6 (tmschema.h:410-430).
+            foreach (int id in new[] { 1, 2, 3, 4, 5, 6 })
             {
                 if (!tc.Parts.TryGetValue(id, out var part) || !part.States.TryGetValue(0, out var st)) continue;
                 string partName = tnames.TryGetValue(id, out var pn) ? pn : "P" + id;
                 // the xp part id comes from the xp schema by name, not from the win10 part map.
                 int spid = XpPartId(sc.ClassName, partName);
                 if (spid < 0 || !sc.Parts.ContainsKey(spid)) continue;
-                // xp tiles the part only when its own SIZINGTYPE says so; otherwise there is nothing to convert.
-                if (!(SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.SIZINGTYPE)?.GetValue() is int sv) || sv != 2) continue;
+                // xp's own SIZINGTYPE says how the strip was drawn; STRETCH already fills the bar.
+                if (SemanticModel.FindEffective(m_source.Style, sc, spid, 0, IDENTIFIER.SIZINGTYPE)?.GetValue() is int sv && sv == 1) continue;
                 var sizing = SemanticModel.FindEffective(m_target.Style, tc, id, 0, IDENTIFIER.SIZINGTYPE);
                 if (sizing == null)
                 {
@@ -1455,7 +1465,7 @@ namespace libmsstyle.Import
                 {
                     Class = tc.ClassName, Part = partName, State = 0, Property = "SIZINGTYPE",
                     Action = "applied-caption-stretch",
-                    Reason = "xp tiles this caption part and win10's non-composited caption renderer draws a tiled part as one sprite, leaving the bar's fill visible, so the art is stretched instead",
+                    Reason = "the caption bar spans the window, so a sprite xp drew TRUESIZE or TILE paints only its own width and win10's non-composited renderer leaves the rest of the bar at the fill color; the art is stretched instead",
                     Result = "STRETCH",
                 });
                 m_report.Count("applied-caption-stretch");
@@ -1517,6 +1527,32 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
+        /// true when the source's SIZINGMARGINS differs from stock xp's for this part/state (a dropped record
+        /// counts as a change). A source that merely repeats stock's numbers never chose them.
+        /// </summary>
+        private bool SourceChangedMargins(StyleClass sc, int spid, int stateId, StyleProperty sourceMargins)
+        {
+            if (!m_base.ClassesByName.TryGetValue(sc.ClassName, out var bc)) return true;
+            var stock = SemanticModel.FindEffective(m_base.Style, bc, spid, stateId, IDENTIFIER.SIZINGMARGINS);
+            if (sourceMargins == null) return stock != null;
+            if (stock == null) return true;
+            return !Equals(SemanticModel.FormatValue(stock), SemanticModel.FormatValue(sourceMargins));
+        }
+
+        /// <summary>
+        /// true when the source's SIZINGTYPE differs from stock xp's for this part/state, i.e. the author chose it.
+        /// A source that only replaced the art keeps stock's value, which says nothing about how the new picture
+        /// should be drawn in a slot whose template value was fitted to the template's own art.
+        /// </summary>
+        private bool SourceChangedSizingType(StyleClass sc, int spid, int stateId, int sourceValue)
+        {
+            if (!m_base.ClassesByName.TryGetValue(sc.ClassName, out var bc)) return true;
+            bool glyph = SemanticModel.FindEffective(m_base.Style, bc, spid, stateId, IDENTIFIER.GLYPHTYPE)?.GetValue() is int g && g == 1;
+            int stock = SemanticModel.FindEffective(m_base.Style, bc, spid, stateId, IDENTIFIER.SIZINGTYPE)?.GetValue() is int v ? v : glyph ? 0 : 1;
+            return stock != sourceValue;
+        }
+
+        /// <summary>
         /// Makes the part/state's effective sizing margins the source's and returns true. xp without a
         /// SIZINGMARGINS record draws the picture as one frame with no nine-grid margins, so the template's
         /// record (fitted to its own art) is zeroed rather than silently kept under the source's TILE/STRETCH.
@@ -1528,6 +1564,9 @@ namespace libmsstyle.Import
             if (sm == null) want = new Margins(0, 0, 0, 0);             // xp's missing record: no margins
             else if (sm.GetValue() is Margins m) want = m;
             else return false;
+            // a source that kept stock xp's margins never chose them, so the template's nine-grid (fitted to its
+            // own art) stays. Only a real change - including dropping the record - travels with the source's picture.
+            if (!SourceChangedMargins(sc, spid, stateId, sm)) return false;
             var tm = SemanticModel.FindEffective(m_target.Style, tc, tpid, stateId, IDENTIFIER.SIZINGMARGINS);
             if (tm != null && tm.GetValue() is Margins have && have.Equals(want)) return true;
 
@@ -3416,6 +3455,23 @@ namespace libmsstyle.Import
             }
         }
 
+        /// <summary>
+        /// The record a strip cut (IMAGECOUNT/IMAGELAYOUT) ends up with after the merge, so a source picture is
+        /// judged against the cut it will actually be drawn with. The source's value lands when the template has
+        /// no record (the merge adds it), when the template still holds stock's value, or when prefer-source takes
+        /// it; the template's stays when it adapted the record away from stock, when both sides added it, or when
+        /// the part is locked to the template's art.
+        /// </summary>
+        private StyleProperty FinalCutValue(SemanticEntry source, StyleProperty stock, StyleProperty target, string partKey)
+        {
+            if (source == null) return target;
+            if (target == null) return source.Property;
+            if (stock == null) return target;
+            if (m_report.UnmappedStripParts.Contains(partKey)) return target;
+            if (Equals(stock.GetValue(), target.GetValue())) return source.Property;
+            return PreferSourceRecord(source) ? source.Property : target;
+        }
+
         private bool FitsTargetFrames(SemanticModel src, SemanticEntry s, StyleProperty target, ImageInfo info, out string error)
         {
             error = null;
@@ -3432,6 +3488,31 @@ namespace libmsstyle.Import
             // xp cuts a strip horizontally when its IMAGELAYOUT record is missing (its loader's default); this
             // check only ever judges xp sources, so a missing layout here means horizontal, not win10's vertical.
             bool horizontal = layoutProp?.GetValue() is int l ? l == 1 : true;
+            // Judge the picture against the cut the merge will leave, not the template's current one. A geometry
+            // record the template didn't adapt takes the source's value, so a picture that fits that cut was
+            // rejected here and the source's IMAGELAYOUT applied anyway: minus4v2's horizontal spinner (60x13,
+            // four frames) failed against Luna10's vertical 15x64, then got cut horizontally into four 3px frames.
+            // Only the part's own records say what cut the target part gets: an alias brings a picture from another
+            // part (ScrollBar GRIPPERVERT taking stock Spin|DOWNHORZ's sprite), and that part's count/layout must
+            // not be read as this one's.
+            if (s != null && s.PartId == target.Header.partID && s.StateId == target.Header.stateID
+                && string.Equals(s.ClassName, cls.ClassName, StringComparison.OrdinalIgnoreCase)
+                && m_base.ClassesByName.TryGetValue(s.ClassName, out var bcls))
+            {
+                string partKey = s.ClassName + "|" + target.Header.partID;
+                var finalCount = FinalCutValue(
+                    src.Entries.FirstOrDefault(e => e.ClassId == s.ClassId && e.PartId == s.PartId
+                        && e.StateId == s.StateId && e.NameId == (int)IDENTIFIER.IMAGECOUNT),
+                    SemanticModel.FindEffective(m_base.Style, bcls, s.PartId, s.StateId, IDENTIFIER.IMAGECOUNT),
+                    countProp, partKey);
+                count = finalCount?.GetValue() is int fc && fc > 0 ? fc : 1;
+                var finalLayout = FinalCutValue(
+                    src.Entries.FirstOrDefault(e => e.ClassId == s.ClassId && e.PartId == s.PartId
+                        && e.StateId == s.StateId && e.NameId == (int)IDENTIFIER.IMAGELAYOUT),
+                    SemanticModel.FindEffective(m_base.Style, bcls, s.PartId, s.StateId, IDENTIFIER.IMAGELAYOUT),
+                    layoutProp, partKey);
+                horizontal = finalLayout?.GetValue() is int fl ? fl == 1 : true;
+            }
             int len = horizontal ? info.Width : info.Height;
             if (len % count == 0) return true;
             // xp drew this very strip with the same cut: uxtheme slices length / count (integer division) on xp and
@@ -3664,20 +3745,10 @@ namespace libmsstyle.Import
         internal SemanticModel Target => m_target;
         internal ImportReport Report => m_report;
         internal Win7ImportOptions Options => m_opt;
-        internal ResourceIdAllocator Allocator => m_alloc;
         internal void MarkTouched(StyleProperty p, string label)
         {
             m_touched.Add(p);
             ChangedProperties[p] = label;
-        }
-
-        internal void Untouch(IEnumerable<StyleProperty> props)
-        {
-            foreach (var p in props)
-            {
-                m_touched.Remove(p);
-                ChangedProperties.Remove(p);
-            }
         }
     }
 

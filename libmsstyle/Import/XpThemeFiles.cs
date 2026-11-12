@@ -333,7 +333,9 @@ namespace libmsstyle.Import
             L("VisualStyleVersion=10");
             L();
             L("[boot]");
-            L("SCRNSAVE.EXE=" + (extras?.Screensaver ?? ""));
+            // only when the pack actually ships one: an empty SCRNSAVE.EXE is not "no screensaver" to the applier,
+            // it is a delete, and applying a ported theme must not clear the screensaver the user already had.
+            if (!string.IsNullOrEmpty(extras?.Screensaver)) L("SCRNSAVE.EXE=" + extras.Screensaver);
             L();
             L("[MasterThemeSelector]");
             L("MTSM=RJSPBS");

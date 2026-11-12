@@ -43,8 +43,6 @@ namespace libmsstyle.Import
             return s;
         }
 
-        public bool IsUsed(string type, int id) => Used(type).Contains(id);
-
         /// <returns>the id holding these bytes in the output and whether it already existed.</returns>
         public int Place(string type, byte[] data, out bool reused)
         {

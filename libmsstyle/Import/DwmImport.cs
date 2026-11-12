@@ -221,6 +221,9 @@ namespace libmsstyle.Import
             public string SourcePart;
             public ArgbImage Sprite;
             public Margins[] Margins;
+            /// <summary>the source's CONTENTMARGINS per frame, or null where it declared none. The sprite's
+            /// pixels replace the template's, so the padding that places text inside them must come with it.</summary>
+            public Margins[] ContentMargins;
             public bool Button;
             public bool Glyph;
             public string Note;
@@ -304,6 +307,7 @@ namespace libmsstyle.Import
                     }
                     var sprite = new ArgbImage(plan.Rect.Width, plan.Rect.Height);
                     var margins = new Margins[count];
+                    var content = new Margins[count];
                     bool complete = true;
                     for (int i = 0; i < count; ++i)
                     {
@@ -325,14 +329,19 @@ namespace libmsstyle.Import
                         int index = sourceCount == 1 ? 0 : Math.Min(state - 1, sourceCount - 1);
                         var frame = source.Crop(new Rectangle(horizontal ? index * fw : 0, horizontal ? 0 : index * fh, fw, fh));
                         ApplyXpColorKey(frame, window, sourcePart, state);
-                        bool tile = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.SIZINGTYPE)?.GetValue() is int sizing && sizing == 2;
+                        // uDWM stretches an atlas sprite: no DWMWindow part carries a SIZINGTYPE record (the
+                        // template has none, and none is written), so the compositor always uses its STRETCH
+                        // default. Tiling the interior here would hand it a tiled-looking body that it then
+                        // stretches again. XP's own TILE is not expressible in the atlas.
+                        bool tile = false;
                         int top = i * plan.Rect.Height / count, bottom = (i + 1) * plan.Rect.Height / count;
                         var rendered = SynthesizeXpFrameStrip(frame, 1, false, plan.Rect.Width, bottom - top, 1,
                             EffectiveSizing(m_imp.Source.Style, window, sourcePart, state), tile, out margins[i]);
                         if (rendered == null) { complete = false; plan.Note = "source frame cannot be nine-gridded into the target slot"; break; }
                         sprite.Blit(rendered, 0, top);
+                        content[i] = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.CONTENTMARGINS)?.GetValue() is Margins cm ? cm : null;
                     }
-                    if (complete) { plan.Sprite = sprite; plan.Margins = margins; }
+                    if (complete) { plan.Sprite = sprite; plan.Margins = margins; plan.ContentMargins = content; }
                 }
 
             // Reject overlaps to a fixed point: retaining one sprite can invalidate an alias
@@ -387,10 +396,17 @@ namespace libmsstyle.Import
                 }
                 var cls = m_imp.Target.Style.Classes[plan.Entry.ClassId];
                 PutXpProperty(cls, plan.Part, plan.Entry.StateId, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, plan.Margins[0]);
+                if (plan.ContentMargins != null && plan.ContentMargins[0] is Margins firstContent)
+                    PutXpProperty(cls, plan.Part, plan.Entry.StateId, IDENTIFIER.CONTENTMARGINS, IDENTIFIER.MARGINS, firstContent);
                 for (int i = 0; i < plan.Margins.Length; ++i)
                 {
                     int state = plan.Entry.StateId == 0 ? i + 1 : plan.Entry.StateId;
                     PutXpProperty(cls, plan.Part, state, IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, plan.Margins[i]);
+                    // the sprite's pixels are XP's now, so the padding that places the caption text inside them
+                    // has to come with it: the template's CONTENTMARGINS was fitted to the template's own frame
+                    // (Elfin2's caption art has a 17px top band; the template's record put the title at the top).
+                    if (plan.ContentMargins != null && plan.ContentMargins[i] is Margins cm)
+                        PutXpProperty(cls, plan.Part, state, IDENTIFIER.CONTENTMARGINS, IDENTIFIER.MARGINS, cm);
                 }
                 // All imported frame/face pixels already contain their authored color and alpha.
                 // Do not apply inherited glass tint or inactive attenuation on top of them.
@@ -442,6 +458,7 @@ namespace libmsstyle.Import
             }
             var sprite = new ArgbImage(plan.Rect.Width, plan.Rect.Height);
             var margins = new Margins[targetCount];
+            var content = new Margins[targetCount];
             bool inactive = plan.Part.Name.IndexOf("INACTIVE", StringComparison.OrdinalIgnoreCase) >= 0;
             bool anyEmbedded = false;
             for (int i = 0; i < targetCount; ++i)
@@ -487,14 +504,16 @@ namespace libmsstyle.Import
                 }
                 else
                 {
-                    bool tile = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.SIZINGTYPE)?.GetValue() is int sizing && sizing == 2;
+                    bool tile = false; // see the frame path: uDWM stretches, no part carries SIZINGTYPE
                     rendered = SynthesizeXpFrameStrip(frame, 1, false, plan.Rect.Width, height, 1,
                         EffectiveSizing(m_imp.Source.Style, window, sourcePart, state), tile, out margins[i]);
                 }
                 sprite.Blit(rendered, 0, top);
+                content[i] = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, state, IDENTIFIER.CONTENTMARGINS)?.GetValue() is Margins cm ? cm : null;
             }
             plan.Sprite = sprite;
             plan.Margins = margins;
+            plan.ContentMargins = content;
             plan.Note = plan.Glyph
                 ? (anyEmbedded ? "complete single-layer XP button fitted to the target glyph slot; source has no separate glyph layer" : "XP glyph size selected from its own image set, centered into target glyph slot; shared DWM glyph strip uses XP active states")
                 : (anyEmbedded ? "transparent background for a single-layer XP button carried by its glyph" : "XP button face: normal/hot/pressed/disabled, " + (inactive ? "inactive states 5-8" : "active states 1-4") + "; source nine-grid margins retained where they fit");

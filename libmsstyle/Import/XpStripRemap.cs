@@ -203,6 +203,13 @@ namespace libmsstyle.Import
                                 if (remapped)
                                     m_report.Notes.Add($"{label}: source draws every state with one frame; repeated into the template's {tg} frames.");
                             }
+                            else if (SemanticMap(bc.ClassName, bp.PartId, sg.Count, tg.Count) is int[] ownMap)
+                            {
+                                // the source's own cut is a state contract too (Elfin2's three gripper frames against
+                                // Luna10's five): frame i is state i+1, and a state the source doesn't draw falls back
+                                // to NORMAL rather than keeping the template's art for that one frame.
+                                remapped = Recut(m_source, sc, bp.PartId, ss, WithGlyph(ss, simages), sg, tg, ownMap, p => false, label);
+                            }
                             else
                                 remapped = false;
                         }
@@ -250,12 +257,29 @@ namespace libmsstyle.Import
             if (string.Equals(cls, "Button", StringComparison.OrdinalIgnoreCase) && part == 3
                 && sourceCount == 12 && targetCount == 20)
                 return new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3 };
+            // TOOLBAR: xp's toolbar buttons have five states (NORMAL, HOT, PRESSED, DISABLED, CHECKED);
+            // win10 adds HOTCHECKED as the sixth, which draws the checked art. Same contract as Button
+            // part 1 below, and the class name arrives here stripped ("TaskBar::Toolbar" -> "Toolbar").
+            if (string.Equals(cls, "Toolbar", StringComparison.OrdinalIgnoreCase)
+                && sourceCount == 5 && targetCount == 6)
+                return new[] { 0, 1, 2, 3, 4, 4 };
+            // win10 adds NEARHOT (7) and OTHERSIDEHOT (8) on top of xp's six: the pointer is on a
+            // neighbouring button, so those draw the resting and the hot-checked face. Stock Luna10's
+            // own strip confirms it: frame 7 is pixel-identical to frame 1, frame 8 to frame 6.
+            if (string.Equals(cls, "Toolbar", StringComparison.OrdinalIgnoreCase)
+                && sourceCount == 6 && targetCount == 8)
+                return new[] { 0, 1, 2, 3, 4, 5, 0, 5 };
             if (string.Equals(cls, "ScrollBar", StringComparison.OrdinalIgnoreCase))
             {
                 if (part == 1 && sourceCount == 16 && targetCount == 20)
                     return Enumerable.Range(0, 16).Concat(new[] { 0, 4, 8, 12 }).ToArray();
-                if (part >= 2 && part <= 9 && sourceCount == 4 && targetCount == 5)
-                    return new[] { 0, 1, 2, 3, 0 };
+                // Every thumb and gripper part indexes its strip by state id (uxtheme imagefile.cpp
+                // GetOffsets: offset = (iStateId-1) * single), so frame i is state i+1 whatever the
+                // count. A source with fewer frames than win10 simply doesn't draw the states it
+                // omits: DISABLED and HOVER fall back to NORMAL, exactly as the 4 -> 5 cut does.
+                // Elfin2 ships three gripper frames (normal/hot/pressed) against Luna10's five.
+                if (part >= 2 && part <= 9 && sourceCount >= 1 && sourceCount < targetCount)
+                    return Enumerable.Range(0, targetCount).Select(i => i < sourceCount ? i : 0).ToArray();
             }
             // SPIN: xp and win10 both have four states (NORMAL, HOT, PRESSED, DISABLED) and both index the strip
             // by state id (uxtheme imagefile.cpp GetOffsets: offset = (iStateId-1) * single). A source that ships

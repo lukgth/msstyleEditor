@@ -426,7 +426,10 @@ namespace libmsstyle
                     return null;
                 }
                 sb.Append(replacement);
+                // step over the closing "##" too, or the next scan finds it with an empty name and refuses the
+                // property. XP's parser accepts the token without the pair, so a lone "##name" also ends here.
                 i = end;
+                if (i + 1 < value.Length && value[i] == '#' && value[i + 1] == '#') i += 2;
             }
             return sb.ToString();
         }

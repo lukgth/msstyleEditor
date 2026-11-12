@@ -279,6 +279,13 @@ namespace libmsstyle.Import.Dui
                     cond.Text = val;
                     cond.Value = ParseValue(val);
                 }
+                else if (cond.Name.StartsWith("!", StringComparison.Ordinal))
+                {
+                    // a bare negated flag, `[!keyfocused]`: the '!' is the operator, and the condition matches when
+                    // the state is false. Without this the name kept its '!' and no state ever resolved.
+                    cond.Name = cond.Name.Substring(1).Trim().ToLowerInvariant();
+                    cond.Negated = true;
+                }
                 if (cond.Name.Length == 0) { if (diag != null) diag.Add(Where(line) + "empty condition in selector: \"" + s + "\""); }
                 else sel.Conditions.Add(cond);
                 i = close + 1;

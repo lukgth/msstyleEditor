@@ -148,27 +148,6 @@ namespace libmsstyle.Import.Dui
             e.SetAttributeValue(name, value);
         }
 
-        public static bool RemoveAttribute(XElement e, string name)
-        {
-            var a = Attribute(e, name);
-            if (a == null) return false;
-            a.Remove();
-            return true;
-        }
-
-        /// <summary>A nested condition inside a class block: <c>&lt;if MouseFocused="true"&gt;</c>. Creates it
-        /// (as the last child) when absent.</summary>
-        public XElement EnsureCondition(XElement parent, string condition, string value = "true")
-        {
-            if (parent == null) return null;
-            foreach (var e in parent.Elements("if"))
-                if (AttributeIs(e, condition, value)) return e;
-            var created = new XElement("if");
-            created.SetAttributeValue(condition, value);
-            parent.Add(created);
-            return created;
-        }
-
         /// <summary>Find the first child element inside a block whose tag is <paramref name="tag"/>, else create it
         /// before any nested &lt;if&gt; so plain declarations stay first.</summary>
         public static XElement EnsureElement(XElement parent, string tag)
@@ -181,15 +160,6 @@ namespace libmsstyle.Import.Dui
             if (firstIf != null) firstIf.AddBeforeSelf(created);
             else parent.Add(created);
             return created;
-        }
-
-        /// <summary>Ensure a child element exists with the given attributes; returns it.</summary>
-        public static XElement AddElement(XElement parent, string tag, params (string name, string value)[] attrs)
-        {
-            var e = new XElement(tag);
-            foreach (var a in attrs) if (a.value != null) e.SetAttributeValue(a.name, a.value);
-            parent.Add(e);
-            return e;
         }
     }
 }

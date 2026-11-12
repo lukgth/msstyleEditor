@@ -136,7 +136,9 @@ namespace libmsstyle.Import
             TaskListInset();
             PaneFonts();
             TaskHover(false);
-            TaskHover(specialMain);
+            // the special group is drawn like the normal one in xp's classic shellstyle, so the second call would
+            // redo the same group: same picture, same records, duplicated decisions.
+            if (specialMain) TaskHover(true);
             SectionIcons();
             GroupBackground();
             ControlPanelPage();
@@ -176,8 +178,10 @@ namespace libmsstyle.Import
             }
             Copy(IDENTIFIER.BGTYPE, 0, IDENTIFIER.ENUM);
             Copy(IDENTIFIER.IMAGEFILE, imageId, IDENTIFIER.FILENAME);
+            // one frame: the recipient shows the rebar picture as a single stretched image. A source strip with
+            // several frames would otherwise have every frame squeezed into the bar.
             Copy(IDENTIFIER.IMAGECOUNT, 1, IDENTIFIER.INT);
-            foreach (var name in new[] { IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGTYPE })
+            foreach (var name in new[] { IDENTIFIER.SIZINGTYPE, IDENTIFIER.TRANSPARENT_, IDENTIFIER.TRANSPARENTCOLOR })
             {
                 var src = P(bgSt, name);
                 if (src != null) Copy(name, src.GetValue(), (IDENTIFIER)src.Header.typeID);
@@ -379,13 +383,6 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// The details section's text ("My Computer" / "System Folder" under the Details header): xp's info lines draw
-        /// no color of their own in themed mode and inherit system windowtext, and a theme overrides it in its shellstyle
-        /// (<see cref="DetailsSheet"/>: CrystalBlue's `foreground: white` over its dark group art; stock luna's sheet has
-        /// none). Windows 10's genericlayoutstyle reads <see cref="PreviewClass"/> instead, so the source's override
-        /// becomes those records; without one the template's black stays, as on xp.
-        /// </summary>
-        /// <summary>
         /// The rebar band the address bar sits on. XP draws Rebar|BAND state 0 as a see-through band (TRANSPARENT true, no
         /// fill of its own), so the rebar background picture (Rebar part 0 IMAGEFILE, XtremeXP's ribbed strip) shows
         /// through it. Windows 10 fills the band's own box from its BGTYPE 2 fill instead, leaving a flat strip where XP
@@ -416,10 +413,14 @@ namespace libmsstyle.Import
             }
             Copy(IDENTIFIER.BGTYPE, 0, IDENTIFIER.ENUM);
             Copy(IDENTIFIER.IMAGEFILE, imageId, IDENTIFIER.FILENAME);
+            // one frame: the recipient shows the rebar picture as a single stretched image. A source strip with
+            // several frames would otherwise have every frame squeezed into the bar.
             Copy(IDENTIFIER.IMAGECOUNT, 1, IDENTIFIER.INT);
             // IMAGELAYOUT/SIZINGTYPE/TRANSPARENT_/TRANSPARENTCOLOR describe the picture itself, so they come over as they
             // are; SIZINGMARGINS does not: it describes the rebar band's own box, and the band is taller than the picture.
-            foreach (var name in new[] { IDENTIFIER.IMAGELAYOUT, IDENTIFIER.SIZINGTYPE, IDENTIFIER.TRANSPARENT_, IDENTIFIER.TRANSPARENTCOLOR })
+            // IMAGELAYOUT only cuts a multi-frame strip, so with the count forced to one it says nothing: leaving the
+            // source's value would pair a horizontal cut with a single frame if the source ever shipped a strip.
+            foreach (var name in new[] { IDENTIFIER.SIZINGTYPE, IDENTIFIER.TRANSPARENT_, IDENTIFIER.TRANSPARENTCOLOR })
             {
                 var src = P(bgSt, name);
                 if (src == null) continue;
@@ -429,6 +430,13 @@ namespace libmsstyle.Import
                 Copy(IDENTIFIER.SIZINGMARGINS, FitMargins(rm, pic.Width, pic.Height), IDENTIFIER.MARGINS);
         }
 
+        /// <summary>
+        /// The details section's text ("My Computer" / "System Folder" under the Details header): xp's info lines draw
+        /// no color of their own in themed mode and inherit system windowtext, and a theme overrides it in its shellstyle
+        /// (<see cref="DetailsSheet"/>: CrystalBlue's `foreground: white` over its dark group art; stock luna's sheet has
+        /// none). Windows 10's genericlayoutstyle reads <see cref="PreviewClass"/> instead, so the source's override
+        /// becomes those records; without one the template's black stays, as on xp.
+        /// </summary>
         private void DetailsText()
         {
             if (!m_imp.Target.ClassesByName.TryGetValue(PreviewClass, out var cls) || m_imp.Target.DuplicateClassNames.Contains(PreviewClass)) return;
@@ -638,6 +646,18 @@ namespace libmsstyle.Import
             if ((img.Header.shortFlag & 0xFFFF) == id) return;
             img.SetValue(id);
             m_imp.MarkTouched(img, $"{IconClass}|Part {GroupPart}|S0|IMAGEFILE");
+            // The rebuilt strip's frames are the source's size, so the template's nine-grid (fitted to the
+            // template's own art) would collapse a frame narrower than its margins. Refit it to the new picture.
+            var sizing = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.SIZINGMARGINS);
+            if (sizing?.GetValue() is Margins rm)
+            {
+                var fitted = FitMargins(rm, w, h);
+                if (!fitted.Equals(rm))
+                {
+                    sizing.SetValue(fitted);
+                    m_imp.MarkTouched(sizing, $"{IconClass}|Part {GroupPart}|S0|SIZINGMARGINS");
+                }
+            }
             m_imp.Report.Decisions.Add(new MergeDecision
             {
                 Class = IconClass, Part = "Part " + GroupPart, State = 0, Property = "IMAGEFILE", Action = "applied-shellstyle",
@@ -1274,6 +1294,25 @@ namespace libmsstyle.Import
             return st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
         }
 
+        /// <summary>the same record in stock xp, so a source record can be told apart from xp's own.</summary>
+        private StyleProperty BaseProperty(int part, IDENTIFIER name)
+        {
+            if (m_imp.Base == null || !m_imp.Base.ClassesByName.TryGetValue(Cls, out var cls)
+                || !cls.Parts.TryGetValue(part, out var p) || !p.States.TryGetValue(0, out var st)) return null;
+            return st.Properties.FirstOrDefault(x => x.Header.nameID == (int)name);
+        }
+
+        /// <summary>
+        /// what the source style states beyond stock xp, or null. XP's msstyles ExplorerBar records are written by
+        /// packthem for every part whether xp's shell reads them or not (it draws the task pane from the shellstyle),
+        /// so a record that merely repeats stock states nothing and must not beat the template's own adaptation.
+        /// </summary>
+        private Margins ChangedFromBase(int part, IDENTIFIER name)
+        {
+            if (!(SourceProperty(part, name)?.GetValue() is Margins source)) return null;
+            return BaseProperty(part, name)?.GetValue() is Margins stock && SameRect(source, stock) ? null : source;
+        }
+
         /// <summary>
         /// The group background (win10 dtb(ExplorerBar, 5/9) on the clipper): what xp showed behind the tasks (the first
         /// opaque fill of tasklist, watermark, clipper, expando and pane, background inheriting through), framed by the
@@ -1555,8 +1594,8 @@ namespace libmsstyle.Import
         /// <c>ExplorerBarBackground</c> element's padding). Two things make the shellstyle value unusable on
         /// its own:
         /// <list type="bullet">
-        /// <item>a style that states its own <c>ExplorerBar</c> part 0 <c>CONTENTMARGINS</c> is authoritative,
-        /// exactly as for the group headers (<see cref="HeaderInset"/>);</item>
+        /// <item>a style that states an <c>ExplorerBar</c> part 0 <c>CONTENTMARGINS</c> other than stock xp's is
+        /// authoritative, exactly as for the group headers (<see cref="HeaderInset"/>);</item>
         /// <item>xp packs commonly pad the section list OUT of its own box (<c>rect(-500rp,-300rp,4rp,8rp)</code>
         /// in areao4) so that only the background bitmap's border shows. A negative extent like that is a
         /// nine-stretch hack, not a content inset; written into the record it moves the pane's content off
@@ -1567,7 +1606,7 @@ namespace libmsstyle.Import
         {
             var p = Find(Background, 0, IDENTIFIER.CONTENTMARGINS);
             if (p == null) return;
-            var explicitMargins = SourceProperty(Background, IDENTIFIER.CONTENTMARGINS)?.GetValue() as Margins;
+            var explicitMargins = ChangedFromBase(Background, IDENTIFIER.CONTENTMARGINS);
             if (explicitMargins != null)
             {
                 if (!(p.GetValue() is Margins cur) || !SameRect(cur, explicitMargins))
@@ -1591,20 +1630,22 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// An explicit ExplorerBar 8/12 CONTENTMARGINS in the source style is authoritative. Only styles without
-        /// that record use the shellstyle delta against the template's stock-luna adaptation: XP sizes the header
-        /// from borderthickness + padding around its title, while Win10 reads gtmar(ExplorerBar, 8/12, 0, 3602).
+        /// A source <c>ExplorerBar</c> 8/12 <c>CONTENTMARGINS</c> that differs from stock xp's is authoritative. A
+        /// record that repeats stock states nothing (packthem writes the whole part whether xp's shell reads it or
+        /// not; the task pane is drawn from the shellstyle), so those styles use the shellstyle delta against the
+        /// template's stock-luna adaptation: XP sizes the header from borderthickness + padding around its title,
+        /// while Win10 reads gtmar(ExplorerBar, 8/12, 0, 3602).
         /// </summary>
         private void HeaderInset(int part, bool main, string what)
         {
             var p = Find(part, 0, IDENTIFIER.CONTENTMARGINS);
             if (p == null) return;
-            var explicitMargins = SourceProperty(part, IDENTIFIER.CONTENTMARGINS);
-            if (explicitMargins?.GetValue() is Margins sourceMargins)
+            var explicitMargins = ChangedFromBase(part, IDENTIFIER.CONTENTMARGINS);
+            if (explicitMargins != null)
             {
-                if (!(p.GetValue() is Margins current) || !SameRect(current, sourceMargins))
+                if (!(p.GetValue() is Margins current) || !SameRect(current, explicitMargins))
                 {
-                    p.SetValue(new Margins(sourceMargins.Left, sourceMargins.Top, sourceMargins.Right, sourceMargins.Bottom));
+                    p.SetValue(new Margins(explicitMargins.Left, explicitMargins.Top, explicitMargins.Right, explicitMargins.Bottom));
                     Changed(p, part, 0, "applied-xp-header-margins", $"{what} header uses the source style's explicit CONTENTMARGINS; shellstyle inset deltas apply only when that record is absent");
                 }
                 return;
@@ -1677,6 +1718,14 @@ namespace libmsstyle.Import
             }
             var strip = new ArgbImage(w, h * pics.Count);
             for (int i = 0; i < pics.Count; ++i) strip.Blit(pics[i], 0, i * h);
+            // the strip is stacked vertically, so the part must be cut vertically. Luna10's collapse/expand parts
+            // carry IMAGELAYOUT 0; a template that cut horizontally would slice this into slivers.
+            var layout = Find(part, 0, IDENTIFIER.IMAGELAYOUT);
+            if (layout?.GetValue() is int lo && lo != 0)
+            {
+                m_imp.Report.Warnings.Add($"shellstyle: {what} arrow part is cut horizontally in the template; the vertical arrow strip was not applied.");
+                return;
+            }
             PlaceImage(img, part, ImageIdentity.EncodePngVerified(strip), $"{what} arrow bitmaps (normal, hot, pressed)");
             var count = Find(part, 0, IDENTIFIER.IMAGECOUNT);
             if (count != null && !(count.GetValue() is int c && c == pics.Count)) { count.SetValue(pics.Count); Changed(count, part, 0, "applied-shellstyle", "frame count of the arrow strip"); }
@@ -1925,6 +1974,7 @@ namespace libmsstyle.Import
                         int bb = ib < 0 ? -1 : sheet.IndexOf("<button ", ib, StringComparison.OrdinalIgnoreCase);
                         if (bb < 0 || sheet.IndexOf("</if>", ib, StringComparison.Ordinal) < bb) { warnings.Add($"shellstyle layout: no {kv.Key} button rule in the template's ExplorerBarStyle; that header title stays left."); align[kv.Key] = null; continue; }
                         int be = sheet.IndexOf("/>", bb, StringComparison.Ordinal);
+                        if (be < 0) { warnings.Add($"shellstyle layout: the template's {kv.Key} button tag is unterminated; that header title stays left."); align[kv.Key] = null; continue; }
                         string tag = sheet.Substring(bb, be - bb);
                         string newTag = tag.Insert("<button ".Length, $"contentalign=\"{kv.Value}\" ");
                         if (pads[kv.Key].HasValue)

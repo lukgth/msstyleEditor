@@ -106,11 +106,13 @@ namespace libmsstyle.Import
         /// <summary>the cursor slots xp's theme engine writes, and only these
         /// (themeui/themefile.cpp:19 <c>s_pszCursorArray</c>). Every other slot in
         /// <see cref="XpThemeFiles.CursorKeys"/> is a win10 addition xp never had: writing them blanks the user's own
-        /// cursors, so they are read but never touched.</summary>
+        /// cursors, so they are read but never touched. The list is the same 15 slots desk.cpl joins into its comma
+        /// list (<see cref="SchemeSlots"/>, shell/cpls/main/mouseptr.c:155 <c>gacd[]</c>): Hand is the pointer's
+        /// link/hand slot there, and Link is a win10-only duplicate of it that xp never wrote.</summary>
         private static readonly string[] XpCursorSlots =
         {
             "Arrow", "Help", "AppStarting", "Wait", "NWPen", "No", "SizeNS", "SizeWE", "Crosshair", "IBeam",
-            "SizeNWSE", "SizeNESW", "SizeAll", "UpArrow", "Link",
+            "SizeNWSE", "SizeNESW", "SizeAll", "UpArrow", "Hand",
         };
 
         /// <summary>the scheme's slots in the order desk.cpl joins them into its comma list
@@ -924,7 +926,9 @@ namespace libmsstyle.Import
                     key.SetValue("TileWallpaper", ini.Get(@"Control Panel\Desktop", "TileWallpaper"), RegistryValueKind.String);
                 if (!string.IsNullOrEmpty(ini.Get(@"Control Panel\Desktop", "PicturePosition")))
                     key.SetValue("PicturePosition", ini.Get(@"Control Panel\Desktop", "PicturePosition"), RegistryValueKind.String);
-                key.SetValue("Wallpaper", wallpaper ?? "", RegistryValueKind.String);
+                // only when the theme names a picture: writing "" clears the desktop for the next logon, and a
+                // .theme that names no wallpaper says nothing about the user's own.
+                if (!string.IsNullOrEmpty(wallpaper)) key.SetValue("Wallpaper", wallpaper, RegistryValueKind.String);
             }
             if (!string.IsNullOrEmpty(wallpaper) && File.Exists(wallpaper))
             {
@@ -938,8 +942,9 @@ namespace libmsstyle.Import
             }
             else if (!string.IsNullOrEmpty(wallpaper))
             {
+                // the registry value was already written above; the picture just isn't there to draw. That is a
+                // cosmetic miss, not a failed style application.
                 r.Warnings.Add($"desktop: wallpaper \"{wallpaper}\" doesn't exist; the desktop picture was left alone");
-                ok = false;
             }
 
             if (!WriteSystemIniScreensaver(screenSaver, r)) ok = false;
@@ -960,23 +965,21 @@ namespace libmsstyle.Import
             return ok;
         }
 
-        /// <summary>writes (or deletes, when there is none) <c>SYSTEM.INI</c>'s <c>[boot] SCRNSAVE.EXE</c>, the same
-        /// channel xp uses. A screensaver that isn't installed is reported and left alone, so the ini keeps naming
-        /// something that exists.</summary>
+        /// <summary>writes <c>SYSTEM.INI</c>'s <c>[boot] SCRNSAVE.EXE</c> when the theme names one, the same channel
+        /// xp uses. A theme that names none leaves the user's screensaver alone: clearing it is desk.cpl's "None"
+        /// selection, a user action, not something applying a visual style should do (and the write needs admin).
+        /// A screensaver that isn't installed is reported and left alone, so the ini keeps naming something that
+        /// exists.</summary>
         private static bool WriteSystemIniScreensaver(string screenSaver, ThemeApplyResult r)
         {
+            if (string.IsNullOrWhiteSpace(screenSaver)) return true;
             string ini = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "system.ini");
             try
             {
-                if (string.IsNullOrEmpty(screenSaver))
-                {
-                    WritePrivateProfileString("boot", "SCRNSAVE.EXE", null, ini);
-                    return true;
-                }
                 if (!File.Exists(screenSaver))
                 {
                     r.Warnings.Add($"desktop: screensaver \"{screenSaver}\" doesn't exist; SYSTEM.INI was left alone");
-                    return false;
+                    return true;
                 }
                 var shortPath = new StringBuilder(260);
                 string value = GetShortPathName(screenSaver, shortPath, shortPath.Capacity) > 0 ? shortPath.ToString() : screenSaver;

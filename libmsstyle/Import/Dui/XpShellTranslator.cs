@@ -603,7 +603,12 @@ namespace libmsstyle.Import.Dui
                         report.Unsupported.Add(rule.Selector.Raw + ": state [" + s.Name + "] has no DUIXML condition");
                         return false;
                     }
-                    string value = s.Negated ? "false" : "true";
+                    // The condition's own value decides, not the operator alone: `[x=false]` matches when x is false
+                    // and `[x!=true]` matches when it is false too. Only a bare `[x]` means true. This mirrors
+                    // DuiCascade.Matches, so the translated sheet and the cascade agree on the same selector.
+                    bool want = s.Value == null
+                        || (s.Value.Kind == XpUifileSyntax.ValueKind.Ident && s.Value.Text.Equals("true", StringComparison.OrdinalIgnoreCase));
+                    string value = (s.Negated ? !want : want) ? "true" : "false";
                     XElement next = null;
                     foreach (var e in cursor.Elements("if"))
                         if (DuiXmlDocument.AttributeIs(e, name, value)) { next = e; break; }

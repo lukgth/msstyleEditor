@@ -188,6 +188,21 @@ namespace libmsstyle
 				this.reserved == other.reserved &&
 				this.sizeInBytes == other.sizeInBytes;
 		}
+
+		public override int GetHashCode()
+		{
+			unchecked
+			{
+				int hash = nameID;
+				hash = (hash * 397) ^ typeID;
+				hash = (hash * 397) ^ classID;
+				hash = (hash * 397) ^ partID;
+				hash = (hash * 397) ^ stateID;
+				hash = (hash * 397) ^ shortFlag;
+				hash = (hash * 397) ^ reserved;
+				return (hash * 397) ^ sizeInBytes;
+			}
+		}
     };
 
 	public class StyleProperty
@@ -390,8 +405,25 @@ namespace libmsstyle
 				return false;
 
 			var other = (StyleProperty)o;
-			return this.Header.Equals(other.Header) &&
-				this.GetValue().Equals(other.GetValue());
+			if (!this.Header.Equals(other.Header))
+				return false;
+			// several property types (DIBDATA, STREAM, HBITMAP, FLOAT, ...) have no default value, so GetValue() is
+			// null for them; comparing through it threw a NullReferenceException from List.Remove.
+			object mine = this.GetValue(), theirs = other.GetValue();
+			if (mine == null || theirs == null) return mine == null && theirs == null;
+			return mine.Equals(theirs);
+		}
+
+		// Equals compares header and value, so the hash has to follow the same fields: a HashSet<StyleProperty>
+		// (the importer's touched-set) otherwise hashes by reference and never finds an equal-but-distinct instance.
+		public override int GetHashCode()
+		{
+			unchecked
+			{
+				int hash = Header == null ? 0 : Header.GetHashCode();
+				object value = GetValue();
+				return (hash * 397) ^ (value == null ? 0 : value.GetHashCode());
+			}
 		}
 	}
 }

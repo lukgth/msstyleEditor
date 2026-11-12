@@ -396,7 +396,7 @@ namespace libmsstyle.Import
                         else Error($"{label}: {ce.ResourceType} {ce.ResourceId} doesn't exist");
                         continue;
                     }
-                    if (changed)
+                    if (changed || CutChanged(tm, tm.Entries.FirstOrDefault(t => t.ClassId == ce.ClassId && t.PartId == ce.PartId && t.StateId == ce.StateId), cm))
                     {
                         if (SemanticModel.MustBePng(ce.Property))
                         {
@@ -419,6 +419,27 @@ namespace libmsstyle.Import
                 }
             }
             Check($"every IMAGE/STREAM reference resolves; {images} changed image references decode as png and split into their effective IMAGECOUNT; {fonts} changed font/string references resolve in the string table.");
+        }
+
+        /// <summary>
+        /// Whether the effective strip cut (IMAGECOUNT/IMAGELAYOUT) of this state differs from the template's.
+        /// A picture that keeps the template's id is still drawn with the candidate's cut, so a cut the import
+        /// changed must re-check its frame fit even though the image record itself didn't change.
+        /// </summary>
+        private static bool CutChanged(SemanticModel tm, SemanticEntry te, SemanticModel cm)
+        {
+            if (te == null) return false;
+            if (!cm.Style.Classes.TryGetValue(te.ClassId, out var cc)) return false;
+            if (!tm.Style.Classes.TryGetValue(te.ClassId, out var tc)) return false;
+            var cmCount = SemanticModel.FindEffective(cm.Style, cc, te.PartId, te.StateId, IDENTIFIER.IMAGECOUNT);
+            var tmCount = SemanticModel.FindEffective(tm.Style, tc, te.PartId, te.StateId, IDENTIFIER.IMAGECOUNT);
+            var cmLayout = SemanticModel.FindEffective(cm.Style, cc, te.PartId, te.StateId, IDENTIFIER.IMAGELAYOUT);
+            var tmLayout = SemanticModel.FindEffective(tm.Style, tc, te.PartId, te.StateId, IDENTIFIER.IMAGELAYOUT);
+            int cc2 = cmCount?.GetValue() is int a && a > 0 ? a : 1;
+            int tc2 = tmCount?.GetValue() is int b && b > 0 ? b : 1;
+            int cl = cmLayout?.GetValue() is int l1 ? l1 : 0;
+            int tl = tmLayout?.GetValue() is int l2 ? l2 : 0;
+            return cc2 != tc2 || cl != tl;
         }
 
         /// <summary>
