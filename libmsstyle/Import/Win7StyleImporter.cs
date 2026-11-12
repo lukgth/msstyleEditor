@@ -916,6 +916,68 @@ namespace libmsstyle.Import
         };
 
         /// <summary>
+        /// xp's combo button face: the Combobox frame (part 0)'s IMAGEFILE and the nine-slice margins it is
+        /// stretched with. Elfin2 keeps the face there and only the arrow on part 1.
+        /// </summary>
+        private (ArgbImage Image, Margins Margins)? SourceComboFace(StyleClass sc)
+        {
+            var prop = SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.IMAGEFILE);
+            if (!(prop?.GetValue() is int id)) return null;
+            var img = Decoded(m_source, "IMAGE", id & 0xFFFF);
+            if (img == null) return null;
+            var m = SemanticModel.FindEffective(m_source.Style, sc, 0, 0, IDENTIFIER.SIZINGMARGINS)?.GetValue() as Margins;
+            return (img, m ?? new Margins(0, 0, 0, 0));
+        }
+
+        /// <summary>nine-slice stretch of <paramref name="pic"/> into <paramref name="dst"/>: corners keep their
+        /// size, the edges and body stretch. Same rule uxtheme applies to a SIZINGTYPE=STRETCH picture.</summary>
+        private static void NineSliceInto(ArgbImage pic, Margins m, ArgbImage dst)
+        {
+            int l = Math.Max(0, Math.Min(m.Left, pic.Width - 1)), r = Math.Max(0, Math.Min(m.Right, pic.Width - 1 - l));
+            int t = Math.Max(0, Math.Min(m.Top, pic.Height - 1)), b = Math.Max(0, Math.Min(m.Bottom, pic.Height - 1 - t));
+            int dl = Math.Min(l, dst.Width - 1), dr = Math.Min(r, dst.Width - 1 - dl);
+            int dt = Math.Min(t, dst.Height - 1), db = Math.Min(b, dst.Height - 1 - dt);
+            for (int y = 0; y < dst.Height; ++y)
+            {
+                int sy;
+                if (y < dt) sy = y;
+                else if (y >= dst.Height - db) sy = pic.Height - (dst.Height - y);
+                else sy = t + (int)((long)(y - dt) * (pic.Height - t - b) / Math.Max(1, dst.Height - dt - db));
+                sy = Math.Max(0, Math.Min(sy, pic.Height - 1));
+                for (int x = 0; x < dst.Width; ++x)
+                {
+                    int sx;
+                    if (x < dl) sx = x;
+                    else if (x >= dst.Width - dr) sx = pic.Width - (dst.Width - x);
+                    else sx = l + (int)((long)(x - dl) * (pic.Width - l - r) / Math.Max(1, dst.Width - dl - dr));
+                    sx = Math.Max(0, Math.Min(sx, pic.Width - 1));
+                    dst.Pixels[y * dst.Width + x] = pic.Pixels[sy * pic.Width + sx];
+                }
+            }
+        }
+
+        private VisualStyle m_templateStyle;
+        private SemanticModel m_templateModel;
+
+        /// <summary>
+        /// the template's own picture for a part/state, read from the template file rather than from the merged
+        /// target (which by this point holds the source's picture in that slot).
+        /// </summary>
+        private ArgbImage TemplatePlate(StyleClass cls, int partId, int stateId)
+        {
+            if (m_templateStyle == null)
+            {
+                m_templateStyle = new VisualStyle();
+                m_templateStyle.Load(m_opt.TemplatePath);
+                m_templateModel = new SemanticModel(m_templateStyle);
+            }
+            if (!m_templateModel.ClassesByName.TryGetValue(cls.ClassName, out var tc)) return null;
+            var prop = SemanticModel.FindEffective(m_templateStyle, tc, partId, stateId, IDENTIFIER.IMAGEFILE);
+            if (!(prop?.GetValue() is int id)) return null;
+            return Decoded(m_templateModel, "IMAGE", id & 0xFFFF);
+        }
+
+        /// <summary>
         /// xp only. xp's Combobox|DROPDOWNBUTTON is two pictures: IMAGEFILE is the 21x22-per-state button
         /// face (a vertical strip) and GLYPHIMAGEFILE is the 10x7-per-state arrow; xp composites them when it
         /// draws. win10 has one picture and picks it from the dpi set (IMAGEFILE1-7), which the merge
@@ -925,6 +987,34 @@ namespace libmsstyle.Import
         /// composite gives win10 the picture xp drew. Every state is composited, because win10 draws hot
         /// and pressed from the same part.
         /// </summary>
+        /// <summary>
+        /// whether <paramref name="picture"/> carries a button face of its own, i.e. it has opaque pixels outside
+        /// the arrow's footprint in any frame. xp's Elfin2 puts the face on the combo frame (part 0) and leaves only
+        /// the arrow strip here, so there is nothing to composite onto and the template's plate is the chrome.
+        /// </summary>
+        private static bool HasButtonFace(ArgbImage picture, int count, bool horizontal, int fw, int fh, int gw, int gh)
+        {
+            // the composite centers the arrow in its frame (see BlendOver below), so the arrow's footprint is the
+            // centered gw x gh box, not the frame's top-left corner.
+            int ox = (fw - gw) / 2, oy = (fh - gh) / 2;
+            for (int i = 0; i < count; ++i)
+            {
+                int sx = horizontal ? i * fw : 0;
+                int sy = horizontal ? 0 : i * fh;
+                if (sx + fw > picture.Width || sy + fh > picture.Height) continue;
+                for (int y = 0; y < fh; ++y)
+                {
+                    for (int x = 0; x < fw; ++x)
+                    {
+                        if ((picture.Pixels[(sy + y) * picture.Width + sx + x] >> 24) == 0) continue;
+                        if (x >= ox && x < ox + gw && y >= oy && y < oy + gh) continue;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         private void CompositeXpComboButton()
         {
             if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
@@ -984,7 +1074,39 @@ namespace libmsstyle.Import
                         if (horizontal) { if (glyph.Width % count != 0) continue; gw = glyph.Width / count; }
                         else { if (glyph.Height % count != 0) continue; gh = glyph.Height / count; }
                     }
-                    if (gw > fw || gh > fh) continue;
+                    // xp's button picture is sometimes the arrow strip itself: the button face is the combo frame
+                    // (part 0), which win10's part 0 has no IMAGEFILE for, so the port drops it. Then there is no
+                    // face to composite onto, and the template's own plate is the button chrome while only the
+                    // arrow is xp's. Without this the port replaced Luna10's 15x64 plate with the bare 10x40 arrow
+                    // strip and uxtheme stretched one arrow across the whole button (Elfin2's Run dialog).
+                    if (!HasButtonFace(picture, count, horizontal, fw, fh, gw, gh))
+                    {
+                        // xp draws this button as a face under an arrow: the face is the combo frame (part 0's
+                        // IMAGEFILE, a nine-slice), the arrow is this part's picture. win10 draws one picture from
+                        // this part and part 0 has no IMAGEFILE to hold the face, so build it from the source's own
+                        // face stretched into the template's frame geometry with the arrow on top. Using the
+                        // template's plate instead put a different theme's artwork behind Elfin2's arrow.
+                        var face = SourceComboFace(sc);
+                        var geom = TemplatePlate(tc, tp.PartId, st.StateId);
+                        if (face == null || geom == null) continue;
+                        int W = geom.Width, H = geom.Height;
+                        if (count > 1 && (horizontal ? W % count : H % count) != 0) continue;
+                        int cw = count > 1 ? (horizontal ? W / count : W) : W;
+                        int ch = count > 1 ? (horizontal ? H : H / count) : H;
+                        if (cw <= 0 || ch <= 0) continue;
+                        glyph = picture;
+                        gw = fw; gh = fh;
+                        var canvas = new ArgbImage(W, H);
+                        for (int i = 0; i < count; ++i)
+                        {
+                            var cell = new ArgbImage(cw, ch);
+                            NineSliceInto(face.Value.Image, face.Value.Margins, cell);
+                            canvas.Blit(cell, horizontal ? i * cw : 0, horizontal ? 0 : i * ch);
+                        }
+                        picture = canvas;
+                        fw = cw; fh = ch;
+                    }
+                    if (fw <= 0 || fh <= 0 || gw > fw || gh > fh) continue;
 
                     var composite = new ArgbImage(picture.Width, picture.Height);
                     bool any = false;

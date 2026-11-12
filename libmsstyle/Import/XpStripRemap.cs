@@ -269,6 +269,14 @@ namespace libmsstyle.Import
             if (string.Equals(cls, "Toolbar", StringComparison.OrdinalIgnoreCase)
                 && sourceCount == 6 && targetCount == 8)
                 return new[] { 0, 1, 2, 3, 4, 5, 0, 5 };
+            // REBAR: the taskbar's overflow chevron (part 4) and its vertical twin (5). Both xp and win10 index
+            // the strip by state id, and both declare only NORMAL/HOT/PRESSED (XpSchema CHEVRONSTATES;
+            // VisualStyleStateMap STATES_REBAR_GENERAL), so frame i is state i+1 and any extra frames are
+            // spares the pack author added. Elfin2 ships 5 against Luna10's 6; refusing the cut left the
+            // template's Luna-blue chevron on a theme that draws its own (the taskbar's overflow button).
+            if (string.Equals(cls, "Rebar", StringComparison.OrdinalIgnoreCase)
+                && (part == 4 || part == 5) && sourceCount >= 1 && sourceCount < targetCount)
+                return Enumerable.Range(0, targetCount).Select(i => i < sourceCount ? i : 0).ToArray();
             if (string.Equals(cls, "ScrollBar", StringComparison.OrdinalIgnoreCase))
             {
                 if (part == 1 && sourceCount == 16 && targetCount == 20)
