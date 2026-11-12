@@ -556,8 +556,28 @@ namespace libmsstyle.Import
 
         internal static ArgbImage CutXpButtonFrame(ArgbImage source, int count, bool horizontal, int stateIndex, bool inactive)
         {
-            if (source == null || (count != 1 && count != 4 && count != 8) || stateIndex < 0 || stateIndex >= 4) return null;
-            int index = count == 1 ? 0 : stateIndex + (inactive && count == 8 ? 4 : 0);
+            if (source == null || stateIndex < 0 || stateIndex >= 4) return null;
+            int index;
+            if (count == 1) index = 0;
+            else if (count == 4) index = stateIndex;                          // N,H,P,D -- no inactive half
+            else if (count == 8) index = stateIndex + (inactive ? 4 : 0);      // N,H,P,D then N,H,P,D
+            else if (count == 3)
+            {
+                // three frames and no inactive half at all: NORMAL/HOT/PUSHED only. The inactive and disabled
+                // states draw the matching active frame (a pack that ships no inactive art has nothing better).
+                if (stateIndex == 3) stateIndex = 0;
+                index = stateIndex;
+            }
+            else if (count == 6)
+            {
+                // Elfin2/Wood ship three states per mode with the inactive half mirrored: N,H,P then P,H,N.
+                // Measured on Wood's 21x126 strip: the pairs (1,6),(2,5),(3,4) are the closest matches
+                // (~30 vs ~54 for the unmirrored reading), and frames 3/4 are the only sunken (pressed) ones.
+                // There is no DISABLED frame, so stateIndex 3 falls back to NORMAL.
+                if (stateIndex == 3) stateIndex = 0;
+                index = inactive ? 5 - stateIndex : stateIndex;
+            }
+            else return null;
             int w = source.Width / (horizontal ? count : 1), h = source.Height / (horizontal ? 1 : count);
             return w < 1 || h < 1 ? null : source.Crop(new Rectangle(horizontal ? index * w : 0, horizontal ? 0 : index * h, w, h));
         }

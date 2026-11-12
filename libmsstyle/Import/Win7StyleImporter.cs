@@ -1848,6 +1848,14 @@ namespace libmsstyle.Import
                         var png = ImageIdentity.EncodePngVerified(flat);
                         newId = PlaceResource("IMAGE", id, png, ImageIdentity.Analyze(png));
                         flattened[id] = newId;
+                        // the flattened picture is a NEW image with its own sha1, so the waiver registered for the
+                        // source's see-through picture no longer matches. Wood's Spin ships 18x81 with IMAGECOUNT 4
+                        // (81/4 leaves a row); xp cut it with integer division and never showed the remainder, so the
+                        // flattened copy carries the same waiver or validation blocks the whole import.
+                        var flatInfo = ImageIdentity.Analyze(png);
+                        if (SemanticModel.FindEffective(m_target.Style, tc, p.PartId, st.StateId, IDENTIFIER.IMAGECOUNT)?.GetValue() is int fcount && fcount > 0
+                            && !StyleValidator.FramesFit(m_target, m_target.Entries.First(x => ReferenceEquals(x.Property, img)), flatInfo, out int fc, out _))
+                            FrameWaivers.Add(StyleValidator.FrameWaiverKey(flatInfo.PixelSha1, fc));
                         m_report.Notes.Add($"Spin IMAGE {id}: see-through button picture flattened onto the source's BTNFACE {face.R},{face.G},{face.B} as IMAGE {newId} (WinForms' NumericUpDown doesn't erase under it).");
                         m_report.Count("applied-opaque-spin");
                     }

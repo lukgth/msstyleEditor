@@ -269,6 +269,25 @@ namespace libmsstyle.Import
             if (string.Equals(cls, "Toolbar", StringComparison.OrdinalIgnoreCase)
                 && sourceCount == 6 && targetCount == 8)
                 return new[] { 0, 1, 2, 3, 4, 5, 0, 5 };
+            // WINDOW caption buttons: xp's CLOSEBUTTONSTATES/MINBUTTONSTATES/etc. declare NORMAL/HOT/PUSHED/
+            // DISABLED (four), and stock xp luna ships exactly that as 8 frames (the four states, active then
+            // inactive). A pack that ships 6 has three states per mode with the inactive half mirrored --
+            // [N,H,P] then [P,H,N] -- which is what Wood's 21x126 strip measures as: the closest pairs are
+            // (1,6),(2,5),(3,4) at ~30 mean channel diff, against ~54 for an unmirrored reading, and only
+            // frames 3/4 are sunken. There is no DISABLED frame, so it falls back to NORMAL.
+            if (string.Equals(cls, "Window", StringComparison.OrdinalIgnoreCase)
+                && part >= 15 && part <= 23 && sourceCount == 6 && targetCount == 8)
+                // target is win10's [N,H,P,D] then [N,H,P,D]; source is [N,H,P] then [P,H,N]. DISABLED has no
+                // frame of its own, so it draws that mode's NORMAL.
+                return new[] { 0, 1, 2, 0, 5, 4, 3, 5 };
+            // TOOLBAR buttons: xp's TOOLBARSTATES declares NORMAL/HOT/PRESSED/DISABLED/CHECKED/HOTCHECKED (six)
+            // and win10 adds NEARHOT/OTHERSIDEHOT (eight). A pack shipping only the first three draws NORMAL,
+            // HOT and PRESSED; DISABLED/CHECKED/HOTCHECKED have no art, so they fall back to NORMAL, and the two
+            // win10-only pointer states draw the resting face. Wood's 160x79 taskband strip is exactly this:
+            // magenta separator rows at 0/26/52/78 mark three 26px frames.
+            if (string.Equals(cls, "Toolbar", StringComparison.OrdinalIgnoreCase)
+                && sourceCount == 3 && targetCount == 6)
+                return new[] { 0, 1, 2, 0, 0, 0 };
             // REBAR: the taskbar's overflow chevron (part 4) and its vertical twin (5). Both xp and win10 index
             // the strip by state id, and both declare only NORMAL/HOT/PRESSED (XpSchema CHEVRONSTATES;
             // VisualStyleStateMap STATES_REBAR_GENERAL), so frame i is state i+1 and any extra frames are
