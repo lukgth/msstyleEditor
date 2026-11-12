@@ -409,10 +409,8 @@ namespace libmsstyle.Import
                         PutXpProperty(cls, plan.Part, state, IDENTIFIER.TEXTGLOWSIZE, IDENTIFIER.INT, 0);
                         PutXpProperty(cls, plan.Part, state, IDENTIFIER.GLOWINTENSITY, IDENTIFIER.INT, 0);
                         int xpState = state == 2 || state == 4 ? 2 : 1;
-                        int sourcePart = names.First(n => string.Equals(n.Value, plan.SourcePart, StringComparison.OrdinalIgnoreCase)).Key;
-                        var text = SemanticModel.FindEffective(m_imp.Source.Style, window, sourcePart, xpState, IDENTIFIER.TEXTCOLOR)
-                            ?? SemanticModel.FindEffective(m_imp.Source.Style, window, 0, 0, xpState == 2 ? IDENTIFIER.INACTIVECAPTIONTEXT : IDENTIFIER.CAPTIONTEXT);
-                        if (text?.GetValue() is Color color) PutXpProperty(cls, plan.Part, state, IDENTIFIER.TEXTCOLOR, IDENTIFIER.COLOR, color);
+                        var color = XpSysColor(xpState == 2 ? IDENTIFIER.INACTIVECAPTIONTEXT : IDENTIFIER.CAPTIONTEXT);
+                        if (color != null) PutXpProperty(cls, plan.Part, state, IDENTIFIER.TEXTCOLOR, IDENTIFIER.COLOR, color.Value);
                     }
                 }
                 report.Count(plan.Button ? "dwm-rect-xp-button" : "dwm-rect-xp-frame");
@@ -627,6 +625,26 @@ namespace libmsstyle.Import
             uint rgb = (uint)key.ToArgb() & 0xFFFFFF;
             for (int i = 0; i < frame.Pixels.Length; ++i)
                 if ((frame.Pixels[i] & 0xFFFFFF) == rgb) frame.Pixels[i] = 0;
+        }
+
+        /// <summary>
+        /// A system colour as XP resolved it for this style: the <c>sysmetrics</c> record, else uxtheme's
+        /// <c>DefaultColors</c> (loader.cpp:1302). XP's caption text is not a Window record at all —
+        /// <c>nctheme.cpp:2512</c> <c>_GetNcCaptionTextColor</c> returns <c>GetSysColor(COLOR_CAPTIONTEXT)</c> and
+        /// <c>loader.cpp:1173</c> fills the system colours from the style's sysmetrics class — so a source that
+        /// recolored its titlebar text states it here and nowhere else.
+        /// </summary>
+        private Color? XpSysColor(IDENTIFIER id)
+        {
+            if (m_imp.Source.ClassesByName.TryGetValue("sysmetrics", out var sm)
+                && SemanticModel.FindEffective(m_imp.Source.Style, sm, 0, 0, id)?.GetValue() is Color c)
+                return c;
+            switch (id)
+            {
+                case IDENTIFIER.CAPTIONTEXT: return Color.FromArgb(255, 255, 255);
+                case IDENTIFIER.INACTIVECAPTIONTEXT: return Color.FromArgb(212, 208, 200);
+                default: return null;
+            }
         }
 
         private void PutXpProperty(StyleClass cls, PartData part, int state, IDENTIFIER name, IDENTIFIER type, object value)

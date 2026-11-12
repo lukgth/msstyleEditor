@@ -72,6 +72,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="DuiTranslatorTests.cs" />
+    <Compile Include="DuiValidatorTests.cs" />
     <Compile Include="FidelityTests.cs" />
     <Compile Include="LegacyPaneMarkupTests.cs" />
     <Compile Include="BinaryComparison.cs" />

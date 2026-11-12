@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -226,10 +226,10 @@ namespace libmsstyle.Import
         }
 
         /// <summary>the copied win10 shellstyle (the Shell\&lt;color&gt; folder the style actually ships) gets the source's bitmaps.</summary>
-        private void PatchShellBitmaps()
+        private void PatchShellBitmaps(string stylePath)
         {
             if (m_srcShell == null) return;
-            string shellDir = StyleCompanions.FindShellFolder(Path.GetDirectoryName(Path.GetFullPath(m_opt.OutputPath)));
+            string shellDir = StyleCompanions.FindShellFolder(Path.GetDirectoryName(Path.GetFullPath(stylePath)));
             if (shellDir == null)
             {
                 m_report.Errors.Add("shellstyle: the ported style has no Shell\\<color>\\shellstyle.dll, so the source's shell bitmaps could not be applied");
@@ -256,6 +256,57 @@ namespace libmsstyle.Import
             {
                 m_report.Warnings.Add("shellstyle bitmaps not replaced: " + ex.Message);
             }
+            ValidateShellStyleDui(target, shellDir);
+        }
+
+        /// <summary>
+        /// The port's shellstyle markup must load: the porter rewrites it with string surgery and the xp stylesheet
+        /// translator, and DirectUI refuses the whole resource on one bad layout, placement token, function arity or
+        /// missing graphic id — the folder window then draws nothing. Checked on the installed file, after every
+        /// patch, so a port can't ship markup the parser rejects.
+        /// </summary>
+        private void ValidateShellStyleDui(string shellStyle, string shellDir)
+        {
+            try
+            {
+                var dui = Dui.DuiValidator.ValidateModule(shellStyle, ShellStyleBitmapIds(shellStyle));
+                foreach (var e in dui.Errors)
+                {
+                    m_report.Errors.Add("shellstyle markup: " + e);
+                    m_report.Validation.Errors.Add("shellstyle markup: " + e);
+                }
+                foreach (var w in dui.Warnings)
+                {
+                    m_report.Warnings.Add("shellstyle markup: " + w);
+                    m_report.Validation.Warnings.Add("shellstyle markup: " + w);
+                }
+                m_report.Validation.Checks.Add($"shellstyle markup: {dui.Documents} DUIXML resource(s) of Shell\\{Path.GetFileName(shellDir)}\\shellstyle.dll are structurally loadable");
+                m_report.Count("shellstyle-markup-checked", dui.Documents);
+            }
+            catch (Exception ex) when (ex is IOException || ex is InvalidDataException)
+            {
+                m_report.Errors.Add("shellstyle markup: the ported shellstyle couldn't be checked: " + ex.Message);
+                m_report.Validation.Errors.Add("shellstyle markup: the ported shellstyle couldn't be checked: " + ex.Message);
+            }
+        }
+
+        /// <summary>The bitmap ids a shellstyle module contains, for the graphic(id, …) check.</summary>
+        private static HashSet<int> ShellStyleBitmapIds(string shellStyle)
+        {
+            var ids = new HashSet<int>();
+            IntPtr mod = Win32Api.LoadLibraryEx(shellStyle, IntPtr.Zero, Win32Api.LoadLibraryFlags.LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE);
+            if (mod == IntPtr.Zero) return ids;
+            try
+            {
+                Win32Api.EnumResourceNamesEx(mod, 2, (m, t, name, l) =>
+                {
+                    long v = name.ToInt64();
+                    if (v > 0 && v <= 0xFFFF) ids.Add((int)v);
+                    return true;
+                }, IntPtr.Zero, Win32Api.EnumResourceFlags.RESOURCE_ENUM_LN, 0);
+            }
+            finally { Win32Api.FreeLibrary(mod); }
+            return ids;
         }
         /// <summary>what the source shellstyle actually is, for the report: a pack can ship stock luna's file verbatim
         /// and the "0 bitmaps replaced" line then looks like a failure when it is the whole story.</summary>
@@ -283,23 +334,39 @@ namespace libmsstyle.Import
         {
             var r = m_report;
             r.Status = r.Errors.Count == 0 ? ImportStatus.ReadyForVmTest : ImportStatus.Blocked;
-            if (candidate != null && File.Exists(candidate) && r.Status == ImportStatus.ReadyForVmTest && !m_opt.DryRun)
+            if (candidate != null && File.Exists(candidate) && r.Status == ImportStatus.ReadyForVmTest)
             {
-                if (File.Exists(m_opt.OutputPath)) File.Delete(m_opt.OutputPath);
-                File.Move(candidate, m_opt.OutputPath);
-                r.Output = m_opt.OutputPath;
+                if (!m_opt.DryRun)
+                {
+                    if (File.Exists(m_opt.OutputPath)) File.Delete(m_opt.OutputPath);
+                    File.Move(candidate, m_opt.OutputPath);
+                    r.Output = m_opt.OutputPath;
+                }
                 try
                 {
-                    var copied = StyleCompanions.CopyAlongside(CompanionSource, m_opt.OutputPath);
+                    // the shellstyle is patched and checked on the copy the candidate ships, in a dry run too: the
+                    // markup check is the only thing that can reject a port whose style file is otherwise valid.
+                    var copied = StyleCompanions.CopyAlongside(CompanionSource, m_opt.DryRun ? candidate : m_opt.OutputPath);
                     r.Notes.Add(copied.Count > 0
                         ? "copied next to the candidate (windows needs them to load the shellstyle and strings): " + string.Join(", ", copied)
                         : $"no Shell folder or .mui next to \"{CompanionSource}\"; without a Shell folder windows can't load a shellstyle for this style.");
-                    PatchShellBitmaps();
+                    PatchShellBitmaps(m_opt.DryRun ? candidate : m_opt.OutputPath);
                 }
                 catch (Exception ex)
                 {
                     r.Errors.Add("couldn't copy the Shell / language folders next to the candidate: " + ex.Message);
                     r.Status = ImportStatus.Blocked;
+                }
+                // the shellstyle checks run after the status was first decided; a port that ships markup DirectUI
+                // rejects must not be kept.
+                if (r.Errors.Count > 0)
+                {
+                    r.Status = ImportStatus.Blocked;
+                    if (!m_opt.DryRun && r.Output != null && File.Exists(r.Output))
+                    {
+                        try { File.Delete(r.Output); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+                        r.Output = null;
+                    }
                 }
             }
             if (m_validationDir != null)
@@ -736,8 +803,12 @@ namespace libmsstyle.Import
                         if (KeyPattern.Matches(m_opt.Exclude, tc.ClassName, partName, "SIZINGTYPE")) continue;
                         if (!PicturesFromSource(sc, tc, spid, tp.PartId, st.StateId, imageCache)) continue;
                         if (!MarginsFromSource(sc, tc, spid, tp.PartId, st.StateId)) continue;
-                        if (tSizing == null)
+                        if (tSizing == null || !st.Properties.Contains(tSizing))
                         {
+                            // FindEffective falls back to the part's state 0, part 0 and the base class, so the record
+                            // it returns often belongs to a different part or class: writing through it would change
+                            // that record (and label the change with this part's name). The value has to land on this
+                            // state to win, so an inherited record gets a local copy.
                             var rec = new StyleProperty(new PropertyHeader((int)IDENTIFIER.SIZINGTYPE, (int)IDENTIFIER.ENUM)
                             {
                                 classID = tc.ClassId, partID = tp.PartId, stateID = st.StateId
@@ -825,24 +896,34 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
+        /// Every picture slot the combo button can be drawn from on win10. xp has MAX_IMAGEFILE_SIZES (5)
+        /// numbered pictures (imagefile.h:8) and draws the button from IMAGEFILE; win10 picks a numbered
+        /// picture by display dpi (IMAGESELECTTYPE SIZE), and its templates carry IMAGEFILE1-7. A slot left
+        /// out keeps whatever FillDpiSlots put there - the source's GLYPHIMAGEFILE, which is the bare arrow
+        /// with no plate - so at 288 dpi and above the button would show an arrow floating on the edit.
+        /// </summary>
+        private static readonly IDENTIFIER[] ComboButtonSlots =
+        {
+            IDENTIFIER.IMAGEFILE, IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3,
+            IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5, IDENTIFIER.IMAGEFILE6, IDENTIFIER.IMAGEFILE7,
+        };
+
+        /// <summary>
         /// xp only. xp's Combobox|DROPDOWNBUTTON is two pictures: IMAGEFILE is the 21x22-per-state button
         /// face (a vertical strip) and GLYPHIMAGEFILE is the 10x7-per-state arrow; xp composites them when it
         /// draws. win10 has one picture and picks it from the dpi set (IMAGEFILE1-7), which the merge
         /// filled with the arrow alone - so the dropdown drew the arrow strip stretched across the whole
         /// button (the "detached grey square" in the control preview and the address bar). Copying the
-        /// arrow onto the face per state and pointing both IMAGEFILE and IMAGEFILE1-5 at the composite
-        /// gives win10 the picture xp drew. Every state is composited, because win10 draws hot and pressed
-        /// from the same part.
+        /// arrow onto the face per state and pointing every slot in <see cref="ComboButtonSlots"/> at the
+        /// composite gives win10 the picture xp drew. Every state is composited, because win10 draws hot
+        /// and pressed from the same part.
         /// </summary>
         private void CompositeXpComboButton()
         {
             if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
                 || !m_source.ClassesByName.TryGetValue("Combobox", out var sc)) return;
             var tgtNames = SemanticModel.PartNames(tc.ClassName, Platform.Win10);
-            // xp has MAX_IMAGEFILE_SIZES (5) numbered pictures (imagefile.h:8), so IMAGEFILE1-5 is the whole set
-            // the source can describe; the parent IMAGEFILE is the picture win10 draws when no slot applies.
-            var slots = new[] { IDENTIFIER.IMAGEFILE, IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3,
-                                IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5 };
+            var slots = ComboButtonSlots;
 
             foreach (var tp in tc.Parts.Values)
             {

@@ -242,6 +242,14 @@ namespace libmsstyle.Import
             if (string.Equals(cls, "Button", StringComparison.OrdinalIgnoreCase) && part == 1
                 && sourceCount == 5 && targetCount == 6)
                 return new[] { 0, 1, 2, 3, 4, 4 }; // DEFAULTED_ANIMATING uses DEFAULTED on XP
+            // CHECKBOX: xp has 12 states (unchecked/checked/mixed x normal/hot/pressed/disabled); win10 keeps
+            // those 1-12 and adds IMPLICITNORMAL/HOT/PRESSED/DISABLED (13-16) and EXCLUDEDNORMAL/HOT/PRESSED/
+            // DISABLED (17-20). IMPLICIT means "checked by the parent", so it draws the checked art; EXCLUDED
+            // means "not applicable", which draws the unchecked art. Stock Luna10's own strip confirms it:
+            // frames 13-16 are pixel-identical to frames 5-8, and 17-20 are the unchecked box with an X.
+            if (string.Equals(cls, "Button", StringComparison.OrdinalIgnoreCase) && part == 3
+                && sourceCount == 12 && targetCount == 20)
+                return new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3 };
             if (string.Equals(cls, "ScrollBar", StringComparison.OrdinalIgnoreCase))
             {
                 if (part == 1 && sourceCount == 16 && targetCount == 20)
@@ -249,6 +257,14 @@ namespace libmsstyle.Import
                 if (part >= 2 && part <= 9 && sourceCount == 4 && targetCount == 5)
                     return new[] { 0, 1, 2, 3, 0 };
             }
+            // SPIN: xp and win10 both have four states (NORMAL, HOT, PRESSED, DISABLED) and both index the strip
+            // by state id (uxtheme imagefile.cpp GetOffsets: offset = (iStateId-1) * single). A source that ships
+            // five frames therefore has one xp never draws - a spare the pack author added, not a state. Taking the
+            // first four keeps the source's own art; refusing the cut (5 has no mapping to 4) left the template's
+            // Luna-blue spinner on themes that ship their own (Black Aero Vista's white/blue Vista button).
+            if (string.Equals(cls, "Spin", StringComparison.OrdinalIgnoreCase) && part >= 1 && part <= 4
+                && sourceCount == 5 && targetCount == 4)
+                return new[] { 0, 1, 2, 3 };
             return null;
         }
 

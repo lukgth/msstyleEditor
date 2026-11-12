@@ -384,7 +384,7 @@ namespace libmsstyle.Import
                 string label = $"{ce.ClassName}|{ce.PartName}|S{ce.StateId}|{ce.PropertyName}";
                 bool changed = m_changed.Contains(label) || (te != null && te.RawValue != ce.RawValue);
                 if (te != null && te.RawValue != ce.RawValue && !m_changed.Contains(label))
-                    Error($"{label} changed but the import didn't record changing it");
+                    Error($"{label} changed but the import didn't record changing it (template {te.RawValue} -> candidate {ce.RawValue})");
 
                 if (ce.ResourceType != null)
                 {

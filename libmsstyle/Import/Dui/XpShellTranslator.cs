@@ -18,6 +18,9 @@ namespace libmsstyle.Import.Dui
         string SystemMetricString(int index);
         /// <summary>theme class name for dtb(handlemap(index), ...); the xp theme's [Handlemaps] table. Null when unknown.</summary>
         string Handlemap(int index);
+        /// <summary>whether the source shellstyle carries RT_BITMAP <paramref name="id"/>; rcbmp(id) with a
+        /// missing bitmap is a dangling xp reference that win10's DUI parser rejects outright.</summary>
+        bool HasBitmap(int id);
     }
 
     public sealed class TranslationReport
@@ -290,6 +293,15 @@ namespace libmsstyle.Import.Dui
                         // The transparent-colour key is a #RRGGBB literal in xp, which its scanner reads as a plain
                         // integer (scan.l: '#' -> YYINT); DUIXML's graphic() takes that integer, so it is written
                         // in decimal instead of the hex spelling.
+                        // xp tolerated a dangling rcbmp: its scanner resolved the id at draw time and drew nothing.
+                        // win10's DUIXMLParserFailure (parse state 9, "Unable to load graphics") aborts the whole
+                        // shellstyle instead, so an id the xp dll does not carry must become argb(0,0,0,0).
+                        int bitmapId = IntArg(v, 0);
+                        if (resources != null && !resources.HasBitmap(bitmapId))
+                        {
+                            report.Unsupported.Add(where + ": rcbmp(" + bitmapId + ") has no bitmap in the xp shellstyle; xp drew nothing for it, win10's parser rejects the sheet");
+                            return "argb(0,0,0,0)";
+                        }
                         var sb = new StringBuilder("graphic(");
                         for (int i = 0; i < v.Args.Count; i++)
                         {

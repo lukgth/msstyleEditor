@@ -53,6 +53,7 @@ namespace libmsstyleTests
             public int? ResourceInt(int id) { return id == 10 ? 700 : (int?)null; }
             public string SystemMetricString(int index) { return index == 6 ? "Tahoma" : null; }
             public string Handlemap(int index) { return index == 1 ? "ScrollBar" : null; }
+            public bool HasBitmap(int id) { return true; }
         }
 
         static XpUifileSyntax.Document StockStylesheet()

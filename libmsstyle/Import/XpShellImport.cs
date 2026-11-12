@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -108,8 +108,7 @@ namespace libmsstyle.Import
 
             // task pane padding: xp's sectionlist padding is the win10 UIFILE's gtmar(ExplorerBar, 0, 0, 3602)
             // (ExplorerBarBackground padding); stock luna's 12rp on every side equals the Luna port's record.
-            var pad = Both(x => x.Pane, false, "padding");
-            SetMargins(Background, IDENTIFIER.CONTENTMARGINS, XpShellStyle.ParseRect(pad.Src), XpShellStyle.ParseRect(pad.Stock), "task pane padding");
+            PanePadding(Both(x => x.Pane, false, "padding"));
 
             // xp's classic shellstyle (no Shell folder): measured on xp x64 sp2 under Flarn, the special group is drawn
             // exactly like the others (buttonface header, buttontext), though its stylesheet asks for activecaption.
@@ -324,19 +323,59 @@ namespace libmsstyle.Import
             ClassChanged(cls, img, CplContent, 1, "Control Panel category view background (flat strip)");
         }
 
-        /// <summary>the watermark: glyph of the content background (state 1), bottom-right like xp's.</summary>
+        /// <summary>
+        /// The watermark: glyph of the content background (state 1), bottom-right like xp's. xp loads
+        /// IDB_CPANEL_WATERMARK (bitmap 26) from the style module and draws nothing when it can't
+        /// (cpview.cpp <c>_CreateWatermark</c>: <c>LoadImage(hStyleModule, MAKEINTRESOURCE(26), …)</c> returns null),
+        /// so a source that doesn't carry the bitmap must leave no glyph: the template's Luna watermark would
+        /// otherwise show on a theme that deliberately has none.
+        /// </summary>
         private void CplWatermark(StyleClass cls)
         {
+            if (!cls.Parts.TryGetValue(CplContent, out var part) || !part.States.TryGetValue(1, out var st)) return;
             var src = m_src.GetBitmap(CplWatermarkId);
-            if (src == null || SameBytes(src, m_base.GetBitmap(CplWatermarkId))) return;
-            var st = ClassState(cls, CplContent, 1);
-            var glyph = st?.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.GLYPHIMAGEFILE);
+            if (src == null)
+            {
+                DropCplGlyph(cls, st);
+                return;
+            }
+            if (SameBytes(src, m_base.GetBitmap(CplWatermarkId))) return;
+            var glyph = st.Properties.FirstOrDefault(x => x.Header.nameID == (int)IDENTIFIER.GLYPHIMAGEFILE);
             if (glyph == null) { m_imp.Report.Warnings.Add($"shellstyle: the source's Control Panel watermark (bitmap {CplWatermarkId}) is dropped: the template's {CplClass} content background has no glyph record to put it in."); return; }
             byte[] png = ImageConverter.ConvertXpDibToPremultipliedPng(src, Color.FromArgb(255, 0, 0));
             int id = m_imp.PlaceResource("IMAGE", -1, png, ImageIdentity.Analyze(png));
             if ((glyph.Header.shortFlag & 0xFFFF) == id) return;
             glyph.SetValue(id);
             ClassChanged(cls, glyph, CplContent, 1, "Control Panel category view watermark (bitmap 26)");
+        }
+
+        /// <summary>
+        /// Removes the template's category-view watermark glyph. The source states "no watermark" by not shipping
+        /// bitmap 26; keeping the template's glyph would draw Luna's mark on a theme that removed it. GLYPHTYPE only
+        /// describes that glyph, so both records go; the removals are declared for the validator.
+        /// </summary>
+        private void DropCplGlyph(StyleClass cls, StyleState st)
+        {
+            string partName = SemanticModel.PartNames(cls.ClassName, Platform.Win10).TryGetValue(CplContent, out var n) ? n : "Part " + CplContent;
+            int dropped = 0;
+            for (int i = st.Properties.Count - 1; i >= 0; --i)
+            {
+                var p = st.Properties[i];
+                if (p.Header.nameID != (int)IDENTIFIER.GLYPHIMAGEFILE && p.Header.nameID != (int)IDENTIFIER.GLYPHTYPE) continue;
+                m_imp.RemovedRecords.Add($"{cls.ClassId}/{CplContent}/{st.StateId}/{p.Header.nameID}/{p.Header.typeID}");
+                m_imp.Report.Decisions.Add(new MergeDecision
+                {
+                    Class = cls.ClassName, Part = partName, State = st.StateId,
+                    Property = SemanticModel.PropertyName(p.Header.nameID), Action = "dropped-cpl-watermark",
+                    Reason = "the source shellstyle has no bitmap 26 (xp's IDB_CPANEL_WATERMARK), so xp's category view drew no watermark; the template's glyph is removed",
+                    Result = "NONE",
+                });
+                m_imp.Report.Count("dropped-cpl-watermark");
+                st.Properties.RemoveAt(i);
+                dropped++;
+            }
+            if (dropped > 0)
+                m_imp.Report.Notes.Add($"shellstyle: the source has no Control Panel watermark bitmap ({CplWatermarkId}), so {CplClass}'s category-view glyph is dropped (xp drew none).");
         }
 
         /// <summary>
@@ -1511,6 +1550,47 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
+        /// The task pane's content inset. XP keeps it in the shellstyle's <c>element [id=atom(sectionlist)]</c>
+        /// padding, which Windows 10 reads as <c>gtmar(ExplorerBar, 0, 0, 3602)</c> (the
+        /// <c>ExplorerBarBackground</c> element's padding). Two things make the shellstyle value unusable on
+        /// its own:
+        /// <list type="bullet">
+        /// <item>a style that states its own <c>ExplorerBar</c> part 0 <c>CONTENTMARGINS</c> is authoritative,
+        /// exactly as for the group headers (<see cref="HeaderInset"/>);</item>
+        /// <item>xp packs commonly pad the section list OUT of its own box (<c>rect(-500rp,-300rp,4rp,8rp)</code>
+        /// in areao4) so that only the background bitmap's border shows. A negative extent like that is a
+        /// nine-stretch hack, not a content inset; written into the record it moves the pane's content off
+        /// screen, which is the blank-pane failure. Such a padding is never imported.</item>
+        /// </list>
+        /// </summary>
+        private void PanePadding((string Src, string Stock) pad)
+        {
+            var p = Find(Background, 0, IDENTIFIER.CONTENTMARGINS);
+            if (p == null) return;
+            var explicitMargins = SourceProperty(Background, IDENTIFIER.CONTENTMARGINS)?.GetValue() as Margins;
+            if (explicitMargins != null)
+            {
+                if (!(p.GetValue() is Margins cur) || !SameRect(cur, explicitMargins))
+                {
+                    p.SetValue(new Margins(explicitMargins.Left, explicitMargins.Top, explicitMargins.Right, explicitMargins.Bottom));
+                    Changed(p, Background, 0, "applied-xp-pane-margins", "the task pane uses the source style's own ExplorerBar CONTENTMARGINS; the shellstyle's sectionlist padding applies only when that record is absent");
+                }
+                return;
+            }
+            var source = XpShellStyle.ParseRect(pad.Src);
+            if (source == null) return;
+            if (source.Left < 0 || source.Top < 0 || source.Right < 0 || source.Bottom < 0)
+            {
+                var stockPad = XpShellStyle.ParseRect(pad.Stock);
+                if (!SameRect(source, stockPad))
+                    m_imp.Report.Warnings.Add($"shellstyle: task pane padding {source.Left},{source.Top},{source.Right},{source.Bottom} is a negative nine-stretch hack (xp padded the content out of its box); not imported.");
+                Restore(p, Background, 0, IDENTIFIER.CONTENTMARGINS, "task pane padding");
+                return;
+            }
+            SetMargins(Background, IDENTIFIER.CONTENTMARGINS, source, XpShellStyle.ParseRect(pad.Stock), "task pane padding");
+        }
+
+        /// <summary>
         /// An explicit ExplorerBar 8/12 CONTENTMARGINS in the source style is authoritative. Only styles without
         /// that record use the shellstyle delta against the template's stock-luna adaptation: XP sizes the header
         /// from borderthickness + padding around its title, while Win10 reads gtmar(ExplorerBar, 8/12, 0, 3602).
@@ -1629,6 +1709,7 @@ namespace libmsstyle.Import
             // xp UIFILEs use the numeric handlemap of the scrollbar stylesheet (scrollbar_themed.uix defines
             // SCROLLBARHTHEME 1); dtb(handlemap(1), part, state) is the target theme's ScrollBar class.
             public string Handlemap(int index) { return index == 1 ? "ScrollBar" : null; }
+            public bool HasBitmap(int id) { return m_style.HasBitmap(id); }
         }
 
         private static bool SameBytes(byte[] a, byte[] b) => a != null && b != null && a.SequenceEqual(b);
@@ -1963,6 +2044,9 @@ namespace libmsstyle.Import
                     const string item = "<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">";
                     const string pane = "class=\"ExplorerBarBackground\">";
                     int files = 0, rowFiles = 0, bandFiles = 0, rightFiles = 0, detailsOpen = 0, bandLayoutFiles = 0;
+                    // layouts whose pane matched but whose dock the converter couldn't read, so a silent skip of
+                    // one layout (the Control Panel page was one) shows up in the report instead of only in the UI.
+                    var bandSkipped = new SortedSet<uint>(); var dockSkipped = new SortedSet<uint>();
 
                     foreach (uint id in ResourceIds(mod, "SHELL32_UIFILE"))
                         foreach (var (lang, text, encoding) in TextResources(mod, "SHELL32_UIFILE", id))
@@ -2038,6 +2122,7 @@ namespace libmsstyle.Import
                             {
                                 string r = DockRight(t);
                                 if (r != t) rightFiles++;
+                                else dockSkipped.Add(id);
                                 t = r;
                             }
                             if (paneBand && t.Contains(pane))
@@ -2046,8 +2131,9 @@ namespace libmsstyle.Import
                                 // not as a folder band. XP drew that pane from the same sectionlist background, so it
                                 // keeps the pane record's picture (state 1, stretched as xp's zero-margin rcbmp mode 5
                                 // did) instead of the flat window fill the sidebar had before the picture was imported.
-                                string r = BandLayout(t, t.Contains("content=\"System Tasks\""), bandBottom);
+                                string r = BandLayout(t, t.Contains("content=\"System Tasks\""), bandBottom, sourcePane.IsBand ? sourcePane.BandHeight : 0);
                                 if (r != t) bandLayoutFiles++;
+                                else bandSkipped.Add(id);
                                 t = r;
                             }
                             if (source.Legacy != null && stock?.Legacy != null && t.IndexOf("<stylesheets>", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -2091,11 +2177,15 @@ namespace libmsstyle.Import
                     {
                         if (bandLayoutFiles == 0) warnings.Add($"shellstyle layout: the task band wasn't applied: no folder layout in the template's SHELL32_UIFILE markup has a left-docked sidebar with an ExplorerBarBackground element to turn into a {(bandBottom ? "bottom" : "top")} band; every pane stays a left sidebar.");
                         else notes.Add($"shellstyle layout: task pane moved to a {(bandBottom ? "bottom" : "top")} band{(sourcePane.IsBand ? $" as in the xp shellstyle (section list {sourcePane.SectionListLayout ?? "layout kept"}{(sourcePane.BandHeight > 0 ? $", {sourcePane.BandHeight}px high" : "")})" : " (--task-band)")} in {bandLayoutFiles} folder layouts; the band layouts keep only the folder's own tasks, so Other Places and Details are dropped from those layouts only.");
+                        if (bandSkipped.Count > 0)
+                            warnings.Add($"shellstyle layout: the task pane stayed a sidebar in SHELL32_UIFILE {string.Join(", ", bandSkipped)}: those layouts don't dock the pane through <element layoutpos=\"left\"> or a left-docked scrollviewer.");
                     }
                     else if (dockRight)
                     {
                         if (rightFiles == 0) warnings.Add("shellstyle layout: no left-docked sidebar with ExplorerBarBackground in the template's SHELL32_UIFILE markup; the right-docked pane stays left.");
                         else notes.Add($"shellstyle layout: task pane docked right as in the xp shellstyle in {rightFiles} folder layouts.");
+                        if (dockSkipped.Count > 0)
+                            warnings.Add($"shellstyle layout: the task pane stayed left in SHELL32_UIFILE {string.Join(", ", dockSkipped)}: those layouts don't dock the pane through <element layoutpos=\"left\"> or a left-docked scrollviewer.");
                     }
                     if (detailsOpen > 0)
                         notes.Add($"shellstyle layout: details section open from the start (Expanded=\"true\") in {detailsOpen} sidebar layouts (the band layouts have no Details section); win10 leaves it closed until the info module has an item, xp showed the folder's own name/type.");
@@ -2114,13 +2204,35 @@ namespace libmsstyle.Import
             return (notes, warnings);
         }
 
+        /// <summary>
+        /// Start index of the element that docks the pane's sidebar before <paramref name="pane"/>. The folder
+        /// templates dock it with a wrapper <c>&lt;element layoutpos="left"&gt;</c> around the scrollviewer; the
+        /// Control Panel's home page (SHELL32_UIFILE 18) docks the scrollviewer itself
+        /// (<c>&lt;scrollviewer sheet="common" layoutpos="left" width="210rp"&gt;</c>), so looking only for the
+        /// wrapper left that page a sidebar. -1 when the pane isn't left-docked in this layout.
+        /// </summary>
+        private static int LeftDock(string t, int pane)
+        {
+            int element = t.LastIndexOf("<element layoutpos=\"left\"", pane, StringComparison.Ordinal);
+            int scroller = t.LastIndexOf("<scrollviewer", pane, StringComparison.Ordinal);
+            if (scroller >= 0)
+            {
+                int end = t.IndexOf('>', scroller);
+                if (end > scroller && end < pane
+                    && t.IndexOf("layoutpos=\"left\"", scroller, end - scroller, StringComparison.Ordinal) >= 0
+                    && scroller > element)
+                    return scroller;
+            }
+            return element;
+        }
+
         /// <summary>Moves the win10 left sidebar to the right, for a source xp markup that docked its section list
         /// <c>layoutpos=right</c>. The scrollviewer already has borders on both sides, so only the dock side changes.</summary>
         private static string DockRight(string t)
         {
             int pane = t.IndexOf("class=\"ExplorerBarBackground\">", StringComparison.Ordinal);
             if (pane < 0) return t;
-            int side = t.LastIndexOf("<element layoutpos=\"left\"", pane, StringComparison.Ordinal);
+            int side = LeftDock(t, pane);
             if (side < 0) return t;
             int sideTag = t.IndexOf('>', side);
             if (sideTag < 0) return t;
@@ -2135,16 +2247,21 @@ namespace libmsstyle.Import
         /// xp's WebView drew the folder's own tasks as a full-width band under one header. The sidebar becomes a
         /// <c>layoutpos="top"</c> (or <c>bottom</c>) element, its scrollviewer loses the fixed width, the folder tree
         /// module goes (the band has no tree), and only the first Expando (the folder's task list) stays.
+        /// The Control Panel's home page docks the scrollviewer itself (see <see cref="LeftDock"/>); it takes the same
+        /// path, and a source that states a fixed band height (<c>&lt;ScrollViewer … height=91&gt;</c>) keeps it.
         /// </summary>
-        private static string BandLayout(string t, bool systemTasks, bool bottom = false)
+        private static string BandLayout(string t, bool systemTasks, bool bottom = false, int height = 0)
         {
             int pane = t.IndexOf("class=\"ExplorerBarBackground\">", StringComparison.Ordinal);
             if (pane < 0) return t;
-            int side = t.LastIndexOf("<element layoutpos=\"left\"", pane, StringComparison.Ordinal);
+            int side = LeftDock(t, pane);
             if (side < 0) return t;
             int sideTag = t.IndexOf('>', side);
             if (sideTag < 0) return t;
             string tag = t.Substring(side, sideTag - side);
+            // xp's task pane was a fixed-height strip in band themes (Black Aero Vista: height=91 on the pane's
+            // scrollviewer); without it the band shrinks to its rows and the theme's backdrop disappears.
+            if (height > 0 && tag.IndexOf("height=", StringComparison.Ordinal) < 0) tag += $" height=\"{height}rp\"";
             t = t.Substring(0, side) + tag.Replace("layoutpos=\"left\"", "layoutpos=\"" + (bottom ? "bottom" : "top") + "\"") + t.Substring(sideTag);
             int scroller = t.IndexOf("<scrollviewer", side, StringComparison.Ordinal);
             if (scroller >= 0)
@@ -2194,11 +2311,14 @@ namespace libmsstyle.Import
                 if (tlist >= 0 && tclose > tlist && tend > tclose
                     && t.IndexOf("<FolderBandModule", tlist, tend - tlist, StringComparison.Ordinal) < 0)
                 {
+                    // No fixed height on the row: a rowlayout() tasklist with an explicit height lays its children
+                    // out at zero size (checked live on the Control Panel page — the header drew, "Switch to Classic
+                    // View" vanished from both the accessibility tree and the pixels). Without one the row sizes to
+                    // its items, which is what xp's band did.
                     string listTag = t.Substring(tlist, tclose - tlist);
                     if (listTag.Contains("layout=\""))
                         listTag = System.Text.RegularExpressions.Regex.Replace(listTag, "layout=\"[^\"]*\"", "layout=\"rowlayout()\"");
                     else listTag += " layout=\"rowlayout()\"";
-                    listTag += " height=\"22rp\"";
                     t = t.Substring(0, tlist) + listTag + t.Substring(tclose);
                 }
                 return t;
@@ -2220,7 +2340,7 @@ namespace libmsstyle.Import
                 int mod = t.IndexOf("<FolderBandModule", list, StringComparison.Ordinal);
                 if (listTag > list && listEnd > listTag && mod >= 0 && mod < listEnd)
                 {
-                    string head = "<element id=\"atom(tasklist)\" layoutpos=\"top\" height=\"22rp\" padding=\"rect(10rp,0,0,0)\" layout=\"rowlayout()\">";
+                    string head = "<element id=\"atom(tasklist)\" layoutpos=\"top\" padding=\"rect(10rp,0,0,0)\" layout=\"rowlayout()\">";
                     string tail = "</element>";
                     string buttons =
                         "\r\n\t\t\t\t\t\t\t<element class=\"task_item\" layout=\"flowlayout()\" layoutpos=\"top\" padding=\"rect(0,0,0,0)\">\r\n" +

@@ -123,6 +123,10 @@ namespace libmsstyle.Import
 
         public byte[] GetBitmap(int id) => ResourceAccess.GetResource(m_module, "#2", (uint)id);
 
+        /// <summary>whether the shellstyle carries RT_BITMAP <paramref name="id"/>. A UIFILE may reference a
+        /// bitmap the dll does not ship: xp's DUI drew nothing for it, win10's parser rejects the sheet.</summary>
+        public bool HasBitmap(int id) => ResourceAccess.GetResource(m_module, "#2", (uint)id) != null;
+
         [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "LoadStringW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
         private static extern int LoadString(IntPtr hInstance, uint uID, StringBuilder lpBuffer, int cchBufferMax);
 

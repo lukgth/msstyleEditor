@@ -85,6 +85,7 @@
     <Compile Include="Import\VariantWriter.cs" />
     <Compile Include="Import\DuiCascade.cs" />
     <Compile Include="Import\Dui\DuiXmlDocument.cs" />
+    <Compile Include="Import\Dui\DuiValidator.cs" />
     <Compile Include="Import\Dui\LegacyPaneMarkup.cs" />
     <Compile Include="Import\Dui\XpShellTranslator.cs" />
     <Compile Include="Import\Dui\XpUifileSyntax.cs" />

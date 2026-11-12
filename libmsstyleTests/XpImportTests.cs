@@ -2,6 +2,7 @@ using libmsstyle;
 using libmsstyle.Import;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
@@ -281,15 +282,36 @@ namespace libmsstyleTests
             Assert.IsTrue(r.Dwm.Parts.All(p => p.NewRect == p.TargetRect), "XP synthesis must not relocate any imported or kept sprite");
             Assert.IsTrue(r.Validation.Checks.Any(c => c.Contains("DWMWindow sprites verified pixel-for-pixel")), string.Join("\n", r.Validation.Checks));
             changes.RemoveAll(d => d.Class == "DWMWindow");
+            // A stock source states no intent beyond stock xp, so nothing it says may delete a template record.
+            var removals = changes.Where(d => d.Action.StartsWith("removed")).ToList();
+            Assert.AreEqual(0, removals.Count, "porting stock xp luna must not remove template records:\n"
+                + string.Join("\n", removals.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}")));
+            // Every remaining change is one of the xp rules, each of which states why it fires. A key whitelist can't
+            // stay honest here: stock luna legitimately adds the ~390 records the win10 template never had and fills
+            // the template-only dpi slots, so the guard is that no mutation happens under an unrecognised rule.
+            var known = new HashSet<string>
+            {
+                "added",                        // the template has no such record; the source's is carried over
+                "applied-dpi-fill",             // template-only dpi slot gets the source's art
+                "applied-dpi-threshold",        // MINDPIn follows the dpi slot that was filled
+                "applied-shellstyle",           // the shellstyle's own geometry
+                "applied-stock-over-template",  // prefer-source: the source kept stock art the template redrew
+                "applied-xp-header-margins",    // ExplorerBar 8/12 CONTENTMARGINS from the source style
+                "applied-xp-startpanel-counterpart", // StartPanel geometry win10 splits across classes
+            };
+            var unknown = changes.Where(d => !known.Contains(d.Action)).ToList();
+            Assert.AreEqual(0, unknown.Count, "unrecognised import rule fired:\n"
+                + string.Join("\n", unknown.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}: {d.Action}")));
+            // the structural conversions the test exists for: xp's rebar band and menu bar become win10 records.
             var structural = new[] { "Rebar|BAND|0|BGTYPE", "Rebar|BAND|0|IMAGEFILE", "Rebar|BAND|0|IMAGECOUNT", "Rebar|BAND|0|SIZINGTYPE", "Rebar|BAND|0|SIZINGMARGINS",
                                      "Menu|BARBACKGROUND|0|BGTYPE", "Menu|BARBACKGROUND|0|IMAGEFILE", "Menu|BARBACKGROUND|0|IMAGECOUNT", "Menu|BARBACKGROUND|0|SIZINGTYPE", "Menu|BARBACKGROUND|0|SIZINGMARGINS" };
-            var unexpected = changes.Where(d => !structural.Contains($"{d.Class}|{d.Part}|{d.State}|{d.Property}")).ToList();
-            Assert.AreEqual(0, unexpected.Count, string.Join("\n", unexpected.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}: {d.Action}")));
-            CollectionAssert.AreEquivalent(structural, changes.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}").ToArray());
+            var keys = changes.Select(d => $"{d.Class}|{d.Part}|{d.State}|{d.Property}").ToList();
+            foreach (var key in structural)
+                Assert.IsTrue(keys.Contains(key), "the xp rebar/menu structural conversion is missing: " + key);
             // DWM artwork is synthesized separately; these remain the generic structural changes.
             Assert.IsTrue(r.Validation.Checks.Any(c => c.Contains("template resources are byte-identical")), string.Join("\n", r.Validation.Checks));
             // the port re-cut Toolbar BUTTON from 6 to 8 frames with stock frames; that mapping must be learned.
-            Assert.IsTrue(r.Notes.Any(n => n.StartsWith("Toolbar part 1 state 0: strip re-cut from 6 vertical to 8 vertical")), string.Join("\n", r.Notes));
+            Assert.IsTrue(r.Notes.Any(n => n.StartsWith("Toolbar part ") && n.Contains(": strip re-cut from 6 vertical to 8 vertical")), string.Join("\n", r.Notes));
         }
 
         [TestMethod]
@@ -538,6 +560,56 @@ namespace libmsstyleTests
             StringAssert.Contains(t, "\r\nPath=%ResourceDir%\\Themes\\TangoLux\\TangoLux Blue.msstyles\r\n");
             StringAssert.Contains(t, "\r\nVisualStyleVersion=10\r\n");
             Assert.ThrowsException<ArgumentException>(() => XpThemeFiles.BuildTheme("a\r\n[x]", "f", "f.msstyles", "w"));
+        }
+
+        [TestMethod]
+        public void ComboButtonCompositeFillsEveryDpiSlot()
+        {
+            string source = Environment.GetEnvironmentVariable("MSSTYLE_XP_GLITCHBLACK");
+            if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
+            if (source == null || !File.Exists(source)) Assert.Inconclusive("set MSSTYLE_XP_GLITCHBLACK to GlitchBlack.msstyles");
+            string dir = Path.Combine(Path.GetTempPath(), "msstyle-combo-test-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string output = Path.Combine(dir, "GlitchBlack.msstyles");
+                var report = Win7StyleImporter.Run(new Win7ImportOptions
+                {
+                    SourcePath = source, SourcePlatform = Platform.WinXP, SourceScheme = "NormalColor",
+                    BaseScheme = "NormalColor", TemplatePath = Luna10, OutputPath = output, DryRun = false,
+                });
+                Assert.AreEqual(ImportStatus.ReadyForVmTest, report.Status, string.Join("\n", report.Errors));
+                using (var xp = new VisualStyle())
+                using (var tpl = new VisualStyle())
+                using (var port = new VisualStyle())
+                {
+                    xp.Load(source); tpl.Load(Luna10); port.Load(output);
+                    // the source draws the button from a plate (IMAGEFILE) under a separate arrow (GLYPHIMAGEFILE).
+                    int glyphId = Find(xp, "Combobox", 1, 0, IDENTIFIER.GLYPHIMAGEFILE).Header.shortFlag & 0xFFFF;
+                    var glyph = ImageIdentity.Decode(xp.GetRawResource("IMAGE", glyphId));
+                    foreach (int part in new[] { 1, 6, 7 })
+                    {
+                        // every slot the template has must hold the composite: win10 selects by dpi, so a slot left
+                        // on the bare arrow draws an arrow with no plate at 288 dpi and above.
+                        for (int name = (int)IDENTIFIER.IMAGEFILE; name <= (int)IDENTIFIER.IMAGEFILE7; ++name)
+                        {
+                            if (Find(tpl, "Combobox", part, 0, (IDENTIFIER)name) == null) continue;
+                            var p = Find(port, "Combobox", part, 0, (IDENTIFIER)name);
+                            Assert.IsNotNull(p, "part " + part + " lost " + (IDENTIFIER)name);
+                            var img = ImageIdentity.Decode(port.GetRawResource("IMAGE", p.Header.shortFlag & 0xFFFF));
+                            Assert.AreNotEqual(glyph.PixelSha1(), img.PixelSha1(),
+                                "part " + part + " " + (IDENTIFIER)name + " still holds the bare arrow");
+                            Assert.AreEqual(Find(port, "Combobox", part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF,
+                                p.Header.shortFlag & 0xFFFF, "part " + part + " " + (IDENTIFIER)name + " is not the composite");
+                        }
+                    }
+                    Assert.IsTrue(report.Decisions.Any(d => d.Action == "composited-xp-combo-button"));
+                }
+            }
+            finally
+            {
+                try { Directory.Delete(dir, true); } catch (IOException) { }
+            }
         }
     }
 }

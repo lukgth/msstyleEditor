@@ -34,7 +34,14 @@ namespace libmsstyleTests
             state.Properties.RemoveAll(p => p.Header.nameID >= (int)IDENTIFIER.IMAGEFILE1 && p.Header.nameID <= (int)IDENTIFIER.IMAGEFILE5 || p.Header.nameID == (int)IDENTIFIER.GLYPHIMAGEFILE);
             int id = (int)typeof(VisualStyle).GetMethod("AddXpImage", BindingFlags.Instance | BindingFlags.NonPublic)
                 .Invoke(style, new object[] { ImageIdentity.EncodePngVerified(image) });
-            Property(style, cls, part, IDENTIFIER.IMAGEFILE).SetValue(id);
+            var file = Property(style, cls, part, IDENTIFIER.IMAGEFILE);
+            if (file == null)
+            {
+                // Button CHECKBOX carries its strip in IMAGEFILE1-3, not IMAGEFILE.
+                file = new StyleProperty(new PropertyHeader((int)IDENTIFIER.IMAGEFILE, (int)IDENTIFIER.FILENAME) { classID = c.ClassId, partID = part, stateID = 0 });
+                state.Properties.Add(file);
+            }
+            file.SetValue(id);
             foreach (var item in new[] { Tuple.Create(IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, count), Tuple.Create(IDENTIFIER.IMAGELAYOUT, IDENTIFIER.ENUM, horizontal ? 1 : 0) })
             {
                 var p = Property(style, cls, part, item.Item1);
@@ -76,6 +83,38 @@ namespace libmsstyleTests
                 Assert.AreEqual(0, report.Warnings.Count, string.Join("\n", report.Warnings));
                 CollectionAssert.AreEqual(Pattern(6, false, 0xFF100000).Pixels, Strip(source, "Button", 1).Pixels);
                 Assert.AreEqual(6, Property(source, "Button", 1, IDENTIFIER.IMAGECOUNT).GetValue());
+            }
+        }
+
+        [TestMethod]
+        public void CheckboxGrowsItsTwelveStatesIntoWin10sTwenty()
+        {
+            foreach (bool horizontal in new[] { false, true })
+            using (var stock = new VisualStyle())
+            using (var source = new VisualStyle())
+            using (var target = new VisualStyle())
+            {
+                stock.Load(Luna); source.Load(Luna); target.Load(Luna);
+                SetStrip(stock, "Button", 3, 12, false, Pattern(12, false, 0xFF000000));
+                SetStrip(source, "Button", 3, 12, horizontal, Pattern(12, horizontal, 0xFF100000));
+                SetStrip(target, "Button", 3, 20, false, Pattern(20, false, 0xFF001000));
+                var report = Remap(stock, source, target);
+                Assert.IsFalse(report.UnmappedStripParts.Contains("Button|3"));
+                Assert.AreEqual(0, report.Warnings.Count, string.Join("\n", report.Warnings));
+                Assert.AreEqual(20, Property(source, "Button", 3, IDENTIFIER.IMAGECOUNT).GetValue());
+                // frames 1-12 keep their state; IMPLICIT (13-16) repeats CHECKED (5-8), EXCLUDED (17-20) repeats UNCHECKED (1-4).
+                var actual = Strip(source, "Button", 3);
+                var want = Pattern(20, false, 0xFF100000);
+                Assert.AreEqual(want.Width, actual.Width);
+                Assert.AreEqual(want.Height, actual.Height);
+                for (int frame = 0; frame < 20; ++frame)
+                {
+                    int from = frame < 12 ? frame : frame < 16 ? frame - 8 : frame - 16;
+                    for (int y = 0; y < 3; ++y)
+                        for (int x = 0; x < 3; ++x)
+                            Assert.AreEqual(want.Pixels[(from * 3 + y) * 3 + x], actual.Pixels[(frame * 3 + y) * 3 + x],
+                                "frame " + (frame + 1) + " should draw frame " + (from + 1));
+                }
             }
         }
 
