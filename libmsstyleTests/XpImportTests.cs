@@ -416,24 +416,23 @@ namespace libmsstyleTests
                     TemplatePath = Luna10, OutputPath = output, DryRun = false,
                 });
                 Assert.AreEqual(ImportStatus.ReadyForVmTest, r.Status, string.Join("\n", r.Errors));
-                // xp has no indeterminate bar; win10's PULSEOVERLAY/MOVEOVERLAY were left blank by the merge, so a
-                // marquee bar (wer's "checking for a solution") fell back to comctl32's classic green blocks. Both
-                // moving overlays must draw the source's chunk art instead.
+                // PBS_MARQUEE uses Indeterminate::Progress, whose explicit overlay overrides Progress.
+                // Checking only Progress's direct rendering misses the live control's actual consumer.
                 using (var xp = new VisualStyle())
                 using (var port = new VisualStyle())
                 {
                     xp.Load(XpLuna);
                     port.Load(output);
-                    foreach (var (target, source) in new[] { (8, 3), (10, 4) })
+                    foreach (var (className, target, source) in new[] { ("Progress", 8, 3), ("Progress", 10, 4), ("Indeterminate::Progress", 8, 3) })
                     {
-                        Assert.AreEqual(0, Find(port, "Progress", target, 0, IDENTIFIER.BGTYPE).GetValue(), "overlay " + target + " must draw its picture");
+                        Assert.AreEqual(0, Find(port, className, target, 0, IDENTIFIER.BGTYPE).GetValue(), "overlay " + className + target + " must draw its picture");
                         int srcId = Find(xp, "Progress", source, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
-                        int dstId = Find(port, "Progress", target, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
+                        int dstId = Find(port, className, target, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
                         Assert.AreEqual(ImageIdentity.Decode(xp.GetRawResource("IMAGE", srcId)).PixelSha1(),
                             ImageIdentity.Decode(port.GetRawResource("IMAGE", dstId)).PixelSha1(),
                             "overlay " + target + " must draw the chunk art");
                         foreach (var id in new[] { IDENTIFIER.SIZINGMARGINS, IDENTIFIER.IMAGELAYOUT })
-                            Assert.AreEqual(Find(xp, "Progress", source, 0, id).GetValue(), Find(port, "Progress", target, 0, id).GetValue(), "strip geometry changed: " + id);
+                            Assert.AreEqual(Find(xp, "Progress", source, 0, id).GetValue(), Find(port, className, target, 0, id).GetValue(), "strip geometry changed: " + id);
                     }
                 }
             }

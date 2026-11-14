@@ -756,22 +756,16 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// xp only. xp's Progress class is BAR/BARVERT/CHUNK/CHUNKVERT (tmschema.h PROGRESSPARTS) and has no
-        /// indeterminate bar, so the merge never touches win10's PULSEOVERLAY/MOVEOVERLAY (parts 7-10). The win10
-        /// template leaves those on one fully transparent picture with BGTYPE NONE, which is not "draw nothing":
-        /// uxtheme hands the part to comctl32's own paint, which draws its classic green blocks. So an
-        /// indeterminate (PBS_MARQUEE) bar - the Windows Error Reporting "checking for a solution" dialog, any
-        /// TaskDialog with a marquee - showed the classic green under a ported theme, while a determinate bar
-        /// drew the ported art (the WER bar is marquee, which is why only it looked unported).
-        /// stock aero fills MOVEOVERLAY (8, vertical 10) with the block strip it slides; PULSEOVERLAY (7, 9) it
-        /// leaves empty (image 787/788 are fully transparent). The source's own chunk is the block, so the
-        /// moving overlay takes the source's CHUNK (3) / CHUNKVERT (4) picture and its strip geometry, and the
-        /// pulse overlays stay transparent like aero's.
+        /// XP has no separate marquee art. Modern comctl32 opens Indeterminate::Progress for PBS_MARQUEE,
+        /// whose explicit MOVEOVERLAY overrides Progress's ordinary overlay. Populate both consumers from
+        /// the source chunk; BGTYPE NONE draws nothing, not a classic-paint fallback.
         /// </summary>
         private void MarqueeOverlayFromXp()
         {
-            if (!m_target.ClassesByName.TryGetValue("Progress", out var tc) || m_target.DuplicateClassNames.Contains("Progress")
-                || !m_source.ClassesByName.TryGetValue("Progress", out var sc)) return;
+            if (!m_source.ClassesByName.TryGetValue("Progress", out var sc)) return;
+            foreach (string className in new[] { "Progress", "Indeterminate::Progress" })
+            {
+            if (!m_target.ClassesByName.TryGetValue(className, out var tc) || m_target.DuplicateClassNames.Contains(className)) continue;
             // xp's part ids come from the xp schema (a class whose xp and win10 numbering differ is still read
             // correctly); the win10 ids are Progress's own (VisualStyleParts.PARTS_PROGRESS: 8 MOVEOVERLAY, 10 MOVEOVERLAYVERT).
             var pairs = new[]
@@ -798,7 +792,7 @@ namespace libmsstyle.Import
                 int res = PlaceResource("IMAGE", srcImage, png, ImageIdentity.Analyze(png));
 
                 Set(IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, res);
-                Set(IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0); // IMAGEFILE: without this uxtheme draws nothing (comctl32's classic paint instead)
+                Set(IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0); // IMAGEFILE
                 Set(IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, sMargins);
                 Set(IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, sSizing ?? 1);
                 if (sLayout != null) Set(IDENTIFIER.IMAGELAYOUT, IDENTIFIER.ENUM, sLayout.Value);
@@ -811,7 +805,7 @@ namespace libmsstyle.Import
                     State = 0,
                     Property = "IMAGEFILE",
                     Action = "applied-marquee-overlay",
-                    Reason = "xp has no indeterminate bar; win10 draws it from MOVEOVERLAY, which the template leaves blank so comctl32 fell back to its classic green blocks. the source's chunk art is the bar's block, so it goes in with the source's strip geometry",
+                    Reason = "xp has no separate marquee art; populate the ordinary and Indeterminate::Progress moving overlays from its chunk art and strip geometry",
                     Result = res.ToString(),
                 });
                 m_report.Count("applied-marquee-overlay");
@@ -829,6 +823,7 @@ namespace libmsstyle.Import
                     else if (value is Margins m) prop.SetValue(m);
                     MarkTouched(prop, $"{tc.ClassName}|{pair.Name}|S0|{id}");
                 }
+            }
             }
         }
 

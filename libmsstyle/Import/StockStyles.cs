@@ -43,21 +43,29 @@ namespace libmsstyle.Import
                 string sha = ResourceInventory.Sha1Hex(data).Substring(0, 12);
                 string dir = Path.Combine(Path.GetTempPath(), "msstyleEditor");
                 string path = Path.Combine(dir, $"{fileStem}-{sha}{extension}");
-                if (File.Exists(path) && File.ReadAllBytes(path).SequenceEqual(data)) return path;
-
-                Directory.CreateDirectory(dir);
-                string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                File.WriteAllBytes(tmp, data);
-                try
+                // Size ports run concurrently. Never delete a valid published file: another
+                // importer can be opening it with LoadLibraryEx at that exact moment.
+                using (var mutex = new System.Threading.Mutex(false, "Local\\msstyleEditor-stock-" + sha))
                 {
-                    if (File.Exists(path)) File.Delete(path);
-                    File.Move(tmp, path);
-                }
-                catch (IOException)
-                {
-                    // another instance won the race and may have it mapped; its copy is identical.
-                    File.Delete(tmp);
-                    if (!File.Exists(path)) throw;
+                    try { mutex.WaitOne(); }
+                    catch (System.Threading.AbandonedMutexException) { }
+                    try
+                    {
+                        if (File.Exists(path) && File.ReadAllBytes(path).SequenceEqual(data)) return path;
+                        Directory.CreateDirectory(dir);
+                        string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                        try
+                        {
+                            File.WriteAllBytes(tmp, data);
+                            if (File.Exists(path)) File.Delete(path);
+                            File.Move(tmp, path);
+                        }
+                        finally
+                        {
+                            if (File.Exists(tmp)) File.Delete(tmp);
+                        }
+                    }
+                    finally { mutex.ReleaseMutex(); }
                 }
                 return path;
             }
