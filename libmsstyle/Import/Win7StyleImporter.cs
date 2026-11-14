@@ -730,11 +730,12 @@ namespace libmsstyle.Import
             if (m_source.Platform == Platform.WinXP) MenuColorsFromXp();
             if (m_source.Platform == Platform.WinXP) TransparentForTrueAlpha();
             if (m_source.Platform == Platform.WinXP) SizingTypeFromXp();
+            if (m_source.Platform == Platform.WinXP) MarqueeOverlayFromXp();
             if (m_source.Platform == Platform.WinXP) BandMarginsForRebuiltPictures();
             if (m_source.Platform == Platform.WinXP) StartPanelCounterpartsFromXp();
             if (m_source.Platform == Platform.WinXP) FillDpiSlots(locked);
             if (m_source.Platform == Platform.WinXP) DropGlyphlessXpButtonDpi();
-            if (m_source.Platform == Platform.WinXP) CompositeXpComboButton();
+            if (m_source.Platform == Platform.WinXP) SplitXpComboButton();
             if (m_source.Platform == Platform.WinXP) DropXpComboPlate();
             if (m_source.Platform == Platform.WinXP) FrameXpCombo();
             if (m_source.Platform == Platform.WinXP) FillXpEditField();
@@ -752,6 +753,83 @@ namespace libmsstyle.Import
             if (string.IsNullOrEmpty(className) || string.IsNullOrEmpty(partName)) return -1;
             if (!XpSchema.Enums.TryGetValue(className + "PARTS", out var parts)) return -1;
             return parts.TryGetValue(partName, out int id) ? id : -1;
+        }
+
+        /// <summary>
+        /// xp only. xp's Progress class is BAR/BARVERT/CHUNK/CHUNKVERT (tmschema.h PROGRESSPARTS) and has no
+        /// indeterminate bar, so the merge never touches win10's PULSEOVERLAY/MOVEOVERLAY (parts 7-10). The win10
+        /// template leaves those on one fully transparent picture with BGTYPE NONE, which is not "draw nothing":
+        /// uxtheme hands the part to comctl32's own paint, which draws its classic green blocks. So an
+        /// indeterminate (PBS_MARQUEE) bar - the Windows Error Reporting "checking for a solution" dialog, any
+        /// TaskDialog with a marquee - showed the classic green under a ported theme, while a determinate bar
+        /// drew the ported art (the WER bar is marquee, which is why only it looked unported).
+        /// stock aero fills MOVEOVERLAY (8, vertical 10) with the block strip it slides; PULSEOVERLAY (7, 9) it
+        /// leaves empty (image 787/788 are fully transparent). The source's own chunk is the block, so the
+        /// moving overlay takes the source's CHUNK (3) / CHUNKVERT (4) picture and its strip geometry, and the
+        /// pulse overlays stay transparent like aero's.
+        /// </summary>
+        private void MarqueeOverlayFromXp()
+        {
+            if (!m_target.ClassesByName.TryGetValue("Progress", out var tc) || m_target.DuplicateClassNames.Contains("Progress")
+                || !m_source.ClassesByName.TryGetValue("Progress", out var sc)) return;
+            // xp's part ids come from the xp schema (a class whose xp and win10 numbering differ is still read
+            // correctly); the win10 ids are Progress's own (VisualStyleParts.PARTS_PROGRESS: 8 MOVEOVERLAY, 10 MOVEOVERLAYVERT).
+            var pairs = new[]
+            {
+                (TargetPart: 8, SourcePart: XpPartId(sc.ClassName, "CHUNK"), Name: "MOVEOVERLAY"),
+                (TargetPart: 10, SourcePart: XpPartId(sc.ClassName, "CHUNKVERT"), Name: "MOVEOVERLAYVERT"),
+            };
+            foreach (var pair in pairs)
+            {
+                if (pair.SourcePart < 0 || !sc.Parts.TryGetValue(pair.SourcePart, out var spart)
+                    || !spart.States.ContainsKey(0)
+                    || !tc.Parts.TryGetValue(pair.TargetPart, out var tpart) || !tpart.States.TryGetValue(0, out var tstate)) continue;
+
+                if (!(SemanticModel.FindEffective(m_source.Style, sc, pair.SourcePart, 0, IDENTIFIER.IMAGEFILE)?.GetValue() is int srcImage)) continue;
+                // the source's picture has to be the one the part draws, and its margins/strip geometry travel with it
+                // (a marquee block is the same art as the determinate chunk, cut the same way).
+                var sMargins = SemanticModel.FindEffective(m_source.Style, sc, pair.SourcePart, 0, IDENTIFIER.SIZINGMARGINS)?.GetValue() as Margins;
+                if (sMargins == null) continue;
+                int? sLayout = SemanticModel.FindEffective(m_source.Style, sc, pair.SourcePart, 0, IDENTIFIER.IMAGELAYOUT)?.GetValue() as int?;
+                int? sCount = SemanticModel.FindEffective(m_source.Style, sc, pair.SourcePart, 0, IDENTIFIER.IMAGECOUNT)?.GetValue() as int?;
+                int? sSizing = SemanticModel.FindEffective(m_source.Style, sc, pair.SourcePart, 0, IDENTIFIER.SIZINGTYPE)?.GetValue() as int?;
+
+                byte[] png = ImageIdentity.EncodePngVerified(Decoded(m_source, "IMAGE", srcImage));
+                int res = PlaceResource("IMAGE", srcImage, png, ImageIdentity.Analyze(png));
+
+                Set(IDENTIFIER.IMAGEFILE, IDENTIFIER.FILENAME, res);
+                Set(IDENTIFIER.BGTYPE, IDENTIFIER.ENUM, 0); // IMAGEFILE: without this uxtheme draws nothing (comctl32's classic paint instead)
+                Set(IDENTIFIER.SIZINGMARGINS, IDENTIFIER.MARGINS, sMargins);
+                Set(IDENTIFIER.SIZINGTYPE, IDENTIFIER.ENUM, sSizing ?? 1);
+                if (sLayout != null) Set(IDENTIFIER.IMAGELAYOUT, IDENTIFIER.ENUM, sLayout.Value);
+                if (sCount != null) Set(IDENTIFIER.IMAGECOUNT, IDENTIFIER.INT, sCount.Value);
+
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName,
+                    Part = pair.Name,
+                    State = 0,
+                    Property = "IMAGEFILE",
+                    Action = "applied-marquee-overlay",
+                    Reason = "xp has no indeterminate bar; win10 draws it from MOVEOVERLAY, which the template leaves blank so comctl32 fell back to its classic green blocks. the source's chunk art is the bar's block, so it goes in with the source's strip geometry",
+                    Result = res.ToString(),
+                });
+                m_report.Count("applied-marquee-overlay");
+
+                void Set(IDENTIFIER id, IDENTIFIER type, object value)
+                {
+                    var prop = tstate.Properties.FirstOrDefault(x => x.Header.nameID == (int)id);
+                    if (prop == null)
+                    {
+                        prop = new StyleProperty(new PropertyHeader((int)id, (int)type) { classID = tc.ClassId, partID = pair.TargetPart, stateID = 0 });
+                        tstate.Properties.Add(prop);
+                        AddedRecords.Add($"{tc.ClassId}/{pair.TargetPart}/0/{(int)id}/{(int)type}");
+                    }
+                    if (value is int i) prop.SetValue(i);
+                    else if (value is Margins m) prop.SetValue(m);
+                    MarkTouched(prop, $"{tc.ClassName}|{pair.Name}|S0|{id}");
+                }
+            }
         }
 
         /// <summary>
@@ -903,15 +981,15 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// Every picture slot the combo button can be drawn from on win10. xp has MAX_IMAGEFILE_SIZES (5)
-        /// numbered pictures (imagefile.h:8) and draws the button from IMAGEFILE; win10 picks a numbered
-        /// picture by display dpi (IMAGESELECTTYPE SIZE), and its templates carry IMAGEFILE1-7. A slot left
-        /// out keeps whatever FillDpiSlots put there - the source's GLYPHIMAGEFILE, which is the bare arrow
-        /// with no plate - so at 288 dpi and above the button would show an arrow floating on the edit.
+        /// Every glyph slot the combo button can be drawn from on win10. The template picks its arrow from these
+        /// by display dpi (GLYPHTYPE IMAGEGLYPH + IMAGESELECTTYPE DPI), and uxtheme only consults them for the
+        /// glyph - the button face always comes from IMAGEFILE (imagefile.cpp:1179). xp has MAX_IMAGEFILE_SIZES
+        /// (5) numbered pictures (imagefile.h:8) and one glyph; the source's arrow goes into every slot, because a
+        /// slot left on the template's own art would draw the template's arrow at that dpi.
         /// </summary>
         private static readonly IDENTIFIER[] ComboButtonSlots =
         {
-            IDENTIFIER.IMAGEFILE, IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3,
+            IDENTIFIER.IMAGEFILE1, IDENTIFIER.IMAGEFILE2, IDENTIFIER.IMAGEFILE3,
             IDENTIFIER.IMAGEFILE4, IDENTIFIER.IMAGEFILE5, IDENTIFIER.IMAGEFILE6, IDENTIFIER.IMAGEFILE7,
         };
 
@@ -978,19 +1056,9 @@ namespace libmsstyle.Import
         }
 
         /// <summary>
-        /// xp only. xp's Combobox|DROPDOWNBUTTON is two pictures: IMAGEFILE is the 21x22-per-state button
-        /// face (a vertical strip) and GLYPHIMAGEFILE is the 10x7-per-state arrow; xp composites them when it
-        /// draws. win10 has one picture and picks it from the dpi set (IMAGEFILE1-7), which the merge
-        /// filled with the arrow alone - so the dropdown drew the arrow strip stretched across the whole
-        /// button (the "detached grey square" in the control preview and the address bar). Copying the
-        /// arrow onto the face per state and pointing every slot in <see cref="ComboButtonSlots"/> at the
-        /// composite gives win10 the picture xp drew. Every state is composited, because win10 draws hot
-        /// and pressed from the same part.
-        /// </summary>
-        /// <summary>
         /// whether <paramref name="picture"/> carries a button face of its own, i.e. it has opaque pixels outside
         /// the arrow's footprint in any frame. xp's Elfin2 puts the face on the combo frame (part 0) and leaves only
-        /// the arrow strip here, so there is nothing to composite onto and the template's plate is the chrome.
+        /// the arrow strip here, so the face has to be built from part 0's plate instead.
         /// </summary>
         private static bool HasButtonFace(ArgbImage picture, int count, bool horizontal, int fw, int fh, int gw, int gh)
         {
@@ -1015,7 +1083,16 @@ namespace libmsstyle.Import
             return false;
         }
 
-        private void CompositeXpComboButton()
+        /// <summary>
+        /// xp only. xp's Combobox|DROPDOWNBUTTON is two pictures: IMAGEFILE is the button face (a 23x22-per-state
+        /// strip) and GLYPHIMAGEFILE is the arrow (13x14-per-state). uxtheme paints the face, then the glyph true
+        /// size on top (imagefile.cpp DrawBackground; an image glyph is forced to ST_TRUESIZE). win10's template
+        /// is the same two layers, so the source's face and arrow travel into them unchanged: the face into
+        /// IMAGEFILE and the arrow into the glyph slots (<see cref="ComboButtonSlots"/>), with the glyph type and
+        /// the dpi selection left on (<see cref="EnableComboButtonGlyph"/>). Every state is done, because win10
+        /// draws hot and pressed from the same part.
+        /// </summary>
+        private void SplitXpComboButton()
         {
             if (!m_target.ClassesByName.TryGetValue("Combobox", out var tc) || m_target.DuplicateClassNames.Contains("Combobox")
                 || !m_source.ClassesByName.TryGetValue("Combobox", out var sc)) return;
@@ -1074,64 +1151,75 @@ namespace libmsstyle.Import
                         if (horizontal) { if (glyph.Width % count != 0) continue; gw = glyph.Width / count; }
                         else { if (glyph.Height % count != 0) continue; gh = glyph.Height / count; }
                     }
-                    // xp's button picture is sometimes the arrow strip itself: the button face is the combo frame
-                    // (part 0), which win10's part 0 has no IMAGEFILE for, so the port drops it. Then there is no
-                    // face to composite onto, and the template's own plate is the button chrome while only the
-                    // arrow is xp's. Without this the port replaced Luna10's 15x64 plate with the bare 10x40 arrow
-                    // strip and uxtheme stretched one arrow across the whole button (Elfin2's Run dialog).
-                    if (!HasButtonFace(picture, count, horizontal, fw, fh, gw, gh))
+                    if (fw <= 0 || fh <= 0) continue;
+
+                    // xp draws this button in two layers, the same way the template does: the picture paints the
+                    // button face and the glyph paints the arrow after it - and an image glyph is forced to
+                    // ST_TRUESIZE (imagefile.cpp:197), so the arrow keeps its own size however the face is
+                    // stretched. win10's template is built the same way (IMAGEFILE is the plate, IMAGEFILE1-7 the
+                    // dpi-selected glyphs, GLYPHTYPE IMAGEGLYPH + IMAGESELECTTYPE DPI), and with the glyph type on
+                    // the background is taken from IMAGEFILE alone (imagefile.cpp:1179). So the two layers travel
+                    // separately: the source's face into IMAGEFILE, its arrow into the glyph slots. The port used to
+                    // bake them into one picture, but that picture is nine-sliced to the button, so the arrow came
+                    // out scaled with it - at the address bar's button xp's 9px arrow was drawn 5px wide.
+                    ArgbImage faceImg, arrowImg;
+                    if (HasButtonFace(picture, count, horizontal, fw, fh, gw, gh))
                     {
-                        // xp draws this button as a face under an arrow: the face is the combo frame (part 0's
-                        // IMAGEFILE, a nine-slice), the arrow is this part's picture. win10 draws one picture from
-                        // this part and part 0 has no IMAGEFILE to hold the face, so build it from the source's own
-                        // face stretched into the template's frame geometry with the arrow on top. Using the
-                        // template's plate instead put a different theme's artwork behind Elfin2's arrow.
-                        var face = SourceComboFace(sc);
+                        // xp's face is on this part: IMAGEFILE paints it and GLYPHIMAGEFILE is the arrow on top.
+                        faceImg = picture;
+                        arrowImg = glyph;
+                    }
+                    else
+                    {
+                        // xp's picture here is the arrow strip alone. Its face is the combo frame (part 0), which
+                        // xp draws across the whole combo - the button included - while win10 draws part 0 only
+                        // around the edit. So the button's face has to be built from the source's own plate, at the
+                        // frame geometry this part already has, and the arrow is this part's picture.
+                        var sf = SourceComboFace(sc);
                         var geom = TemplatePlate(tc, tp.PartId, st.StateId);
-                        if (face == null || geom == null) continue;
+                        if (sf == null || geom == null) continue;
                         int W = geom.Width, H = geom.Height;
                         if (count > 1 && (horizontal ? W % count : H % count) != 0) continue;
                         int cw = count > 1 ? (horizontal ? W / count : W) : W;
                         int ch = count > 1 ? (horizontal ? H : H / count) : H;
                         if (cw <= 0 || ch <= 0) continue;
-                        glyph = picture;
-                        gw = fw; gh = fh;
                         var canvas = new ArgbImage(W, H);
                         for (int i = 0; i < count; ++i)
                         {
                             var cell = new ArgbImage(cw, ch);
-                            NineSliceInto(face.Value.Image, face.Value.Margins, cell);
+                            NineSliceInto(sf.Value.Image, sf.Value.Margins, cell);
                             canvas.Blit(cell, horizontal ? i * cw : 0, horizontal ? 0 : i * ch);
                         }
-                        picture = canvas;
-                        fw = cw; fh = ch;
+                        faceImg = canvas;
+                        arrowImg = picture;
                     }
-                    if (fw <= 0 || fh <= 0 || gw > fw || gh > fh) continue;
 
-                    var composite = new ArgbImage(picture.Width, picture.Height);
-                    bool any = false;
-                    for (int i = 0; i < count; ++i)
+                    var facePng = ImageIdentity.EncodePngVerified(faceImg);
+                    int faceRes = PlaceResource("IMAGE", picId, facePng, ImageIdentity.Analyze(facePng));
+                    var arrowPng = ImageIdentity.EncodePngVerified(arrowImg);
+                    int arrowRes = PlaceResource("IMAGE", glyphId & 0xFFFF, arrowPng, ImageIdentity.Analyze(arrowPng));
+
+                    var faceProp = SemanticModel.FindEffective(m_target.Style, tc, tp.PartId, st.StateId, IDENTIFIER.IMAGEFILE);
+                    if (faceProp != null && (!(faceProp.GetValue() is int fcur) || fcur != faceRes))
                     {
-                        int sx = horizontal ? i * fw : 0;
-                        int sy = horizontal ? 0 : i * fh;
-                        if (sx + fw > picture.Width || sy + fh > picture.Height) continue;
-                        var frame = picture.Crop(new Rectangle(sx, sy, fw, fh));
-                        int gx = horizontal ? i * gw : 0;
-                        int gy = horizontal ? 0 : i * gh;
-                        if (gx + gw <= glyph.Width && gy + gh <= glyph.Height)
-                            frame.BlendOver(glyph.Crop(new Rectangle(gx, gy, gw, gh)), (fw - gw) / 2, (fh - gh) / 2);
-                        composite.Blit(frame, sx, sy);
-                        any = true;
+                        if (!st.Properties.Contains(faceProp))
+                        {
+                            faceProp = new StyleProperty(new PropertyHeader((int)IDENTIFIER.IMAGEFILE, (int)IDENTIFIER.FILENAME)
+                            {
+                                classID = tc.ClassId, partID = tp.PartId, stateID = st.StateId
+                            });
+                            st.Properties.Add(faceProp);
+                            AddedRecords.Add($"{tc.ClassId}/{tp.PartId}/{st.StateId}/{(int)IDENTIFIER.IMAGEFILE}/{(int)IDENTIFIER.FILENAME}");
+                        }
+                        faceProp.SetValue(faceRes);
+                        MarkTouched(faceProp, $"{tc.ClassName}|{partName}|S{st.StateId}|IMAGEFILE");
                     }
-                    if (!any) continue;
-
-                    var png = ImageIdentity.EncodePngVerified(composite);
-                    int newId = PlaceResource("IMAGE", picId, png, ImageIdentity.Analyze(png));
                     foreach (var ident in slots)
                     {
+                        if (ident == IDENTIFIER.IMAGEFILE) continue;
                         var prop = SemanticModel.FindEffective(m_target.Style, tc, tp.PartId, st.StateId, ident);
                         if (prop == null) continue;
-                        if (prop.GetValue() is int cur && cur == newId) continue;
+                        if (prop.GetValue() is int cur && cur == arrowRes) continue;
                         if (!st.Properties.Contains(prop))
                         {
                             // inherited from a base class: the value has to land on this state to win.
@@ -1142,21 +1230,63 @@ namespace libmsstyle.Import
                             st.Properties.Add(prop);
                             AddedRecords.Add($"{tc.ClassId}/{tp.PartId}/{st.StateId}/{(int)ident}/{(int)IDENTIFIER.FILENAME}");
                         }
-                        prop.SetValue(newId);
+                        prop.SetValue(arrowRes);
                         MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{ident}");
                     }
+                    EnableComboButtonGlyph(tc, tp, st, partName);
                     m_report.Decisions.Add(new MergeDecision
                     {
                         Class = tc.ClassName, Part = partName, State = st.StateId, Property = "IMAGEFILE",
-                        Action = "composited-xp-combo-button",
-                        Reason = "xp draws the button face (IMAGEFILE) under a separate arrow (GLYPHIMAGEFILE); win10 draws one picture from the dpi set, which held the arrow alone stretched across the button",
-                        Result = newId.ToString(),
+                        Action = "split-xp-combo-button",
+                        Reason = "xp paints the button face (IMAGEFILE) and then the arrow (GLYPHIMAGEFILE) true size on top, exactly like the template's own two layers; baking them together scaled the arrow with the nine-sliced face, so a narrower button drew a smaller arrow",
+                        Result = faceRes + " face / " + arrowRes + " arrow",
                     });
-                    m_report.Count("composited-xp-combo-button");
+                    m_report.Count("split-xp-combo-button");
                 }
             }
         }
 
+
+        /// <summary>
+        /// xp only, called after <see cref="SplitXpComboButton"/>. Turns the image glyph back on so win10
+        /// paints the arrow the way xp did: uxtheme draws the part's picture (IMAGEFILE) and then the image glyph
+        /// true size on top (imagefile.cpp:197 forces an image glyph to ST_TRUESIZE), and with IMAGESELECTTYPE it
+        /// takes that glyph from IMAGEFILE1-7 (imagefile.cpp <c>PackProperties</c> points the multi-image slots at
+        /// <c>_GlyphInfo</c> when the glyph type is IMAGEGLYPH). <see cref="SplitXpComboButton"/> put xp's
+        /// arrow into those slots, so both switches have to be on for it to be drawn - and the template shipped
+        /// them on (its own button is the same two layers).
+        /// </summary>
+        private void EnableComboButtonGlyph(StyleClass tc, StylePart tp, StyleState st, string partName)
+        {
+            void On(IDENTIFIER id, int value, string why)
+            {
+                var prop = SemanticModel.FindEffective(m_target.Style, tc, tp.PartId, st.StateId, id);
+                if (prop == null)
+                {
+                    // the template has the record (its own button is a two-layer glyph button); a variant that
+                    // dropped it still needs it, since the arrow now lives in the glyph slots.
+                    prop = new StyleProperty(new PropertyHeader((int)id, (int)IDENTIFIER.ENUM)
+                    {
+                        classID = tc.ClassId, partID = tp.PartId, stateID = st.StateId
+                    });
+                    st.Properties.Add(prop);
+                    AddedRecords.Add($"{tc.ClassId}/{tp.PartId}/{st.StateId}/{(int)id}/{(int)IDENTIFIER.ENUM}");
+                }
+                if (prop.GetValue() is int cur && cur == value) return;
+                prop.SetValue(value);
+                MarkTouched(prop, $"{tc.ClassName}|{partName}|S{st.StateId}|{id}");
+                m_report.Decisions.Add(new MergeDecision
+                {
+                    Class = tc.ClassName, Part = partName, State = st.StateId, Property = id.ToString(),
+                    Action = "enabled-xp-combo-glyph",
+                    Reason = why,
+                    Result = value.ToString(),
+                });
+                m_report.Count("enabled-xp-combo-glyph");
+            }
+            On(IDENTIFIER.GLYPHTYPE, 1, "xp paints the button's arrow after the face as an image glyph, true size; win10 draws that glyph from IMAGEFILE1-7, which now hold xp's arrow");
+            On(IDENTIFIER.IMAGESELECTTYPE, 2, "the arrow sits in the template's dpi slots, so win10 has to pick one by display dpi (imagefile.cpp SelectCorrectImageFile)");
+        }
 
         /// <summary>
         /// xp only. Combobox|0 carries the 42x21 combo plate as a picture behind the whole combo. win10
@@ -1391,7 +1521,32 @@ namespace libmsstyle.Import
                         bool changedBg = !(bg.GetValue() is int bv && bv == 1);
                         bg.SetValue(1); // BORDERFILL: the body's colour paints the field, no picture
                         MarkTouched(bg, $"{tc.ClassName}|{partName}|S{st.StateId}|BGTYPE");
-                        if (touched || added || changedBg)
+                        // a BORDERFILL on the background part inherits part 0's BORDERSIZE and BORDERCOLOR, i.e.
+                        // it draws a 1px frame behind the text: the address bar's inner edit got a box inside the
+                        // combo's own frame (visible as soon as the edit border and the combo edge differ). xp's
+                        // edit background has no border - the fill starts at the window edge - so zero it locally.
+                        var bs = st.Properties.FirstOrDefault(p => p.Header.nameID == (int)IDENTIFIER.BORDERSIZE && p.Header.typeID == (int)IDENTIFIER.INT);
+                        bool addedBs = bs == null;
+                        if (addedBs)
+                        {
+                            bs = new StyleProperty(new PropertyHeader((int)IDENTIFIER.BORDERSIZE, (int)IDENTIFIER.INT) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
+                            st.Properties.Add(bs);
+                            AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)IDENTIFIER.BORDERSIZE}/{(int)IDENTIFIER.INT}");
+                        }
+                        bool changedBs = !(bs.GetValue() is int bsv && bsv == 0);
+                        bs.SetValue(0);
+                        if (changedBs) MarkTouched(bs, $"{tc.ClassName}|{partName}|S{st.StateId}|{IDENTIFIER.BORDERSIZE}");
+                        // a BORDERFILL with no FILLCOLOR leaves uxtheme without a face colour; carry the source's
+                        // COLOR_WINDOW so the area under the text matches the field.
+                        bool addedFill = !st.Properties.Any(p => p.Header.nameID == (int)IDENTIFIER.FILLCOLOR);
+                        if (addedFill)
+                        {
+                            var fp = new StyleProperty(new PropertyHeader((int)IDENTIFIER.FILLCOLOR, (int)IDENTIFIER.COLOR) { classID = tc.ClassId, partID = partId, stateID = st.StateId });
+                            fp.SetValue(window);
+                            st.Properties.Add(fp);
+                            AddedRecords.Add($"{tc.ClassId}/{partId}/{st.StateId}/{(int)IDENTIFIER.FILLCOLOR}/{(int)IDENTIFIER.COLOR}");
+                        }
+                        if (touched || added || changedBg || addedBs || changedBs || addedFill)
                         {
                             m_report.Decisions.Add(new MergeDecision
                             {

@@ -298,6 +298,7 @@ namespace libmsstyleTests
                 "applied-stock-over-template",  // prefer-source: the source kept stock art the template redrew
                 "applied-xp-header-margins",    // ExplorerBar 8/12 CONTENTMARGINS from the source style
                 "applied-xp-startpanel-counterpart", // StartPanel geometry win10 splits across classes
+                "applied-marquee-overlay",      // win10's indeterminate bar gets the source's chunk art (xp has no marquee bar of its own)
             };
             var unknown = changes.Where(d => !known.Contains(d.Action)).ToList();
             Assert.AreEqual(0, unknown.Count, "unrecognised import rule fired:\n"
@@ -397,6 +398,46 @@ namespace libmsstyleTests
             var chunk = r.Decisions.Single(d => d.Class == "Progress" && d.Part == "CHUNK" && d.State == 0 && d.Property == "SIZINGTYPE");
             Assert.AreEqual("applied-xp-sizingtype", chunk.Action);
             Assert.AreEqual("2", chunk.Result); // final raw SIZINGTYPE value (TILE), not the intermediate display label
+        }
+
+        [TestMethod]
+        public void IndeterminateProgressBarDrawsTheSourceChunkArt()
+        {
+            if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
+            string dir = Path.Combine(Path.GetTempPath(), "msstyle-marquee-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                string output = Path.Combine(dir, "luna.msstyles");
+                var r = Win7StyleImporter.Run(new Win7ImportOptions
+                {
+                    SourcePath = XpLuna, SourcePlatform = Platform.WinXP, SourceScheme = "NormalColor",
+                    BaseScheme = "NormalColor", SourceShellStylePath = StockStyles.XpLunaShellPath("NormalColor"),
+                    TemplatePath = Luna10, OutputPath = output, DryRun = false,
+                });
+                Assert.AreEqual(ImportStatus.ReadyForVmTest, r.Status, string.Join("\n", r.Errors));
+                // xp has no indeterminate bar; win10's PULSEOVERLAY/MOVEOVERLAY were left blank by the merge, so a
+                // marquee bar (wer's "checking for a solution") fell back to comctl32's classic green blocks. Both
+                // moving overlays must draw the source's chunk art instead.
+                using (var xp = new VisualStyle())
+                using (var port = new VisualStyle())
+                {
+                    xp.Load(XpLuna);
+                    port.Load(output);
+                    foreach (var (target, source) in new[] { (8, 3), (10, 4) })
+                    {
+                        Assert.AreEqual(0, Find(port, "Progress", target, 0, IDENTIFIER.BGTYPE).GetValue(), "overlay " + target + " must draw its picture");
+                        int srcId = Find(xp, "Progress", source, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
+                        int dstId = Find(port, "Progress", target, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
+                        Assert.AreEqual(ImageIdentity.Decode(xp.GetRawResource("IMAGE", srcId)).PixelSha1(),
+                            ImageIdentity.Decode(port.GetRawResource("IMAGE", dstId)).PixelSha1(),
+                            "overlay " + target + " must draw the chunk art");
+                        foreach (var id in new[] { IDENTIFIER.SIZINGMARGINS, IDENTIFIER.IMAGELAYOUT })
+                            Assert.AreEqual(Find(xp, "Progress", source, 0, id).GetValue(), Find(port, "Progress", target, 0, id).GetValue(), "strip geometry changed: " + id);
+                    }
+                }
+            }
+            finally { Directory.Delete(dir, true); }
         }
 
         [TestMethod]
@@ -563,7 +604,7 @@ namespace libmsstyleTests
         }
 
         [TestMethod]
-        public void ComboButtonCompositeFillsEveryDpiSlot()
+        public void ComboButtonSplitsFaceAndArrow()
         {
             string source = Environment.GetEnvironmentVariable("MSSTYLE_XP_GLITCHBLACK");
             if (Luna10 == null || !File.Exists(Luna10)) Assert.Inconclusive("set MSSTYLE_LUNA10 to the win10 Luna.msstyles port");
@@ -584,26 +625,50 @@ namespace libmsstyleTests
                 using (var port = new VisualStyle())
                 {
                     xp.Load(source); tpl.Load(Luna10); port.Load(output);
-                    // the source draws the button from a plate (IMAGEFILE) under a separate arrow (GLYPHIMAGEFILE).
+                    // the source draws the button from a plate (IMAGEFILE) under a separate arrow (GLYPHIMAGEFILE),
+                    // and the template's own button is the same two layers. The two must travel separately: the
+                    // face into IMAGEFILE, the arrow into every dpi slot, or the arrow scales with the nine-sliced
+                    // face (at the address bar's narrow button xp's 9px arrow came out 5px wide).
+                    int faceId = Find(xp, "Combobox", 1, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF;
                     int glyphId = Find(xp, "Combobox", 1, 0, IDENTIFIER.GLYPHIMAGEFILE).Header.shortFlag & 0xFFFF;
+                    var face = ImageIdentity.Decode(xp.GetRawResource("IMAGE", faceId));
                     var glyph = ImageIdentity.Decode(xp.GetRawResource("IMAGE", glyphId));
+                    Assert.AreNotEqual(face.PixelSha1(), glyph.PixelSha1(), "the fixture's face and arrow are the same picture");
                     foreach (int part in new[] { 1, 6, 7 })
                     {
-                        // every slot the template has must hold the composite: win10 selects by dpi, so a slot left
-                        // on the bare arrow draws an arrow with no plate at 288 dpi and above.
-                        for (int name = (int)IDENTIFIER.IMAGEFILE; name <= (int)IDENTIFIER.IMAGEFILE7; ++name)
+                        var faceProp = Find(port, "Combobox", part, 0, IDENTIFIER.IMAGEFILE);
+                        Assert.IsNotNull(faceProp, "part " + part + " lost IMAGEFILE");
+                        var faceImg = ImageIdentity.Decode(port.GetRawResource("IMAGE", faceProp.Header.shortFlag & 0xFFFF));
+                        for (int name = (int)IDENTIFIER.IMAGEFILE1; name <= (int)IDENTIFIER.IMAGEFILE7; ++name)
                         {
                             if (Find(tpl, "Combobox", part, 0, (IDENTIFIER)name) == null) continue;
                             var p = Find(port, "Combobox", part, 0, (IDENTIFIER)name);
                             Assert.IsNotNull(p, "part " + part + " lost " + (IDENTIFIER)name);
                             var img = ImageIdentity.Decode(port.GetRawResource("IMAGE", p.Header.shortFlag & 0xFFFF));
-                            Assert.AreNotEqual(glyph.PixelSha1(), img.PixelSha1(),
-                                "part " + part + " " + (IDENTIFIER)name + " still holds the bare arrow");
-                            Assert.AreEqual(Find(port, "Combobox", part, 0, IDENTIFIER.IMAGEFILE).Header.shortFlag & 0xFFFF,
-                                p.Header.shortFlag & 0xFFFF, "part " + part + " " + (IDENTIFIER)name + " is not the composite");
+                            Assert.AreEqual(glyph.PixelSha1(), img.PixelSha1(),
+                                "part " + part + " " + (IDENTIFIER)name + " does not hold the source's arrow");
+                            Assert.AreNotEqual(faceImg.PixelSha1(), img.PixelSha1(),
+                                "part " + part + " " + (IDENTIFIER)name + " holds the face, not the arrow");
+                        }
+                        // the arrow now lives in the dpi slots, so both glyph switches must be on for win10 to draw
+                        // it (GLYPHTYPE IMAGEGLYPH makes it the glyph; IMAGESELECTTYPE DPI picks the slot).
+                        var gt = Find(port, "Combobox", part, 0, IDENTIFIER.GLYPHTYPE);
+                        Assert.IsNotNull(gt, "part " + part + " lost GLYPHTYPE, so the arrow in the slots is never drawn");
+                        Assert.AreEqual(1, (int)gt.GetValue(), "part " + part + " does not draw an image glyph");
+                        var sel = Find(port, "Combobox", part, 0, IDENTIFIER.IMAGESELECTTYPE);
+                        Assert.IsNotNull(sel, "part " + part + " lost the dpi-selection switch");
+                        Assert.AreEqual(2, (int)sel.GetValue(), "part " + part + " does not select the arrow by dpi");
+                        // GLYPHIMAGEFILE is dead while the arrow is selected by dpi, but if it survived from the
+                        // source it must be the arrow, never the face.
+                        var gim = Find(port, "Combobox", part, 0, IDENTIFIER.GLYPHIMAGEFILE);
+                        if (gim != null)
+                        {
+                            Assert.AreEqual(glyph.PixelSha1(),
+                                ImageIdentity.Decode(port.GetRawResource("IMAGE", gim.Header.shortFlag & 0xFFFF)).PixelSha1(),
+                                "part " + part + " GLYPHIMAGEFILE is not xp's arrow");
                         }
                     }
-                    Assert.IsTrue(report.Decisions.Any(d => d.Action == "composited-xp-combo-button"));
+                    Assert.IsTrue(report.Decisions.Any(d => d.Action == "split-xp-combo-button"));
                 }
             }
             finally

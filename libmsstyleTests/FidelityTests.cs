@@ -561,7 +561,18 @@ namespace libmsstyleTests
                             Assert.AreEqual(3, actual.Width); Assert.AreEqual(3, actual.Height);
                             Assert.AreEqual(0xFF100000u + (uint)(frame * 0x080808), actual.Pixels[0]);
                         }
-            Assert.IsNull(method.Invoke(null, new object[] { Pattern(6, true, 0xFF100000), 6, true, 0, false }));
+            // six frames: three states per mode, the inactive half mirrored (N,H,P then P,H,N); state 3
+            // (disabled) falls back to normal, as the strip has no fourth active frame.
+            foreach (bool inactive in new[] { false, true })
+                for (int state = 0; state < 4; ++state)
+                {
+                    int index = inactive ? 5 - (state == 3 ? 0 : state) : (state == 3 ? 0 : state);
+                    var six = (ArgbImage)method.Invoke(null, new object[] { Pattern(6, true, 0xFF100000), 6, true, state, inactive });
+                    Assert.AreEqual(3, six.Width); Assert.AreEqual(3, six.Height);
+                    Assert.AreEqual(0xFF100000u + (uint)(index * 0x080808), six.Pixels[0]);
+                }
+            // a strip that does not describe one of the supported state orders is refused.
+            Assert.IsNull(method.Invoke(null, new object[] { Pattern(5, true, 0xFF100000), 5, true, 0, false }));
         }
 
         [TestMethod]
